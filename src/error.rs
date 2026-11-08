@@ -48,9 +48,18 @@ pub enum Error {
     /// No such principal in the database.
     UnknownPrincipal(String),
 
-    #[error("pre-authentication required for {0}")]
-    /// The client must authenticate before a ticket is issued.
-    PreauthRequired(String),
+    #[error("pre-authentication: {text}")]
+    /// `PREAUTH_REQUIRED` or `PREAUTH_FAILED`, with the `METHOD-DATA` that has
+    /// to travel in `e-data`: a client told only "no" cannot tell whether its
+    /// password was wrong or its salt.
+    Preauth {
+        /// `KDC_ERR_PREAUTH_REQUIRED` or `KDC_ERR_PREAUTH_FAILED`.
+        code: i32,
+        /// The `e-text`.
+        text: String,
+        /// The encoded `METHOD-DATA`.
+        method_data: Vec<u8>,
+    },
 
     #[error("pre-authentication failed for {0}")]
     /// The client's pre-authentication did not verify.
@@ -122,6 +131,8 @@ pub mod codes {
     pub const KDC_ERR_MUST_USE_USER2USER: i32 = 27;
     /// This KDC cannot answer; the client should try another.
     pub const KDC_ERR_SVC_UNAVAILABLE: i32 = 29;
+    /// The reply does not fit in a datagram; the client should retry over TCP.
+    pub const KDC_ERR_RESPONSE_TOO_BIG: i32 = 52;
     /// The realm in the request is not one this KDC serves.
     pub const KDC_ERR_WRONG_REALM: i32 = 68;
     /// A decrypted value failed its integrity check.
@@ -152,7 +163,7 @@ impl Error {
             Error::KeyLength { .. } | Error::Crypto(_) => KRB_AP_ERR_BAD_INTEGRITY,
             Error::UnknownPrincipal(_) => KDC_ERR_C_PRINCIPAL_UNKNOWN,
             Error::Kdc { code, .. } => *code,
-            Error::PreauthRequired(_) => KDC_ERR_PREAUTH_REQUIRED,
+            Error::Preauth { code, .. } => *code,
             Error::PreauthFailed(_) => KDC_ERR_PREAUTH_FAILED,
             Error::Skew { .. } => KRB_AP_ERR_SKEW,
             Error::Hdb(_) | Error::Config(_) | Error::Io(_) => KDC_ERR_SVC_UNAVAILABLE,

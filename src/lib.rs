@@ -44,6 +44,8 @@ pub mod msg;
 /// Principal names and realms, where the name type is metadata and not
 /// identity.
 pub mod name;
+/// RFC 4120 transport: UDP and TCP framing, and a loopback server for tests.
+pub mod transport;
 
 pub use error::{Error, Result};
 pub use time::{format_generalized_time, parse_generalized_time};

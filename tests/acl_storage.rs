@@ -13,7 +13,6 @@ use rust_heimdal_kdc::crypto::{Cipher, Enctype, OwnCipher};
 use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, RedbHdb};
 use rust_heimdal_kdc::kdc::{ChangePolicy, Kdc, KdcConfig, changepw_entry, kpasswd};
 use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::serve_loopback;
 
 const REALM: &str = "EXAMPLE.COM";
 const NOW: i64 = 1_700_000_000;

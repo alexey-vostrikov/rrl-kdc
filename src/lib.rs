@@ -35,5 +35,15 @@ pub mod error;
 /// `KerberosTime`: `GeneralizedTime` in `YYYYMMDDHHMMSSZ`.
 pub mod time;
 
+/// The principal database, shaped after Heimdal's `lib/hdb/hdb.asn1`.
+pub mod hdb;
+/// The protocol engine: AS and TGS exchanges.
+pub mod kdc;
+/// RFC 4120 messages: the KDC reads requests and writes replies.
+pub mod msg;
+/// Principal names and realms, where the name type is metadata and not
+/// identity.
+pub mod name;
+
 pub use error::{Error, Result};
 pub use time::{format_generalized_time, parse_generalized_time};

@@ -56,6 +56,17 @@ pub enum Error {
     /// The client's pre-authentication did not verify.
     PreauthFailed(String),
 
+    #[error("{text} (KRB-ERROR {code})")]
+    /// A check failed and the protocol has a code for exactly that, which is
+    /// not one of the variants above: `KDC_ERR_POLICY`, `KDC_ERR_NEVER_VALID`,
+    /// `KDC_ERR_WRONG_REALM`.
+    Kdc {
+        /// The RFC 4120 §7.5 code to put in the reply.
+        code: i32,
+        /// The `e-text`, if any.
+        text: String,
+    },
+
     #[error("clock skew too great: {skew}s against a {allowed}s allowance")]
     /// The client's clock and this KDC's differ by more than the allowance.
     Skew {
@@ -92,6 +103,11 @@ pub mod codes {
     pub const KDC_ERR_S_PRINCIPAL_UNKNOWN: i32 = 7;
     /// The principal name resolves to more than one entry.
     pub const KDC_ERR_PRINCIPAL_NOT_UNIQUE: i32 = 8;
+    /// The request asks for a lifetime that ends before it starts.
+    pub const KDC_ERR_NEVER_VALID: i32 = 11;
+    /// The realm's policy forbids what was asked for (a proxiable ticket, a
+    /// postdated one, a service that may not be issued).
+    pub const KDC_ERR_POLICY: i32 = 12;
     /// No requested enctype is one this KDC implements.
     pub const KDC_ERR_ETYPE_NOSUPP: i32 = 14;
     /// The account is locked, disabled or expired.
@@ -106,6 +122,8 @@ pub mod codes {
     pub const KDC_ERR_MUST_USE_USER2USER: i32 = 27;
     /// This KDC cannot answer; the client should try another.
     pub const KDC_ERR_SVC_UNAVAILABLE: i32 = 29;
+    /// The realm in the request is not one this KDC serves.
+    pub const KDC_ERR_WRONG_REALM: i32 = 68;
     /// A decrypted value failed its integrity check.
     pub const KRB_AP_ERR_BAD_INTEGRITY: i32 = 31;
     /// The ticket has expired.
@@ -133,6 +151,7 @@ impl Error {
             Error::UnsupportedEnctype(_) => KDC_ERR_ETYPE_NOSUPP,
             Error::KeyLength { .. } | Error::Crypto(_) => KRB_AP_ERR_BAD_INTEGRITY,
             Error::UnknownPrincipal(_) => KDC_ERR_C_PRINCIPAL_UNKNOWN,
+            Error::Kdc { code, .. } => *code,
             Error::PreauthRequired(_) => KDC_ERR_PREAUTH_REQUIRED,
             Error::PreauthFailed(_) => KDC_ERR_PREAUTH_FAILED,
             Error::Skew { .. } => KRB_AP_ERR_SKEW,

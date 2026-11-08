@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned, not "stable": the crate is edition 2024 and the toolchain is the same
+# one the in-process consumer (rust-rest-ldap) pins, so one workspace does not
+# need two compilers. A CI run that installs "stable" instead would go red on
+# whatever lands in stable next, and the red would name this repository.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

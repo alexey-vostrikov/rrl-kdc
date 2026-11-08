@@ -1,0 +1,64 @@
+name: ci
+
+# Everything compiles inside `rust:1.99.1-bookworm`, the same image a developer
+# runs locally: the toolchain is the image tag, not a `rustup` download, so what
+# CI builds with is what the repository says it builds with. `act push` runs
+# this file as it is, which is the point — a workflow that only works on GitHub
+# is a workflow nobody has run.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: rust:1.99.1-bookworm
+    env:
+      CARGO_TERM_COLOR: always
+      # The image ships exactly the channel `rust-toolchain.toml` names; these
+      # point at its own toolchain rather than at a home directory that does not
+      # exist in a fresh container.
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+    steps:
+      - uses: actions/checkout@v4
+
+      # `act` replaces PATH when it runs a step (its own node goes first), so the
+      # image's PATH is published for the later steps explicitly. On GitHub the
+      # image already has it and the duplicate entry is harmless.
+      - name: Publish the toolchain on PATH
+        run: echo "/usr/local/cargo/bin" >> "$GITHUB_PATH"
+
+      # The pin lives in `rust-toolchain.toml`; the image tag has to agree with
+      # it. A mismatch is a gate failure, not a warning: building with a
+      # different compiler than the one the repository declares is how a
+      # `cargo fmt --check` goes red for a reason nobody can reproduce locally.
+      - name: The toolchain matches rust-toolchain.toml
+        run: |
+          declared=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          actual=$(rustc --version | cut -d' ' -f2)
+          echo "declared=$declared actual=$actual"
+          test "$declared" = "$actual"
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      # `-D warnings` rather than a tail of output: a warning nobody reads is a
+      # warning that becomes a defect, and this crate is small enough that
+      # holding the line costs nothing.
+      - name: clippy
+        run: cargo clippy --all-targets --features crypto-rskrb5 -- -D warnings
+
+      - name: test
+        run: cargo test --features crypto-rskrb5
+
+      # The differential backend is optional, so the default-feature build is a
+      # configuration of its own: it is what a consumer who does not want the
+      # second crypto implementation gets.
+      - name: test without the second crypto backend
+        run: cargo test --no-default-features

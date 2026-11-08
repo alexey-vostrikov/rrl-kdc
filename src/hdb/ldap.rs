@@ -37,7 +37,11 @@
 //! an entry that carries only the Heimdal attributes is complete.
 //!
 //! Where both vocabularies describe the same fact and disagree, the mapping
-//! refuses rather than picking one. A KDC that silently preferred
+//! refuses rather than picking one.
+//!
+//! `supplementalCredentials` is written and never read: it is a projection of
+//! `krb5Key` for tools that look for an Active Directory's shape, so reading it
+//! back would make the projection a second source of truth for the keys. A KDC that silently preferred
 //! `userAccountControl` would leave an entry enabled in the directory and
 //! disabled in the realm, and the operator would find out from a user.
 
@@ -88,6 +92,10 @@ pub mod attrs {
     pub const AD_USER_ACCOUNT_CONTROL: &str = "userAccountControl";
     /// Microsoft's service names: `HOST/server.example.com`, no realm.
     pub const AD_SERVICE_PRINCIPAL_NAME: &str = "servicePrincipalName";
+    /// Microsoft's binary blob of every long-term key, a `USER_PROPERTIES`
+    /// structure. Written here as a projection of `krb5Key`, never read: see
+    /// [`crate::hdb::ad_blob`].
+    pub const AD_SUPPLEMENTAL_CREDENTIALS: &str = "supplementalCredentials";
 }
 
 /// `userAccountControl` bits ([MS-ADTS] 2.2.9), the ones that describe a Kerberos
@@ -305,6 +313,17 @@ pub fn to_attributes(entry: &HdbEntry) -> Attributes {
     );
     if let Some(spn) = service_principal_name(&entry.principal) {
         out.set(attrs::AD_SERVICE_PRINCIPAL_NAME, spn.into_bytes());
+    }
+    // The AD projection of the keys, so that an audit tool looking for it finds
+    // something. Not written for an entry with no keys: an empty blob would say
+    // "this account has no credentials", and absent says "nobody has filled this
+    // in yet" — the second is true and the first is a claim about an account that
+    // may not have been provisioned.
+    if !entry.keys.is_empty() {
+        out.set(
+            attrs::AD_SUPPLEMENTAL_CREDENTIALS,
+            crate::hdb::ad_blob::supplemental_credentials(entry),
+        );
     }
 
     for class in OBJECT_CLASSES {

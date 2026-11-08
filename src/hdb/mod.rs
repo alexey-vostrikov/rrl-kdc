@@ -18,6 +18,8 @@ use crate::crypto::{Cipher, Enctype, Key};
 use crate::error::{Error, Result};
 use crate::name::Principal;
 
+#[cfg(feature = "hdb-ldap")]
+pub mod ad_blob;
 pub mod keytab;
 #[cfg(feature = "hdb-ldap")]
 pub mod ldap;

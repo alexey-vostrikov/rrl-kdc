@@ -209,6 +209,40 @@ fn a_password_changed_through_the_hdb_is_the_one_that_works() {
 }
 
 #[test]
+fn the_ad_key_blob_is_written_and_never_read_back() {
+    // The projection is for tools that look for an Active Directory's shape. It is
+    // generated from `krb5Key` and must not become a second source of truth: an
+    // entry whose blob was edited by hand still gets its keys from `krb5Key`.
+    let directory = FakeDirectory::new();
+    realm(&directory);
+    let attributes = directory
+        .entries
+        .lock()
+        .unwrap()
+        .get(&p("alice").to_string())
+        .cloned()
+        .unwrap();
+    let blob = attributes
+        .first(attrs::AD_SUPPLEMENTAL_CREDENTIALS)
+        .expect("an entry with keys must carry the projection");
+    assert!(blob.len() >= 111, "a USER_PROPERTIES structure");
+
+    // Replace it with garbage: the entry must still read, because the keys are in
+    // `krb5Key` and the blob is not consulted.
+    let mut edited = attributes.clone();
+    edited.set(attrs::AD_SUPPLEMENTAL_CREDENTIALS, b"not a blob".to_vec());
+    let entry = from_attributes(&edited).expect("the blob must not be authoritative");
+    assert_eq!(entry.keys.len(), 2, "the keys come from krb5Key");
+
+    // And an entry with no keys carries no blob: absent means "not filled in",
+    // while an empty one would claim the account has no credentials.
+    let mut keyless = HdbEntry::user(p("fresh"));
+    keyless.etypes = None;
+    let written = to_attributes(&keyless);
+    assert!(!written.has(attrs::AD_SUPPLEMENTAL_CREDENTIALS));
+}
+
+#[test]
 fn the_kvno_and_the_keys_are_written_both_ways() {
     // Microsoft's attributes are copies; a client that reads them must see the
     // same number the KDC does.

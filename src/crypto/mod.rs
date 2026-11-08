@@ -47,6 +47,32 @@ pub enum Enctype {
     Aes256Sha384 = 20,
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for Enctype {
+    /// The RFC 3961 number, as it appears on the wire and in every `krb5.conf`.
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_i32(self.id())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Enctype {
+    /// Refuses a number this KDC does not implement, rather than defaulting to
+    /// one: a request asking for an enctype the caller could not have meant is a
+    /// mistake worth reporting.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let id = i32::deserialize(deserializer)?;
+        Enctype::from_id(id).ok_or_else(|| {
+            serde::de::Error::custom(format!("enctype {id} is not one this KDC implements"))
+        })
+    }
+}
+
 impl Enctype {
     /// Strongest first: the order a KDC offers them in, and the order an
     /// `allowed_enctypes` list is matched in.
@@ -170,12 +196,18 @@ impl Enctype {
     pub fn parse_list(names: &[&str]) -> Result<Vec<Enctype>> {
         let mut out = Vec::with_capacity(names.len());
         for n in names {
-            match Enctype::from_name(n) {
+            // A name first, as `krb5.conf` writes it, then a number: the RFC 3961
+            // number appears in `klist -e` output and in documentation, and an
+            // operator pasting `18` should get the enctype rather than a message
+            // claiming 18 is not implemented.
+            let parsed = Enctype::from_name(n)
+                .or_else(|| n.trim().parse::<i32>().ok().and_then(Enctype::from_id));
+            match parsed {
                 Some(e) if !out.contains(&e) => out.push(e),
                 Some(_) => {}
                 None => {
                     return Err(Error::Config(format!(
-                        "enctype {n:?} is not implemented; this KDC issues {} (RFC 3962 and RFC 8009 only)",
+                        "enctype {n:?} is not one this KDC implements; it issues {} (RFC 3962 and RFC 8009 only)",
                         Enctype::ALL
                             .iter()
                             .map(|e| e.name())

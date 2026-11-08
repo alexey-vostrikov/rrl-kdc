@@ -38,6 +38,30 @@ pub struct Principal {
     pub realm: String,
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for Principal {
+    /// A principal as the string every Kerberos tool prints: `name@REALM`.
+    ///
+    /// Not as a struct: a transport's clients are administrators and their
+    /// scripts, and `alice@EXAMPLE.COM` is what they already write.
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Principal {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Principal::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Principal {
     /// A principal from its parts.
     pub fn new<I, S>(name_type: i32, components: I, realm: impl Into<String>) -> Self

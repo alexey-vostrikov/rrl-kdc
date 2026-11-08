@@ -48,6 +48,25 @@ pub enum Error {
     /// No such principal in the database.
     UnknownPrincipal(String),
 
+    #[error("{0} is not in the database")]
+    /// An administrative operation named a principal that is not there.
+    ///
+    /// Separate from [`Error::UnknownPrincipal`] because the two answer different
+    /// callers: an AS request for an unknown client is a protocol failure a
+    /// client must not be able to distinguish from any other, while an
+    /// administrator asking about an absent account wants to be told exactly
+    /// that. A transport maps this to 404 and the other to the reply it belongs
+    /// to.
+    NotFound(String),
+
+    #[error("{0} already exists")]
+    /// An administrative operation tried to create what is already there.
+    Exists(String),
+
+    #[error("not permitted: {0}")]
+    /// The actor has no right to do this.
+    Forbidden(String),
+
     #[error("pre-authentication: {text}")]
     /// `PREAUTH_REQUIRED` or `PREAUTH_FAILED`, with the `METHOD-DATA` that has
     /// to travel in `e-data`: a client told only "no" cannot tell whether its
@@ -162,6 +181,25 @@ pub mod codes {
     pub const KRB_AP_ERR_INAPP_CKSUM: i32 = 50;
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for Error {
+    /// The failure as a transport sees it: `{"kind": "...", "message": "..."}`.
+    ///
+    /// Only the two fields a caller can act on. A nested error chain would invite
+    /// a transport to depend on this crate's internal shape, and the internal
+    /// shape is free to change.
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("Error", 2)?;
+        out.serialize_field("kind", self.kind())?;
+        out.serialize_field("message", &self.to_string())?;
+        out.end()
+    }
+}
+
 impl Error {
     /// The `KRB-ERROR` code this failure becomes on the wire.
     pub fn kdc_code(&self) -> i32 {
@@ -171,6 +209,10 @@ impl Error {
             Error::UnsupportedEnctype(_) => KDC_ERR_ETYPE_NOSUPP,
             Error::KeyLength { .. } | Error::Crypto(_) => KRB_AP_ERR_BAD_INTEGRITY,
             Error::UnknownPrincipal(_) => KDC_ERR_C_PRINCIPAL_UNKNOWN,
+            Error::NotFound(_) => KDC_ERR_S_PRINCIPAL_UNKNOWN,
+            // Neither of these is a protocol answer: a create that collided and a
+            // refused right both mean the realm's policy said no.
+            Error::Exists(_) | Error::Forbidden(_) => KDC_ERR_POLICY,
             Error::Kdc { code, .. } => *code,
             Error::Preauth { code, .. } => *code,
             Error::PreauthFailed(_) => KDC_ERR_PREAUTH_FAILED,
@@ -186,5 +228,27 @@ impl Error {
             self,
             Error::Hdb(_) | Error::Config(_) | Error::Io(_) | Error::Crypto(_)
         )
+    }
+
+    /// A stable, machine-readable name for the failure.
+    ///
+    /// A transport that has to answer with a status code cannot parse prose: the
+    /// message is for a human and will change. These names will not. They are the
+    /// vocabulary a REST layer switches on, so adding one is a deliberate act.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Der(_) => "der",
+            Error::UnsupportedEnctype(_) | Error::KeyLength { .. } | Error::Crypto(_) => "crypto",
+            Error::NotARequest(_) | Error::Protocol(_) => "protocol",
+            Error::UnknownPrincipal(_) | Error::NotFound(_) => "not_found",
+            Error::Exists(_) => "already_exists",
+            Error::Forbidden(_) => "forbidden",
+            Error::Preauth { .. } | Error::PreauthFailed(_) => "preauth",
+            Error::Kdc { .. } => "policy",
+            Error::Skew { .. } => "clock_skew",
+            Error::Hdb(_) => "storage",
+            Error::Config(_) => "bad_request",
+            Error::Io(_) => "io",
+        }
     }
 }

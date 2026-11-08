@@ -19,6 +19,8 @@
 //!   deploys a new keytab before the KDC changes the password must accept tickets
 //!   sealed with either — that is what a kvno is for.
 
+pub mod wire;
+
 use std::sync::Arc;
 
 use crate::crypto::{Cipher, Enctype, Key};
@@ -117,12 +119,15 @@ impl Modify {
 }
 
 /// The realm, from the managing side.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Admin {
     realm: String,
     hdb: Arc<dyn Hdb>,
     cipher: Arc<dyn Cipher>,
     allowed: Vec<Enctype>,
+    /// Who may do what. `DenyAll` until the embedder says otherwise, because a
+    /// default that allows turns a forgotten configuration into an open realm.
+    policy: Arc<dyn wire::Policy>,
 }
 
 impl Admin {
@@ -138,6 +143,7 @@ impl Admin {
             hdb,
             cipher,
             allowed: allowed.to_vec(),
+            policy: Arc::new(wire::DenyAll),
         }
     }
 
@@ -173,7 +179,10 @@ impl Admin {
     pub fn get(&self, principal: &Principal) -> Result<HdbEntry> {
         self.hdb
             .fetch(principal)?
-            .ok_or_else(|| Error::Hdb(format!("{principal} is not in the database")))
+            // `NotFound` and not `Hdb`: an absent account is a fact about the
+            // realm, not a storage failure, and a transport answers the two with
+            // different status codes.
+            .ok_or_else(|| Error::NotFound(principal.to_string()))
     }
 
     /// Creates a principal, or fails if it exists.
@@ -189,9 +198,9 @@ impl Admin {
             )));
         }
         if self.hdb.fetch(&principal)?.is_some() {
-            return Err(Error::Hdb(format!(
-                "{principal} already exists: creating it would replace its keys, which would \
-                 invalidate every ticket already issued to it"
+            return Err(Error::Exists(format!(
+                "{principal}: creating it would replace its keys, which would invalidate every \
+                 ticket already issued to it"
             )));
         }
 

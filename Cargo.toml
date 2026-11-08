@@ -60,6 +60,15 @@ admin-json = ["serde"]
 # what it accepts. `rskrb5` is a cross-check on the crypto only.
 crypto-rskrb5 = ["dep:rskrb5"]
 
+# An example that needs a feature is declared with `required-features`, so that a
+# default build does not compile it. Without this, `cargo test` builds every example
+# and `cargo test` in the primary configuration fails on an example about a feature
+# it does not have — which the `--all-features` gate cannot see, because there the
+# feature is on.
+[[example]]
+name = "ad-blob"
+required-features = ["hdb-ldap"]
+
 [dev-dependencies]
 # The primary client. Written by a third party and tested against a live MIT KDC,
 # it is the half of every acceptance test that matters: it asks this KDC for a

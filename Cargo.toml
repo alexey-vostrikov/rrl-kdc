@@ -52,6 +52,11 @@ crypto-rskrb5 = ["dep:rskrb5"]
 # reply it accepts is a reply another implementation would accept too.
 krb5 = "1.0"
 hex = "0.4"
+# The secondary implementation, with the half a *service* needs: the acceptor
+# (`service`) lives behind `messages`, which the library never asks for. Cargo
+# unifies features per build, so this reaches tests only and leaves
+# `cargo build` with the crypto-only dependency.
+rskrb5 = { version = "0.2", default-features = false, features = ["messages"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

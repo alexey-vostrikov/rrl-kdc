@@ -144,3 +144,62 @@ KDC не задаёт. Поэтому основной прогон ворот �
 
 **Следствие для шага 2:** интероп-проверки AP-REQ пишутся сначала против `krb5`; `rskrb5`
 (`ServiceValidator`) — вторым, как дополнительная проверка, а не как эталон.
+
+## Шаг 2: TGS-обмен
+
+**Зачем.** TGT бесполезен без служебного тикета: `kinit` даёт доказательство, а работать с LDAP/SMB/NFS
+даёт именно `TGS-REQ`.
+
+**TDD.** Сначала `tests/tgs_live.rs` — сторонний клиент берёт `service_ticket` по TGT. Первый прогон
+упал ожидаемо: `the TGS exchange is not implemented yet`. Движок писался после.
+
+**Что сделано:**
+
+| Файл | Что |
+|---|---|
+| `src/msg/apreq.rs` | `AP-REQ` и `Authenticator`: кодирование и разбор, обе стороны (KDC читает, сервис-тест пишет) |
+| `src/kdc/tgs_exchange.rs` | Порядок как в `_kdc_tgs_rep`: realm → `PA-TGS-REQ` → тикет расшифрован ключом `krbtgt` → срок TGT → authenticator в сеансовом ключе → сверка клиента → контрольная сумма по точным октетам `KDC-REQ-BODY` → часы → сервис существует → тикет |
+
+**Ошибка в спецификации, найденная тестом.** Первый прогон дал
+`DER: Authenticator: expected tag 0x1b, got 0x30`: у `Authenticator` **нет** поля `msg-type`, поля идут
+vno[0], crealm[1], cname[2], cksum[3], cusec[4], ctime[5], subkey[6], seq[7], ad[8]. Я написал его «по
+памяти» с `msg-type`, сдвинув все номера на единицу. Подтверждено двумя независимыми реализациями —
+`lib/asn1/krb5.asn1` Heimdal и `picky-krb` Devolutions. Тест `the_authenticator_carries_no_msg_type`
+фиксирует это прямо.
+
+**Доказательства:**
+
+- `tests/tgs_live.rs` (3): клиент `krb5` берёт служебный тикет; два тикета — разные сеансовые ключи;
+  запрос без `PA-TGS-REQ` получает `KRB_AP_ERR_MODIFIED`.
+- `tests/tgs_cross_check.rs` (1, за фичей): тикет нашего KDC принимает **другая** реализация —
+  `rskrb5::service::ServiceValidator` расшифровывает его своим ключом из keytab и видит того же
+  клиента, тот же сервис и тот же сеансовый ключ.
+- `tests/tgs_errors.rs` (12): истёкший TGT (32), «ещё не валиден» (33), неизвестный сервис (7),
+  испорченная контрольная сумма (42), authenticator с чужим клиентом (36), устаревший authenticator
+  (37), без доказательств (42), тикет не для `krbtgt` (42); `forwardable` не поднимается выше TGT;
+  служебный тикет не переживает TGT.
+- Итого `cargo test` — 110 тестов в 8 наборах, все зелёные; `clippy --all-targets --features
+  crypto-rskrb5` — 0; `act push -P ubuntu-latest=rust:1.99.1-bookworm` — job succeeded.
+
+**Мутации (6, каждая откатана обратной правкой):**
+
+| Мутация | Итог |
+|---|---|
+| снять ограничение жизни по TGT | убита `a_service_ticket_does_not_outlive_its_tgt` |
+| снять сверку клиента в authenticator | убита `an_authenticator_naming_another_client_is_badmatch` |
+| снять проверку часов | убита `a_stale_authenticator_is_skew` |
+| снять проверку срока TGT | убита `an_expired_tgt_is_tkt_expired` |
+| брать `forwardable` из запроса, а не из TGT | убита `a_service_ticket_cannot_be_more_forwardable_than_its_tgt` |
+| снять проверку контрольной суммы | убита `a_checksum_that_does_not_cover_the_body_is_modified` |
+
+**Два дефекта в собственной работе, найденных мутациями:**
+
+1. Мутация «снять проверку контрольной суммы» сначала выглядела выжившей, а на деле оставила висящий
+   `.map_err` — то есть тесты даже не собирались. Правило: отличать «не убит» от «не собралось».
+2. Тест `a_wrong_ap_req_msg_type_is_refused` правил первое INTEGER в кодировке, а это `pvno`, а не
+   `msg-type`; `pvno` тогда вообще не проверялся. Добавлена проверка `pvno`, тест переписан на поиск
+   именно `0x0e`.
+
+**Чего нет и куда вынесено:** реферралы, S4U2Self/S4U2Proxy, PAC (генерация), FAST, PKINIT,
+renew/validate, `transited` между реалмами, адресные проверки, kpasswd — фазы 2–4. Запрос, которому
+нужно одно из этого, получает код, а не тикет, который делает вид, что умеет.

@@ -151,6 +151,10 @@ pub mod codes {
     pub const KRB_AP_ERR_MSG_TYPE: i32 = 41;
     /// The message could not be decoded or was altered.
     pub const KRB_AP_ERR_MODIFIED: i32 = 42;
+    /// The authenticator names a different principal than the ticket does.
+    pub const KRB_AP_ERR_BADMATCH: i32 = 36;
+    /// A checksum that must be present is absent, or is of the wrong type.
+    pub const KRB_AP_ERR_INAPP_CKSUM: i32 = 50;
 }
 
 impl Error {

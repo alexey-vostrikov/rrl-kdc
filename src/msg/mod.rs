@@ -6,8 +6,10 @@
 //! [`der::field`] and decoding through [`crate::der::Fields`]' typed
 //! accessors rather than raw octets.
 
+pub mod apreq;
 pub mod req;
 
+pub use apreq::{ApReq, Authenticator};
 pub use req::{KdcReq, KdcReqBody};
 
 use crate::crypto::{Enctype, Key};

@@ -237,8 +237,8 @@ fn a_locked_account_is_client_revoked() {
 
 #[test]
 fn a_tgs_request_is_answered_not_ignored() {
-    // Step 1 issues TGTs only. The client must be told to try elsewhere rather
-    // than left waiting.
+    // A TGS request sent with no evidence must be answered — the code is
+    // checked in `tgs_errors`; what matters here is that it is not silence.
     let client = principal("alice");
     let body = der::seq(&[
         der::field(0, der::flags32(0)),
@@ -257,7 +257,11 @@ fn a_tgs_request_is_answered_not_ignored() {
         ])],
     );
     let reply = kdc().handle(&req, NOW);
-    assert_eq!(reply_code(&reply).0, codes::KDC_ERR_SVC_UNAVAILABLE);
+    let (code, _) = reply_code(&reply);
+    assert_ne!(
+        code, 0,
+        "a request that cannot be served still gets an error code"
+    );
     let _ = client;
 }
 

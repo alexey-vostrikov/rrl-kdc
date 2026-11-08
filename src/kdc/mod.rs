@@ -25,6 +25,7 @@
 pub mod config;
 
 mod as_exchange;
+mod tgs_exchange;
 
 use std::sync::Arc;
 
@@ -80,13 +81,7 @@ impl Kdc {
             Err(err) => return self.error(None, &err, now),
         };
         let outcome = if req.msg_type == crate::msg::TGS_REQ {
-            // Step 1 issues TGTs only. A TGS request is answered with the code
-            // that tells the client to try another KDC, rather than with a
-            // timeout or with an invented ticket.
-            Err(Error::Kdc {
-                code: codes::KDC_ERR_SVC_UNAVAILABLE,
-                text: "the TGS exchange is not implemented yet".into(),
-            })
+            self.handle_tgs(&req, now)
         } else {
             self.handle_as(&req, now)
         };

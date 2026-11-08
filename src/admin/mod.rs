@@ -19,6 +19,8 @@
 //!   deploys a new keytab before the KDC changes the password must accept tickets
 //!   sealed with either — that is what a kvno is for.
 
+#[cfg(feature = "admin-json")]
+pub mod json;
 pub mod wire;
 
 use std::sync::Arc;

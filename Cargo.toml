@@ -22,6 +22,7 @@ zeroize = { version = "1", features = ["derive"] }
 tracing = { version = "0.1", optional = true }
 redb = { version = "4.4", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 # The secondary implementation, kept only for the differential check. Its crypto
 # is the only half used, so the client-oriented features stay off: no tokio, no
@@ -35,7 +36,14 @@ trace = ["dep:tracing"]
 # The second HDB backend: a single-file redb store, the same version the
 # in-process consumer already builds against.
 hdb-redb = ["dep:redb"]
-serde = ["dep:serde"]
+# The JSON form of the administrator's vocabulary, for a transport that speaks
+# HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
+# this feature adds the request and reply envelopes and the base64 encoding the
+# binary fields need.
+serde = ["dep:serde", "dep:base64"]
+# The JSON envelopes. Named separately so that a caller who only wants
+# `Principal` to serialize does not get the rest.
+admin-json = ["serde"]
 # A second, independent implementation of RFC 3961/3962/8009 crypto. Every
 # known-answer vector in `tests/` then runs against both, which turns the vectors
 # from a self-test into a differential test.
@@ -59,6 +67,7 @@ hex = "0.4"
 rskrb5 = { version = "0.2", default-features = false, features = ["messages"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 
 [profile.release]
 overflow-checks = true

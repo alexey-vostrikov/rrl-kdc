@@ -209,6 +209,7 @@ impl Admin {
         let mut entry = HdbEntry {
             principal: principal.clone(),
             keys: Vec::new(),
+            kvno: 0,
             flags: new.role.flags()
                 | entry_flags::INITIAL
                 | entry_flags::FORWARDABLE
@@ -219,6 +220,7 @@ impl Admin {
             pw_end: None,
             max_life: None,
             max_renew: None,
+            etypes: None,
             modified: 0,
         };
 

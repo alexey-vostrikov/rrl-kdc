@@ -44,6 +44,7 @@ use crate::hdb::Hdb;
 use crate::msg::KdcReq;
 use crate::name::Principal;
 
+pub use as_exchange::Purpose;
 pub use as_exchange::{endtime, renew_till, starttime, ticket_flags, usable_enctypes};
 pub use config::KdcConfig;
 

@@ -26,18 +26,49 @@ use crate::name::Principal;
 
 use super::{Kdc, KdcConfig};
 
+/// What the enctype is being chosen for.
+///
+/// Heimdal distinguishes the two because `hdb_entry.etypes` restricts what a
+/// principal may be *issued*, not how it proves who it is: a client whose entry
+/// declares only AES-128 still pre-authenticates in AES-256 if that is the key it
+/// has, because refusing would break the login of every such account without
+/// protecting anything. `_kdc_find_etype` takes the same distinction as
+/// `is_preauth`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    /// Verifying a client's pre-authentication.
+    Preauth,
+    /// Sealing a ticket for a principal.
+    Ticket,
+}
+
 /// The enctypes a request may be answered in.
 ///
-/// The intersection of three sets, and all three matter: what the client asked
-/// for, what this KDC issues, and what the entry has a key for — an enctype the
-/// principal has no key for cannot verify its pre-authentication or encrypt its
-/// reply. Strongest first, because the first one becomes the session key.
-pub fn usable_enctypes(config: &KdcConfig, requested: &[i32], entry: &HdbEntry) -> Vec<Enctype> {
+/// The intersection of what the client asked for, what this KDC issues, and what
+/// the entry has a key for — an enctype the principal has no key for cannot
+/// verify its pre-authentication or encrypt its reply. Strongest first, because
+/// the first one becomes the session key.
+///
+/// For a [`Purpose::Ticket`] there is a fourth filter: the entry's own `etypes`
+/// restriction, if it declares one. That is the exchange's declaration of what
+/// it can read, and honouring it is the difference between a realm where an
+/// operator can turn off AES-128 for one service and a realm where the setting
+/// exists but does nothing.
+pub fn usable_enctypes(
+    config: &KdcConfig,
+    requested: &[i32],
+    entry: &HdbEntry,
+    purpose: Purpose,
+) -> Vec<Enctype> {
     config
         .allowed_enctypes()
         .iter()
         .copied()
         .filter(|e| requested.contains(&e.id()) && entry.key_for(*e).is_some())
+        .filter(|e| match (purpose, &entry.etypes) {
+            (Purpose::Ticket, Some(declared)) => declared.contains(e),
+            _ => true,
+        })
         .collect()
 }
 
@@ -245,7 +276,7 @@ impl Kdc {
         }
 
         // 4. Enctypes.
-        let usable = usable_enctypes(config, &body.etypes, &client);
+        let usable = usable_enctypes(config, &body.etypes, &client, Purpose::Preauth);
         if usable.is_empty() {
             return Err(Error::UnsupportedEnctype(
                 body.etypes.first().copied().unwrap_or(0),

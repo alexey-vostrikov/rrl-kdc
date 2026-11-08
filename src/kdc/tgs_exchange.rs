@@ -28,6 +28,7 @@ use crate::msg::{
 };
 use crate::name::Principal;
 
+use super::as_exchange::Purpose;
 use super::{Kdc, wrong_realm};
 
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
@@ -227,7 +228,7 @@ impl Kdc {
         }
 
         // 6: the ticket.
-        let usable = super::usable_enctypes(config, &body.etypes, &server);
+        let usable = super::usable_enctypes(config, &body.etypes, &server, Purpose::Ticket);
         let session_enctype = usable
             .first()
             .copied()

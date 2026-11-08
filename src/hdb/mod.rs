@@ -19,11 +19,15 @@ use crate::error::{Error, Result};
 use crate::name::Principal;
 
 pub mod keytab;
+#[cfg(feature = "hdb-ldap")]
+pub mod ldap;
 pub mod record;
 #[cfg(feature = "hdb-redb")]
 pub mod redb_store;
 
 pub use keytab::Keytab;
+#[cfg(feature = "hdb-ldap")]
+pub use ldap::LdapHdb;
 #[cfg(feature = "hdb-redb")]
 pub use redb_store::RedbHdb;
 
@@ -96,6 +100,16 @@ pub struct HdbEntry {
     pub principal: Principal,
     /// The keys, at most one per (kvno, enctype).
     pub keys: Vec<HdbKey>,
+    /// `kvno` (`[1]` in `hdb.asn1`): the key version this entry is at.
+    ///
+    /// A field rather than a maximum over `keys`, because the two are not the
+    /// same fact: an entry created before its keys are known (a principal added
+    /// to a directory by an administrator, an account whose keys live in another
+    /// system) has a version and no keys, and deriving one from the other would
+    /// erase it. [`HdbEntry::add_key`] and [`HdbEntry::rekey`] keep it moving
+    /// forward, so a value written here that is below the highest key is a
+    /// mistake the backends report rather than a state they repair.
+    pub kvno: u32,
     /// `HDBFlags`.
     pub flags: u32,
     /// `valid_start`.
@@ -108,6 +122,19 @@ pub struct HdbEntry {
     pub max_life: Option<i64>,
     /// `max_renew` for the same.
     pub max_renew: Option<i64>,
+    /// `etypes` (`[11]` in `hdb.asn1`): the enctypes this principal may be
+    /// issued a ticket in, or `None` for "whatever it has keys for".
+    ///
+    /// This is Heimdal's per-principal restriction, and it is the same thing
+    /// Active Directory keeps in `msDS-SupportedEncryptionTypes`: a declaration
+    /// that narrows an entry's key set for issuing. It is not the keys — an
+    /// entry with an AES-256 key and `etypes = [aes128]` may only get an AES-128
+    /// ticket, and the AES-256 key is still there for the old tickets sealed
+    /// with it.
+    ///
+    /// `None` and `Some([])` are different: no restriction, versus a principal
+    /// no enctype is acceptable for, which can be issued nothing.
+    pub etypes: Option<Vec<Enctype>>,
     /// `modified`.
     pub modified: i64,
 }
@@ -120,6 +147,7 @@ impl HdbEntry {
         HdbEntry {
             principal,
             keys: Vec::new(),
+            kvno: 0,
             flags: flags::CLIENT
                 | flags::INITIAL
                 | flags::FORWARDABLE
@@ -131,6 +159,7 @@ impl HdbEntry {
             pw_end: None,
             max_life: None,
             max_renew: None,
+            etypes: None,
             modified: 0,
         }
     }
@@ -140,12 +169,14 @@ impl HdbEntry {
         HdbEntry {
             principal,
             keys: Vec::new(),
+            kvno: 0,
             flags: flags::SERVER,
             valid_start: None,
             valid_end: None,
             pw_end: None,
             max_life: None,
             max_renew: None,
+            etypes: None,
             modified: 0,
         }
     }
@@ -156,12 +187,14 @@ impl HdbEntry {
         HdbEntry {
             principal: Principal::krbtgt(realm),
             keys: Vec::new(),
+            kvno: 0,
             flags: flags::SERVER | flags::FORWARDABLE | flags::PROXIABLE | flags::RENEWABLE,
             valid_start: None,
             valid_end: None,
             pw_end: None,
             max_life: None,
             max_renew: None,
+            etypes: None,
             modified: 0,
         }
     }
@@ -187,9 +220,9 @@ impl HdbEntry {
             .collect()
     }
 
-    /// The highest kvno any key is at.
+    /// The key version this entry is at.
     pub fn kvno(&self) -> u32 {
-        self.keys.iter().map(|k| k.kvno).max().unwrap_or(0)
+        self.kvno
     }
 
     /// Whether the entry may authenticate at `now`.
@@ -225,16 +258,19 @@ impl HdbEntry {
         // the same default the client applies when `ETYPE-INFO2` carries no
         // `s2kparams`, which is how both sides agree without being told.
         let key = cipher.s2k(enctype, password, &salt, None)?;
-        self.keys.push(HdbKey {
-            kvno,
-            key,
-            salt: Some(salt),
-        });
+        // Through `add_key`, so that the entry's version cannot stay behind the
+        // key it just gained.
+        self.add_key(key, kvno, Some(salt));
         Ok(())
     }
 
     /// Adds a raw key at `kvno` — what a keytab import does.
+    ///
+    /// Moves the entry's version forward when the key is newer, so that the two
+    /// cannot drift apart by accident; an import of an *older* key leaves the
+    /// version alone, which is the point of keeping old keys at all.
     pub fn add_key(&mut self, key: Key, kvno: u32, salt: Option<Vec<u8>>) {
+        self.kvno = self.kvno.max(kvno);
         self.keys.push(HdbKey { kvno, key, salt });
     }
 

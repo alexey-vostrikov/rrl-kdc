@@ -18,6 +18,10 @@
 //! | 6 | `max_life` | `INTEGER` seconds, optional |
 //! | 7 | `max_renew` | `INTEGER` seconds, optional |
 //! | 8 | `modified` | `KerberosTime` |
+//! | 9 | `etypes` | `SEQUENCE OF INTEGER`, optional — the enctypes this
+//!   principal may be issued |
+//! | 10 | `kvno` | `INTEGER` — the entry's key version. Absent in records
+//!   written before it was stored, which decode to the highest key instead |
 //!
 //! What is *not* here yet, and is not pretended otherwise: Heimdal's
 //! `HDB-extension` (`[9]`), `mkvno` on a key, generated and virtual keys, and
@@ -115,6 +119,21 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
         }
     }
     parts.push(der::field(8, der::time(entry.modified)));
+    if let Some(etypes) = &entry.etypes {
+        // `Some([])` is written as an empty SEQUENCE, not omitted: a principal
+        // that may be issued nothing is a decision, and dropping it would turn
+        // the entry back into one with no restriction at all.
+        parts.push(der::field(
+            9,
+            der::seq(
+                &etypes
+                    .iter()
+                    .map(|e| der::int(e.id() as i64))
+                    .collect::<Vec<_>>(),
+            ),
+        ));
+    }
+    parts.push(der::field(10, der::int(entry.kvno as i64)));
     der::seq(&parts)
 }
 
@@ -182,6 +201,30 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         }
     };
 
+    let keys_highest = keys.iter().map(|k| k.kvno).max().unwrap_or(0);
+
+    // `Some([])` and absent are different states and both are written, so the
+    // decoder must keep the difference rather than collapsing to `None`.
+    let etypes_field = || -> Result<Option<Vec<Enctype>>> {
+        if f.opt(9).is_none() {
+            return Ok(None);
+        }
+        let mut r = Reader::new(f.get(9, ctx)?);
+        let mut inner = Reader::new(r.expect(ctx, der::SEQUENCE)?);
+        let mut out = Vec::new();
+        while !inner.is_empty() {
+            let content = inner.expect(ctx, der::INTEGER)?;
+            let raw = der::as_int(ctx, content)?;
+            let enctype = Enctype::from_id(raw as i32).ok_or_else(|| {
+                Error::Hdb(format!(
+                    "{ctx}: enctype {raw} is not one this KDC implements"
+                ))
+            })?;
+            out.push(enctype);
+        }
+        Ok(Some(out))
+    };
+
     Ok(HdbEntry {
         principal,
         keys,
@@ -191,6 +234,15 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         pw_end: time_field(5)?,
         max_life: f.opt_int(6, ctx)?,
         max_renew: f.opt_int(7, ctx)?,
+        // A record written before the version was stored has no `[10]`; the
+        // highest key is the only value that cannot be wrong for it, and it is
+        // what this crate derived before the field existed.
+        kvno: match f.opt_int(10, ctx)? {
+            Some(kvno) => u32::try_from(kvno)
+                .map_err(|_| Error::Hdb(format!("{ctx}: kvno {kvno} does not fit in 32 bits")))?,
+            None => keys_highest,
+        },
+        etypes: etypes_field()?,
         modified: time_field(8)?.unwrap_or(0),
     })
 }

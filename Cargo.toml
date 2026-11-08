@@ -36,6 +36,10 @@ trace = ["dep:tracing"]
 # The second HDB backend: a single-file redb store, the same version the
 # in-process consumer already builds against.
 hdb-redb = ["dep:redb"]
+# The LDAP form of an entry: attribute names, the mapping to and from Heimdal's
+# schema, the Active Directory spellings, and an `Hdb` over a `Directory` the
+# embedder supplies. No LDAP client, on purpose: see `src/hdb/ldap.rs`.
+hdb-ldap = []
 # The JSON form of the administrator's vocabulary, for a transport that speaks
 # HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
 # this feature adds the request and reply envelopes and the base64 encoding the

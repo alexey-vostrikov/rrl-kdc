@@ -42,6 +42,8 @@ the administrator's API over it. The `krb5` crate drives the acceptance tests.
 | `admin` — create, delete, modify, re-key, export a keytab | done |
 | `admin::wire` — the operations as values, with the authorization in one place | done |
 | `admin::json` — the JSON form (feature `admin-json`) | done, for a REST front end to wrap |
+| `hdb::ldap` — an entry as directory attributes (feature `hdb-ldap`) | done: Heimdal's schema, plus the Microsoft spellings |
+| `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, chpass, chrand |
 
 ### Managing a realm without inventing an API
 
@@ -112,6 +114,34 @@ Three real bugs were caught by them during step 0 and are worth knowing:
    `aes256-cts-hmac-sha384-192` they are 192-bit, while `Ke` is 256-bit;
    deriving 32 octets and truncating the MAC yields a tag no peer accepts.
    RFC 8009 §4 also prefixes the salt with the enctype name and a NUL.
+
+### A realm in a directory
+
+`hdb-ldap` is a **mapping**, not an LDAP client: `to_attributes` writes an entry as
+the attributes Heimdal's `lib/hdb/hdb.schema` defines, `from_attributes` reads one
+back, and `Directory` is the four operations a KDC needs from whatever holds them.
+`LdapHdb` is then an `Hdb` over any such directory, so an embedder that already has
+a database implements that trait in a few dozen lines instead of running an LDAP
+client against itself.
+
+The Microsoft attributes (`msDS-KeyVersionNumber`, `msDS-SupportedEncryptionTypes`,
+`userAccountControl`, `servicePrincipalName`) are written, never required: an entry
+with only the Heimdal attributes is complete, and an entry with only Microsoft's
+reads too. Where the two vocabularies state one fact and disagree, the mapping
+refuses rather than picking a winner — a KDC that silently preferred one would end
+up with an account enabled in the directory and disabled in the realm.
+
+### `kadmin`
+
+`kadmin` speaks MIT's `kadm5` protocol over ONC RPC with RPCSEC_GSS privacy, and
+this crate answers it: the acceptance tests drive a real `krb5` 1.0
+`AdminClient` — connect, handshake, `get_principals`, create, delete, `chpass`,
+`chrand`, and then log in with an ordinary client using the password that was just
+set. Authorization is the same `Policy` the in-process and JSON front ends use, so
+a `kadmin` user without rights gets MIT's `KADM5_AUTH_*` and no data.
+
+Not implemented, and answered with an error rather than a fabricated success:
+policies, string attributes, `extract_keys`.
 
 ## Building
 

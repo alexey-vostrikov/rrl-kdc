@@ -258,19 +258,11 @@ impl Kdc {
             .hdb()
             .fetch(&sname)?
             .ok_or_else(|| Error::UnknownPrincipal(sname.to_string()))?;
-        // An AS-REQ may ask for the ticket-granting service, or for one of the
-        // services that must be reached *before* a TGT exists. RFC 3244's
-        // password change is the only such service here: `kpasswd` asks for
-        // kadmin/changepw straight from the AS, because a password that can no
-        // longer be changed is a password nobody can rotate.
-        let krbtgt_here = sname.is_krbtgt() && sname.components[1] == config.realm();
-        let changepw = server.has(entry_flags::CHANGE_PW);
-        if !krbtgt_here && !changepw {
-            return Err(Error::Kdc {
-                code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
-                text: format!("{sname} cannot be reached without a ticket-granting ticket"),
-            });
-        }
+        // Any service may be asked for here — that is what an "initial ticket" is,
+        // and Heimdal allows it (`kdc/kerberos5.c` restricts an AS request only by
+        // the entry's own flags). The opposite restriction lives in the TGS: an
+        // entry with `initial` may *only* be reached this way, which is how
+        // `kpasswd` keeps `kadmin/changepw` out of reach of a stolen TGT.
         if !server.has(entry_flags::SERVER) {
             return Err(Error::UnknownPrincipal(sname.to_string()));
         }

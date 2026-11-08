@@ -43,6 +43,9 @@ pub mod address;
 pub mod admin;
 /// The principal database, shaped after Heimdal's `lib/hdb/hdb.asn1`.
 pub mod hdb;
+/// `kadmind`: MIT's kadm5 RPC protocol, for a stock `kadmin` client.
+#[cfg(feature = "kadmin")]
+pub mod kadmin;
 /// The protocol engine: AS and TGS exchanges.
 pub mod kdc;
 /// RFC 4120 messages: the KDC reads requests and writes replies.

@@ -349,6 +349,14 @@ pub mod usage {
     pub const KRB_CRED_ENCPART: u32 = 14;
     /// A KRB-SAFE's checksum.
     pub const KRB_SAFE_CKSUM: u32 = 15;
+    /// An RFC 4121 Wrap token sealed by the context **acceptor**.
+    pub const ACCEPTOR_SEAL: u32 = 22;
+    /// An RFC 4121 MIC token signed by the context acceptor.
+    pub const ACCEPTOR_SIGN: u32 = 23;
+    /// An RFC 4121 Wrap token sealed by the context **initiator**.
+    pub const INITIATOR_SEAL: u32 = 24;
+    /// An RFC 4121 MIC token signed by the context initiator.
+    pub const INITIATOR_SIGN: u32 = 25;
 }
 
 #[cfg(test)]

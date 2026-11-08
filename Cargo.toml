@@ -40,6 +40,9 @@ hdb-redb = ["dep:redb"]
 # schema, the Active Directory spellings, and an `Hdb` over a `Directory` the
 # embedder supplies. No LDAP client, on purpose: see `src/hdb/ldap.rs`.
 hdb-ldap = []
+# `kadmind`: MIT's kadm5 protocol over ONC RPC, sealed by RPCSEC_GSS and RFC 4121
+# tokens. A front end over `Admin`, not a second implementation of it.
+kadmin = []
 # The JSON form of the administrator's vocabulary, for a transport that speaks
 # HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
 # this feature adds the request and reply envelopes and the base64 encoding the

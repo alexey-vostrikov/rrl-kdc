@@ -21,11 +21,10 @@ use rust_heimdal_kdc::error::codes;
 use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
 use rust_heimdal_kdc::kdc::{
     ChangePolicy, Kdc, KdcConfig, SelfOnly, kpasswd::ChangeReply, kpasswd::STATUS_SUCCESS,
-    kpasswd::VERSION_CHANGE, kpasswd::changepw_entry,
+    kpasswd::changepw_entry,
 };
-use rust_heimdal_kdc::msg::{EncTicketPart, EncryptedData, KdcReq, Ticket, kdc_options, tkt_flags};
+use rust_heimdal_kdc::msg::{EncTicketPart, EncryptedData, Ticket, kdc_options, tkt_flags};
 use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::{serve_kpasswd_loopback, serve_loopback};
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";

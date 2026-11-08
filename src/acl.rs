@@ -278,7 +278,9 @@ mod tests {
     #[test]
     fn a_granted_rule_lets_one_actor_change_one_target() {
         let store = MemoryAcl::new();
-        store.grant(&p("admin@R"), Targets::Only(p("bob@R"))).unwrap();
+        store
+            .grant(&p("admin@R"), Targets::Only(p("bob@R")))
+            .unwrap();
         let policy = StoredAclPolicy::new(std::sync::Arc::new(store));
         assert!(policy.may_change(&p("admin@R"), &p("bob@R")));
         assert!(
@@ -325,7 +327,9 @@ mod tests {
     fn revoke_all_removes_every_rule_of_one_actor() {
         let store = MemoryAcl::new();
         store.grant(&p("admin@R"), Targets::Any).unwrap();
-        store.grant(&p("admin@R"), Targets::Only(p("bob@R"))).unwrap();
+        store
+            .grant(&p("admin@R"), Targets::Only(p("bob@R")))
+            .unwrap();
         store.grant(&p("other@R"), Targets::Any).unwrap();
         assert_eq!(store.revoke_all(&p("admin@R")).unwrap(), 2);
         assert_eq!(store.rules().unwrap().len(), 1);
@@ -357,10 +361,7 @@ mod tests {
 
     #[test]
     fn the_text_form_parses_and_refuses_what_it_cannot_read() {
-        let rules = parse_rules(
-            "# an administrator\nadmin@R *\nhelpdesk@R alice@R\n\n",
-        )
-        .unwrap();
+        let rules = parse_rules("# an administrator\nadmin@R *\nhelpdesk@R alice@R\n\n").unwrap();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].targets, Targets::Any);
         assert_eq!(rules[1].targets, Targets::Only(p("alice@R")));
@@ -376,7 +377,10 @@ mod tests {
     fn listing_groups_rules_by_actor() {
         let rules = parse_rules("admin@R *\nhelpdesk@R alice@R\nadmin@R bob@R\n").unwrap();
         let grouped = by_actor(&rules);
-        assert_eq!(grouped["admin@R"], vec!["*".to_string(), "bob@R".to_string()]);
+        assert_eq!(
+            grouped["admin@R"],
+            vec!["*".to_string(), "bob@R".to_string()]
+        );
         assert_eq!(grouped["helpdesk@R"], vec!["alice@R".to_string()]);
     }
 }

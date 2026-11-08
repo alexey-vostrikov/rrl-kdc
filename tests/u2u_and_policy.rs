@@ -25,7 +25,7 @@ use rust_heimdal_kdc::kdc::{
 };
 use rust_heimdal_kdc::msg::{EncTicketPart, EncryptedData, KdcReq, Ticket, kdc_options, tkt_flags};
 use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::{serve_loopback, serve_kpasswd_loopback};
+use rust_heimdal_kdc::transport::{serve_kpasswd_loopback, serve_loopback};
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -64,7 +64,8 @@ fn realm() -> (Arc<MemoryHdb>, Key) {
 
     let mut svc = HdbEntry::service(service());
     for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
-        svc.add_password_key(&cipher, e, b"the-service-key", 1).unwrap();
+        svc.add_password_key(&cipher, e, b"the-service-key", 1)
+            .unwrap();
     }
     db.insert(svc).unwrap();
 
@@ -142,8 +143,14 @@ fn u2u_request(tgt: &(Vec<u8>, Key), additional: &[u8], target: &Principal) -> V
     let ap_req = rust_heimdal_kdc::msg::ApReq {
         ap_options: 0,
         ticket: tgt.0.clone(),
-        authenticator: EncryptedData::seal(&cipher, &tgt.1, usage::TGS_REQ_AUTH, None, &auth.encode())
-            .unwrap(),
+        authenticator: EncryptedData::seal(
+            &cipher,
+            &tgt.1,
+            usage::TGS_REQ_AUTH,
+            None,
+            &auth.encode(),
+        )
+        .unwrap(),
     };
     der::cons(
         der::app(12),
@@ -152,13 +159,15 @@ fn u2u_request(tgt: &(Vec<u8>, Key), additional: &[u8], target: &Principal) -> V
             der::field(2, der::int(12)),
             der::field(
                 3,
-                rust_heimdal_kdc::msg::encode_pa_data(&[(rust_heimdal_kdc::msg::PA_TGS_REQ, ap_req.encode())]),
+                rust_heimdal_kdc::msg::encode_pa_data(&[(
+                    rust_heimdal_kdc::msg::PA_TGS_REQ,
+                    ap_req.encode(),
+                )]),
             ),
             der::field(4, body),
         ])],
     )
 }
-
 
 // ---------------------------------------------------------------------------
 // U2U (RFC 4120 §2.9.2)
@@ -366,7 +375,10 @@ fn realm_with_accounts() -> Arc<MemoryHdb> {
 fn the_default_policy_is_self_service_only() {
     let policy = SelfOnly;
     assert!(policy.may_change(&alice(), &alice()));
-    assert!(!policy.may_change(&alice(), &Principal::parse(&format!("bob@{REALM}")).unwrap()));
+    assert!(!policy.may_change(
+        &alice(),
+        &Principal::parse(&format!("bob@{REALM}")).unwrap()
+    ));
 }
 
 #[test]
@@ -375,8 +387,8 @@ fn an_administrator_may_change_another_password() {
     // the administrators are, and this crate just asks.
     let db = realm_with_accounts();
     let admin = Principal::parse(&format!("admin@{REALM}")).unwrap();
-    let kdc = kdc_over(Arc::clone(&db))
-        .with_change_policy(Arc::new(Administrators(vec![admin.clone()])));
+    let kdc =
+        kdc_over(Arc::clone(&db)).with_change_policy(Arc::new(Administrators(vec![admin.clone()])));
 
     let data = rust_heimdal_kdc::msg::kpasswd::ChangePasswdData {
         new_password: b"a password an admin set".to_vec(),
@@ -396,8 +408,7 @@ fn an_administrator_may_change_another_password() {
 fn a_non_administrator_still_may_not() {
     let db = realm_with_accounts();
     let admin = Principal::parse(&format!("admin@{REALM}")).unwrap();
-    let kdc = kdc_over(Arc::clone(&db))
-        .with_change_policy(Arc::new(Administrators(vec![admin])));
+    let kdc = kdc_over(Arc::clone(&db)).with_change_policy(Arc::new(Administrators(vec![admin])));
     let data = rust_heimdal_kdc::msg::kpasswd::ChangePasswdData {
         new_password: b"alice tries it".to_vec(),
         target: Some(Principal::parse(&format!("bob@{REALM}")).unwrap()),
@@ -450,8 +461,14 @@ fn change_through_wire(
     let ticket = Ticket {
         realm: REALM.into(),
         sname: svc,
-        enc: EncryptedData::seal(&cipher, &service_key, usage::KDC_REP_TICKET, Some(1), &part.encode())
-            .unwrap(),
+        enc: EncryptedData::seal(
+            &cipher,
+            &service_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
     };
     let subkey = cipher.random(Enctype::Aes256Sha1).unwrap();
     let auth = rust_heimdal_kdc::msg::Authenticator {
@@ -487,7 +504,8 @@ fn change_through_wire(
 
 /// The status in a change-password reply.
 fn status_of(reply: &ChangeReply, subkey: &Key) -> u16 {
-    let (payload, _) = rust_heimdal_kdc::msg::kpasswd::open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
-        .expect("the reply must decrypt in the client's subkey");
+    let (payload, _) =
+        rust_heimdal_kdc::msg::kpasswd::open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
+            .expect("the reply must decrypt in the client's subkey");
     u16::from_be_bytes([payload[0], payload[1]])
 }

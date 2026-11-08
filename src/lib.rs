@@ -35,14 +35,14 @@ pub mod error;
 /// `KerberosTime`: `GeneralizedTime` in `YYYYMMDDHHMMSSZ`.
 pub mod time;
 
-/// Ticket addresses: `HostAddress`, and the check a KDC makes against them.
-pub mod address;
-/// The principal database, shaped after Heimdal's `lib/hdb/hdb.asn1`.
-pub mod hdb;
 /// Who may change whose password, stored rather than configured.
 pub mod acl;
+/// Ticket addresses: `HostAddress`, and the check a KDC makes against them.
+pub mod address;
 /// Managing a realm: create, delete, modify, re-key, export a keytab.
 pub mod admin;
+/// The principal database, shaped after Heimdal's `lib/hdb/hdb.asn1`.
+pub mod hdb;
 /// The protocol engine: AS and TGS exchanges.
 pub mod kdc;
 /// RFC 4120 messages: the KDC reads requests and writes replies.

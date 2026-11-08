@@ -612,7 +612,10 @@ fn first_ticket(encoded: &[u8]) -> Result<Vec<u8>> {
     if tlv.tag != crate::der::app(crate::msg::TICKET) {
         return Err(Error::Kdc {
             code: codes::KDC_ERR_BADOPTION,
-            text: format!("additional-tickets holds tag {:#04x}, not a Ticket", tlv.tag),
+            text: format!(
+                "additional-tickets holds tag {:#04x}, not a Ticket",
+                tlv.tag
+            ),
         });
     }
     // The reader hands back the tag and the content separately; `Ticket::decode`
@@ -623,4 +626,3 @@ fn first_ticket(encoded: &[u8]) -> Result<Vec<u8>> {
     out.extend_from_slice(tlv.content);
     Ok(out)
 }
-

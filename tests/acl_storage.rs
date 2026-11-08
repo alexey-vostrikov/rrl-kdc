@@ -115,10 +115,7 @@ fn a_revocation_takes_effect_for_the_next_change() {
         policy.may_change(&p("admin"), &p("bob")),
         "the grant must work before it is withdrawn"
     );
-    policy
-        .store()
-        .revoke(&p("admin"), &Targets::Any)
-        .unwrap();
+    policy.store().revoke(&p("admin"), &Targets::Any).unwrap();
     assert!(
         !policy.may_change(&p("admin"), &p("bob")),
         "a policy that keeps a revoked rule lets somebody in after they were removed"
@@ -211,7 +208,9 @@ fn exchange(
 ) -> (kpasswd::ChangeReply, rust_heimdal_kdc::crypto::Key) {
     use rust_heimdal_kdc::crypto::usage;
     use rust_heimdal_kdc::msg::kpasswd::{ChangePasswdData, seal_krb_priv};
-    use rust_heimdal_kdc::msg::{ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, tkt_flags};
+    use rust_heimdal_kdc::msg::{
+        ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, tkt_flags,
+    };
 
     let cipher = OwnCipher;
     let session = cipher.random(Enctype::Aes256Sha1).unwrap();
@@ -240,8 +239,14 @@ fn exchange(
     let ticket = Ticket {
         realm: REALM.into(),
         sname: Principal::parse(&format!("kadmin/changepw@{REALM}")).unwrap(),
-        enc: EncryptedData::seal(&cipher, &service_key, usage::KDC_REP_TICKET, Some(1), &part.encode())
-            .unwrap(),
+        enc: EncryptedData::seal(
+            &cipher,
+            &service_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
     };
     let subkey = cipher.random(Enctype::Aes256Sha1).unwrap();
     let auth = Authenticator {
@@ -257,8 +262,14 @@ fn exchange(
     let ap_req = ApReq {
         ap_options: 0,
         ticket: ticket.encode(),
-        authenticator: EncryptedData::seal(&cipher, &session, usage::AP_REQ_AUTH, None, &auth.encode())
-            .unwrap(),
+        authenticator: EncryptedData::seal(
+            &cipher,
+            &session,
+            usage::AP_REQ_AUTH,
+            None,
+            &auth.encode(),
+        )
+        .unwrap(),
     };
     let data = ChangePasswdData {
         new_password: new_password.as_bytes().to_vec(),

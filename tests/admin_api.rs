@@ -109,7 +109,10 @@ fn a_service_account_may_be_issued_tickets_but_not_ask_for_them() {
 #[test]
 fn deleting_krbtgt_is_refused() {
     let (_db, admin) = realm();
-    let err = admin.delete(&Principal::krbtgt(REALM)).unwrap_err().to_string();
+    let err = admin
+        .delete(&Principal::krbtgt(REALM))
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("may not be deleted"),
         "deleting krbtgt invalidates every ticket in the realm, got: {err}"
@@ -140,7 +143,13 @@ fn a_password_change_moves_the_kvno_and_keeps_the_old_keys() {
     admin
         .create(NewPrincipal::user(p("alice"), b"old".to_vec()))
         .unwrap();
-    let first = admin.get(&p("alice")).unwrap().key_for(Enctype::Aes256Sha1).unwrap().key.clone();
+    let first = admin
+        .get(&p("alice"))
+        .unwrap()
+        .key_for(Enctype::Aes256Sha1)
+        .unwrap()
+        .key
+        .clone();
     let kvno = admin.set_password(&p("alice"), b"new").unwrap();
     assert_eq!(kvno, 2);
     let after = admin.get(&p("alice")).unwrap();
@@ -186,7 +195,10 @@ fn an_empty_modification_is_refused() {
     admin
         .create(NewPrincipal::user(p("alice"), b"pw".to_vec()))
         .unwrap();
-    let err = admin.modify(&p("alice"), Modify::default()).unwrap_err().to_string();
+    let err = admin
+        .modify(&p("alice"), Modify::default())
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("nothing to do"),
         "a no-op that reports success is a change an operator will believe happened"
@@ -233,7 +245,12 @@ fn the_keytab_carries_every_key_the_entry_holds() {
     // kvno as well: that is the case a keytab has to serve, because the service
     // may be running with the previous file while the KDC already has the new key.
     let old = OwnCipher
-        .s2k(Enctype::Aes256Sha1, b"service key", b"EXAMPLE.COMhost".as_slice(), None)
+        .s2k(
+            Enctype::Aes256Sha1,
+            b"service key",
+            b"EXAMPLE.COMhost".as_slice(),
+            None,
+        )
         .unwrap();
     admin.set_password(&host, b"rotated service key").unwrap();
     let mut entry = admin.get(&host).unwrap();
@@ -280,7 +297,11 @@ fn the_listing_walks_every_principal() {
             .unwrap();
     }
     let listed = admin.list().unwrap();
-    assert_eq!(listed.len(), 4, "three accounts and the krbtgt the realm was made with");
+    assert_eq!(
+        listed.len(),
+        4,
+        "three accounts and the krbtgt the realm was made with"
+    );
     assert!(listed.contains(&Principal::krbtgt(REALM)));
 }
 
@@ -324,7 +345,11 @@ fn a_password_can_be_set_on_a_principal_with_a_restricted_enctype_set() {
     assert_eq!(admin.get(&p("alice")).unwrap().keys.len(), 1);
     admin.set_password(&p("alice"), b"new").unwrap();
     let after = admin.get(&p("alice")).unwrap();
-    assert_eq!(after.keys.len(), 1, "a change keeps the entry's enctype set");
+    assert_eq!(
+        after.keys.len(),
+        1,
+        "a change keeps the entry's enctype set"
+    );
     assert_eq!(after.keys[0].key.enctype(), Enctype::Aes128Sha1);
 }
 

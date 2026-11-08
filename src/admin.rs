@@ -142,7 +142,11 @@ impl Admin {
     }
 
     /// An administrator whose enctypes are the four this crate issues.
-    pub fn with_defaults(realm: impl Into<String>, hdb: Arc<dyn Hdb>, cipher: Arc<dyn Cipher>) -> Self {
+    pub fn with_defaults(
+        realm: impl Into<String>,
+        hdb: Arc<dyn Hdb>,
+        cipher: Arc<dyn Cipher>,
+    ) -> Self {
         Admin::new(realm, hdb, cipher, &Enctype::ALL)
     }
 
@@ -167,9 +171,9 @@ impl Admin {
 
     /// One entry.
     pub fn get(&self, principal: &Principal) -> Result<HdbEntry> {
-        self.hdb.fetch(principal)?.ok_or_else(|| {
-            Error::Hdb(format!("{principal} is not in the database"))
-        })
+        self.hdb
+            .fetch(principal)?
+            .ok_or_else(|| Error::Hdb(format!("{principal} is not in the database")))
     }
 
     /// Creates a principal, or fails if it exists.
@@ -342,7 +346,13 @@ impl Admin {
     }
 
     /// Adds a raw key to an entry — what importing a keytab does.
-    pub fn add_key(&self, principal: &Principal, key: Key, kvno: u32, salt: Option<Vec<u8>>) -> Result<()> {
+    pub fn add_key(
+        &self,
+        principal: &Principal,
+        key: Key,
+        kvno: u32,
+        salt: Option<Vec<u8>>,
+    ) -> Result<()> {
         let mut entry = self.get(principal)?;
         if entry.key_for(key.enctype()).is_some_and(|k| k.kvno > kvno) {
             return Err(Error::Hdb(format!(

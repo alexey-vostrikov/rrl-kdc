@@ -179,7 +179,6 @@ impl RedbHdb {
     }
 }
 
-
 /// The change-password rules live in the same file as the principals, behind
 /// the same handle.
 ///

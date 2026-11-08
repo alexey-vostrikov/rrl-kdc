@@ -300,7 +300,13 @@ impl HdbEntry {
         }
         let next = self.kvno().saturating_add(1);
         let mut updated = self.clone();
-        updated.keys.clear();
+        // The old keys stay. A service that has not re-read its keytab yet must
+        // still read the tickets issued a minute ago, and a ticket is sealed with
+        // the key of the kvno it was issued against — dropping that key turns a
+        // password change into an outage for every service that rotates on its own
+        // schedule. Bounding the history is a separate decision, which is what
+        // `Admin::prune_old_keys` is for.
+        updated.keys.retain(|k| k.kvno != next);
         for enctype in enctypes {
             let salt = self
                 .key_for(enctype)

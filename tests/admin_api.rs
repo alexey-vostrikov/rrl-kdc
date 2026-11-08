@@ -156,11 +156,25 @@ fn a_password_change_moves_the_kvno_and_keeps_the_old_keys() {
     assert_eq!(after.kvno(), 2);
     assert_eq!(
         after.keys.len(),
-        4,
-        "one new key per enctype, and the old ones dropped: a password change replaces, it does \
-         not accumulate"
+        8,
+        "one new key per enctype *and* the previous ones: a ticket sealed with the old key must \
+         still open, or a password change is an outage for every service that rotates on its own \
+         schedule"
     );
-    assert_ne!(after.key_for(Enctype::Aes256Sha1).unwrap().key, first);
+    assert_ne!(
+        after.key_for(Enctype::Aes256Sha1).unwrap().key,
+        first,
+        "the key a client derives from the new password is the new one"
+    );
+    assert!(
+        after.keys.iter().any(|k| k.key.bytes() == first.bytes()),
+        "and the old key is still there, at the previous kvno"
+    );
+    assert_eq!(
+        after.key_for(Enctype::Aes256Sha1).unwrap().kvno,
+        2,
+        "lookups answer with the newest"
+    );
 }
 
 #[test]
@@ -344,13 +358,24 @@ fn a_password_can_be_set_on_a_principal_with_a_restricted_enctype_set() {
         .unwrap();
     assert_eq!(admin.get(&p("alice")).unwrap().keys.len(), 1);
     admin.set_password(&p("alice"), b"new").unwrap();
+    assert_eq!(
+        admin.get(&p("alice")).unwrap().keys.len(),
+        2,
+        "one new key in the entry's only enctype, and the previous one kept"
+    );
     let after = admin.get(&p("alice")).unwrap();
     assert_eq!(
-        after.keys.len(),
+        after.keys.iter().filter(|k| k.kvno == after.kvno()).count(),
         1,
-        "a change keeps the entry's enctype set"
+        "a change keeps the entry's enctype set: one new key, not four"
     );
-    assert_eq!(after.keys[0].key.enctype(), Enctype::Aes128Sha1);
+    assert!(
+        after
+            .keys
+            .iter()
+            .all(|k| k.key.enctype() == Enctype::Aes128Sha1),
+        "and no key in an enctype the realm does not issue"
+    );
 }
 
 #[test]

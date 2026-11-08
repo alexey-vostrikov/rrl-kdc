@@ -132,9 +132,14 @@ fn the_change_moves_the_key_version_and_keeps_the_old_key() {
     assert_eq!(before.kvno(), 1, "the account started at kvno 1");
     assert_eq!(after.kvno(), 2, "a change must move the kvno");
     assert_eq!(
-        after.keys.len(),
+        after.keys.iter().filter(|k| k.kvno == 2).count(),
         before.keys.len(),
         "one new key per enctype the account already had"
+    );
+    assert_eq!(
+        after.keys.len(),
+        before.keys.len() * 2,
+        "and the previous keys stay, so a ticket issued a moment ago still opens"
     );
     assert_ne!(
         after.key_for(Enctype::Aes256Sha1).unwrap().key,

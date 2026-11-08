@@ -259,6 +259,32 @@ fn an_unknown_service_is_s_principal_unknown() {
     );
 }
 
+/// A principal that exists but is not a service gets the *same* answer as one
+/// that does not exist, and that is the behaviour to keep.
+///
+/// Heimdal looks the target up with `HDB_F_GET_SERVER`, so "there, but not a
+/// service" and "not there" collapse into one answer before the KDC ever sees
+/// them; this backend returns the entry and the flag check decides. Answering
+/// `KDC_ERR_POLICY` here would claim something else — that the principal *is*
+/// a service and is being refused — and would send a client looking for a
+/// policy to change instead of for a service that exists. The flag check is
+/// the boundary, so it is what this test holds in place.
+#[test]
+fn a_principal_that_is_not_a_service_is_s_principal_unknown_too() {
+    let (_, krbtgt_key) = realm();
+    let t = tgt(&krbtgt_key, &alice(), NOW + 3600, None, tkt_flags::INITIAL);
+    // `alice` is in the database, with a password key and the client flags a
+    // user entry carries — it is present and is not a service.
+    let knobs = Knobs {
+        target: Some(alice()),
+        ..Knobs::default()
+    };
+    assert_eq!(
+        code_of(&kdc().handle(&tgs_req(&t, knobs), NOW)),
+        codes::KDC_ERR_S_PRINCIPAL_UNKNOWN
+    );
+}
+
 #[test]
 fn a_checksum_that_does_not_cover_the_body_is_modified() {
     let (_, krbtgt_key) = realm();

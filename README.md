@@ -24,9 +24,9 @@ else's implementation — a KDC that only agrees with itself agrees with nothing
 
 ## Status
 
-Step 0 of the plan is in place and green: DER, the crypto profile, and two
-crypto backends checked against published vectors. The protocol engine
-(`msg`, `hdb`, `kdc`) is next.
+The protocol engine is in place and green: AS and TGS exchanges, the
+change-password service, user-to-user tickets, keytab files, a redb store, and
+the administrator's API over it. The `krb5` crate drives the acceptance tests.
 
 | Layer | State |
 |---|---|
@@ -34,9 +34,12 @@ crypto backends checked against published vectors. The protocol engine
 | `crypto` — RFC 3961 §5.1/§5.3, RFC 3962, RFC 8009 | done: enctypes 17/18/19/20 |
 | `crypto::nfold` — RFC 3961 §5.1 n-fold | done |
 | `time` — `KerberosTime` | done |
-| `msg` — KDC-REQ decode, KDC-REP / EncASRepPart / EncTGSRepPart encode | todo |
-| `hdb` — principal records after Heimdal's `lib/hdb/hdb.asn1` | todo |
-| `kdc` — AS-REQ → AS-REP, TGS-REQ → TGS-REP | todo |
+| `msg` — KDC-REQ decode, KDC-REP / EncASRepPart / EncTGSRepPart encode | done |
+| `hdb` — principal records after Heimdal's `lib/hdb/hdb.asn1` | done: memory and redb backends, keytab read/write |
+| `kdc` — AS-REQ → AS-REP, TGS-REQ → TGS-REP | done, including user-to-user tickets |
+| `kdc::kpasswd` — RFC 3244 change-password | done: set-password, with a pluggable authorization policy |
+| `acl` — who may change whose password | done: rules in a store, not a file |
+| `admin` — create, delete, modify, re-key, export a keytab | done |
 
 ## Enctypes
 

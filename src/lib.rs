@@ -41,6 +41,8 @@ pub mod address;
 pub mod hdb;
 /// Who may change whose password, stored rather than configured.
 pub mod acl;
+/// Managing a realm: create, delete, modify, re-key, export a keytab.
+pub mod admin;
 /// The protocol engine: AS and TGS exchanges.
 pub mod kdc;
 /// RFC 4120 messages: the KDC reads requests and writes replies.

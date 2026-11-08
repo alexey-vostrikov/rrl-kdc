@@ -1,0 +1,200 @@
+{
+ "source": "Heimdal 7.99.1, lib/krb5/{n-fold-test.c,derived-key-test.c,aes-test.c}",
+ "license": "BSD-3-Clause (Kungliga Tekniska Hogskolan)",
+ "note": "Vectors transcribed from Heimdal's own test programs. The second column of n-fold-test.c is an octet count, not a bit count.",
+ "nfold": [
+  {
+   "input": "012345",
+   "octets": 8,
+   "output": "be072631276b1955"
+  },
+  {
+   "input": "basch",
+   "octets": 24,
+   "output": "1aab6b42964b98b21f8cde2d2448ba3455d7862c9731643f"
+  },
+  {
+   "input": "eichin",
+   "octets": 24,
+   "output": "65696368696e4b732b4b1b43da1a5b995a58d2c6d0d2dcca"
+  },
+  {
+   "input": "sommerfeld",
+   "octets": 24,
+   "output": "2f7a98557c6ee4abadf4e71192dd442bd4ff5325a5def75c"
+  },
+  {
+   "input": "MASSACHVSETTS INSTITVTE OF TECHNOLOGY",
+   "octets": 24,
+   "output": "db3b0d8f0b061e603282b308a50841229ad798fab9540c1b"
+  },
+  {
+   "input": "assar@NADA.KTH.SE",
+   "octets": 24,
+   "output": "5c06c34d2c8905be7a51836cd6f81c4b7a9349165ab3faa9"
+  },
+  {
+   "input": "testKRBTEST.MIT.EDUtestkey",
+   "octets": 24,
+   "output": "502cf82978e5fb1a2906bd22289156c006a0dcf5b6c2da6c"
+  },
+  {
+   "input": "password",
+   "octets": 7,
+   "output": "78a07b6caf85fa"
+  },
+  {
+   "input": "Rough Consensus, and Running Code",
+   "octets": 8,
+   "output": "bb6ed30870b7f0e0"
+  },
+  {
+   "input": "password",
+   "octets": 21,
+   "output": "59e4a8ca7c0385c3c37b3f6d2000247cb6e6bd5b3e"
+  },
+  {
+   "input": "kerberos",
+   "octets": 8,
+   "output": "6b65726265726f73"
+  }
+ ],
+ "derive": [
+  {
+   "enctype": 19,
+   "key": "3705d96080c17728a0e800eab6e0d23c",
+   "constant": "0000000299",
+   "derived": "b31a018a48f54776f403e9a396325dc3"
+  },
+  {
+   "enctype": 19,
+   "key": "3705d96080c17728a0e800eab6e0d23c",
+   "constant": "00000002aa",
+   "derived": "9b197dd1e8c5609d6e67c3e37c62c72e"
+  },
+  {
+   "enctype": 19,
+   "key": "3705d96080c17728a0e800eab6e0d23c",
+   "constant": "0000000255",
+   "derived": "9fda0e56ab2d85e1569a688696c26a6c"
+  },
+  {
+   "enctype": 20,
+   "key": "6d404d37faf79f9df0d33568d320669800eb4836472ea8a026d16b7182460c52",
+   "constant": "0000000299",
+   "derived": "ef5718be86cc84963d8bbb5031e9f5c4ba41f28faf69e73d"
+  },
+  {
+   "enctype": 20,
+   "key": "6d404d37faf79f9df0d33568d320669800eb4836472ea8a026d16b7182460c52",
+   "constant": "00000002aa",
+   "derived": "56ab22bee63d82d7bc5227f6773f8ea7a5eb1c825160c38312980c442e5c7e49"
+  },
+  {
+   "enctype": 20,
+   "key": "6d404d37faf79f9df0d33568d320669800eb4836472ea8a026d16b7182460c52",
+   "constant": "0000000255",
+   "derived": "69b16514e3cd8e56b82010d5c73012b622c4d00ffc23ed1f"
+  }
+ ],
+ "s2k": [
+  {
+   "enctype": 19,
+   "salt": "10df9dd783e5bc8acea1730e74355f61415448454e412e4d49542e4544557261656275726e",
+   "iterations": 32768,
+   "key": "089bca48b105ea6ea77ca5d2f39dc5e7",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 20,
+   "salt": "10df9dd783e5bc8acea1730e74355f61415448454e412e4d49542e4544557261656275726e",
+   "iterations": 32768,
+   "key": "45bd806dbf6a833a9cffc1c94589a222367a79bc21c413718906e9f578a78467",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 17,
+   "salt": "415448454e412e4d49542e4544557261656275726e",
+   "iterations": 1,
+   "key": "42263c6e89f4fc28b8df68ee09799f15",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 18,
+   "salt": "415448454e412e4d49542e4544557261656275726e",
+   "iterations": 1,
+   "key": "fe697b52bc0d3ce14432ba036a92e65bbb52280990a2fa27883998d72af30161",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 17,
+   "salt": "415448454e412e4d49542e4544557261656275726e",
+   "iterations": 1200,
+   "key": "4c01cd46d632d01e6dbe230a01ed642a",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 18,
+   "salt": "415448454e412e4d49542e4544557261656275726e",
+   "iterations": 1200,
+   "key": "55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 17,
+   "salt": "706173732070687261736520657175616c7320626c6f636b2073697a65",
+   "iterations": 1200,
+   "key": "59d1bb789a828b1aa54ef9c2883f69ed",
+   "password_hex": "58585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858"
+  },
+  {
+   "enctype": 18,
+   "salt": "706173732070687261736520657175616c7320626c6f636b2073697a65",
+   "iterations": 1200,
+   "key": "89adee3608db8bc71f1bfbfe459486b05618b70cbae22092534e56c553ba4b34",
+   "password_hex": "58585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858"
+  },
+  {
+   "enctype": 17,
+   "salt": "7061737320706872617365206578636565647320626c6f636b2073697a65",
+   "iterations": 1200,
+   "key": "cb8005dc5f90179a7f02104c0018751d",
+   "password_hex": "5858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858"
+  },
+  {
+   "enctype": 18,
+   "salt": "7061737320706872617365206578636565647320626c6f636b2073697a65",
+   "iterations": 1200,
+   "key": "d78c5c9cb872a8c9dad4697f0bb5b2d21496c82beb2caeda2112fceea057401b",
+   "password_hex": "5858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858"
+  },
+  {
+   "enctype": 17,
+   "salt": "1234567878563412",
+   "iterations": 5,
+   "key": "e9b23d52273747dd5c35cb55be619d8e",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 18,
+   "salt": "1234567878563412",
+   "iterations": 5,
+   "key": "97a4e786be20d81a382d5ebc96d5909cabcdadc87ca48f574504159f16c36e31",
+   "password_hex": "70617373776f7264"
+  },
+  {
+   "enctype": 17,
+   "salt": "4558414d504c452e434f4d7069616e697374",
+   "iterations": 50,
+   "key": "f149c1f2e154a73452d43e7fe62a56e5",
+   "password_hex": "f09d849e"
+  },
+  {
+   "enctype": 18,
+   "salt": "4558414d504c452e434f4d7069616e697374",
+   "iterations": 50,
+   "key": "4b6d9839f84406df1f09cc166db4b83c571848b784a3d6bdc346589a3e393f9e",
+   "password_hex": "f09d849e"
+  }
+ ]
+}

@@ -1,0 +1,55 @@
+[package]
+name = "rust-heimdal-kdc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "Kerberos KDC core in Rust with Heimdal-compatible behaviour: sans-io AS/TGS, HDB, RFC 3961/3962/8009 crypto"
+license = "MIT"
+repository = "https://gitlab.skala-r.ru/avostrikov/rust-heimdal-kdc"
+readme = "README.md"
+keywords = ["kerberos", "kdc", "krb5", "heimdal", "rfc4120"]
+categories = ["authentication", "cryptography", "network-programming"]
+
+[dependencies]
+aes = "0.9"
+getrandom = "0.4"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+tracing = { version = "0.1", optional = true }
+redb = { version = "4.4", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+# The differential-check backend. Its crypto is the only half used, so the
+# client-oriented features stay off: no tokio, no resolver, no SPNEGO.
+# The version is the one the in-process consumer (rust-rest-ldap) vendors, so
+# one copy serves both.
+rskrb5 = { version = "0.2", default-features = false, optional = true }
+
+[features]
+default = []
+# Heimdal writes its audit log through the host's syslog; here it is `tracing`.
+trace = ["dep:tracing"]
+# The second HDB backend: a single-file redb store, the same version the
+# in-process consumer already builds against.
+hdb-redb = ["dep:redb"]
+serde = ["dep:serde"]
+# A second, independent implementation of RFC 3961/3962/8009 crypto. Every
+# known-answer vector in `tests/` then runs against both, which turns the
+# vectors from a self-test into a differential test.
+crypto-rskrb5 = ["dep:rskrb5"]
+
+[dev-dependencies]
+# An independent Kerberos client, written by a third party and tested against a
+# live MIT KDC. It is the client half of the acceptance test: it asks this KDC
+# for a TGT exactly as MIT's `kinit` would, and refuses anything MIT refuses.
+krb5 = "1.0"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+overflow-checks = true

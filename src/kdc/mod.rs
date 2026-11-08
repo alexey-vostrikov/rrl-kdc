@@ -127,11 +127,13 @@ impl Kdc {
     /// The database as a shared handle, for a front end that needs to own one —
     /// `kadmind` builds an `Admin` over the same database the KDC serves from, so
     /// that a principal it creates and a ticket the KDC issues cannot disagree.
+    #[cfg(feature = "kadmin")]
     pub(crate) fn hdb_arc(&self) -> Arc<dyn Hdb> {
         Arc::clone(&self.hdb)
     }
 
     /// The crypto backend as a shared handle.
+    #[cfg(feature = "kadmin")]
     pub(crate) fn cipher_arc(&self) -> Arc<dyn Cipher> {
         Arc::clone(&self.cipher)
     }

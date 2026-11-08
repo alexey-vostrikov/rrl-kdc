@@ -71,22 +71,42 @@ impl std::fmt::Debug for RunningKdc {
 /// The same port on both protocols is what a client expects: it discovers a KDC
 /// by name, not by transport, and picks the protocol per request.
 pub fn serve_loopback(kdc: Kdc) -> RunningKdc {
+    serve_on(("127.0.0.1", 0), kdc)
+}
+
+/// Binds UDP and TCP on `addr` and answers with `kdc`.
+///
+/// The address a real deployment needs: port 88 is below 1024, so it takes a
+/// privileged process or a capability, and a KDC that could only bind loopback
+/// would be a library no daemon could wrap. `serve_loopback` is this with a
+/// loopback address and an ephemeral port.
+///
+/// Panics when the pair cannot be bound. The alternative — returning an error a
+/// caller might ignore — leaves a KDC that looks alive and answers nothing, and a
+/// realm whose first symptom is a client timing out.
+pub fn serve_on<A: std::net::ToSocketAddrs>(addr: A, kdc: Kdc) -> RunningKdc {
     let kdc = Arc::new(kdc);
-    // Bind TCP first to get a free port, then take the same one for UDP. The
-    // pair can collide with another process between the two binds, so a few
-    // attempts are made rather than panicking on the first race.
+    let addr = addr
+        .to_socket_addrs()
+        .unwrap_or_else(|e| panic!("cannot resolve the KDC address: {e}"))
+        .next()
+        .unwrap_or_else(|| panic!("the KDC address resolved to nothing"));
+    // Bind TCP first, then UDP on the same address: the pair can collide with
+    // another process between the two binds, so a few attempts are made rather
+    // than panicking on the first race. With an explicit port the retry cannot
+    // help, and the bind either works or says why.
     let mut attempt = 0;
     let (listener, udp) = loop {
         attempt += 1;
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .unwrap_or_else(|e| panic!("cannot bind the TCP listener: {e}"));
-        let addr = listener
+        let listener = TcpListener::bind(addr)
+            .unwrap_or_else(|e| panic!("cannot bind the TCP listener on {addr}: {e}"));
+        let bound = listener
             .local_addr()
             .expect("bound listener has an address");
-        match UdpSocket::bind(addr) {
+        match UdpSocket::bind(bound) {
             Ok(udp) => break (listener, udp),
-            Err(_) if attempt < 16 => continue,
-            Err(e) => panic!("cannot bind UDP on {addr}: {e}"),
+            Err(_) if attempt < 16 && addr.port() == 0 => continue,
+            Err(e) => panic!("cannot bind UDP on {bound}: {e}"),
         }
     };
     let addr = listener

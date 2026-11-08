@@ -1,0 +1,93 @@
+# The directory side of the stand: a realm that has to look like a domain.
+#
+# Every non-default line here is a concession the stand makes so that Samba gets far
+# enough to fail for an interesting reason. They are listed, not hidden:
+#
+#   schema.mode: warn          the stand seeds entries by hand and would rather see
+#                              the violation than be refused at start
+#   access: users may write    a real deployment names administrators; the stand lets
+#                              any authenticated principal write so that the join is
+#                              not blocked by an ACL before it reaches the part this
+#                              exercise is about
+#   cldap.enabled: true        off by default on purpose (see src/cldap/mod.rs): a
+#                              controller that answers a ping and cannot complete a
+#                              logon sends machines to a dead end
+log_timestamp: true
+log_caller: false
+
+base_dn: dc=ad,dc=example,dc=com
+listen_addr: 0.0.0.0:389
+
+backends:
+  redb:
+    path: /shared/directory.redb
+    durability: none
+
+backend: redb
+
+schema:
+  mode: warn
+
+# The keytab kdc-stand wrote: `ldap/samba.ad.example.com`. With this section present
+# the server publishes the Active Directory vocabulary (userPrincipalName,
+# sAMAccountName, userAccountControl, objectSid, servicePrincipalName) and honours
+# userAccountControl on a ticket bind.
+sasl:
+  keytab: /shared/service.keytab
+  service_principal: ldap/samba.ad.example.com@AD.EXAMPLE.COM
+  realms:
+    - name: ad.example.com
+      # AD resolves an account by userPrincipalName before this template; the
+      # template is the fallback for a principal with no UPN in the directory.
+      dn: "cn={user},ou=users,{base}"
+
+# Off by default everywhere else. Here it is the whole point of step 3.
+cldap:
+  enabled: true
+  dns_domain: ad.example.com
+  dns_host: samba.ad.example.com
+  netbios_domain: AD
+  netbios_host: SAMBA
+
+integrity:
+  unique: [cn, uid]
+  allow_duplicates: false
+  referential_integrity: false
+
+indexes:
+  default: [pres]
+  attributes:
+    cn: [eq, pres]
+    uid: [eq]
+    userPrincipalName: [eq]
+    sAMAccountName: [eq]
+    objectClass: [eq, pres]
+
+access:
+  - subject: admin
+    attributes: ["*"]
+    rights: [read, search, compare, write, auth]
+  # Any authenticated principal, for the reason in the header comment.
+  - subject: users
+    attributes: ["*"]
+    rights: [read, search, compare, write, auth]
+
+users_ou_name: users
+groups_ou_name: groups
+
+passwords:
+  store_scheme: argon2id
+  upgrade_on_bind: false
+
+# Simple bind over a plaintext connection: refused unless said in words. The stand
+# seeds entries with `ldapadd -x`, which needs it.
+AllowDangerousSettings: "Yes I know this is bad idea"
+bind:
+  AllowUnencryptedBind: "Yes I know this is bad idea"
+AllowPlainHttpRest: "Yes I know this is bad idea"
+
+http_listen_addr: 127.0.0.1:8080
+
+bootstrap:
+  dn: cn=admin,ou=users,dc=ad,dc=example,dc=com
+  password_env: RRD_ADMIN_PASSWORD

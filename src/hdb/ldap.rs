@@ -371,6 +371,25 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
     // An entry with keys but no kvno is an entry whose keys nothing can match.
     // Reading the highest one is what Heimdal's LDAP backend does when the
     // attribute is absent, and it is the only value that cannot be wrong.
+    //
+    // `krb5Key` is the canonical attribute. The AD projection is read only when
+    // the canonical attribute is absent — an account that was written by an
+    // AD-shaped tool has its keys in `supplementalCredentials` and nowhere else —
+    // because reading it back loses what the projection cannot carry: the blob has
+    // no key version, and it has one salt for all keys. An entry that has both is
+    // an entry whose `krb5Key` wins, and that is the direction the plan fixed:
+    // written by us, read only as a fallback.
+    if keys.is_empty()
+        && let Some(blob) = attributes.get(attrs::AD_SUPPLEMENTAL_CREDENTIALS).first()
+    {
+        let kvno = declared_kvno.unwrap_or(0);
+        keys = crate::hdb::ad_blob::keys(blob, kvno).map_err(|e| {
+            Error::Hdb(format!(
+                "{name}: {}: {e}",
+                attrs::AD_SUPPLEMENTAL_CREDENTIALS
+            ))
+        })?;
+    }
     if let Some(declared) = declared_kvno {
         let highest = keys.iter().map(|k: &HdbKey| k.kvno).max();
         match highest {

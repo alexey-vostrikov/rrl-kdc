@@ -9,11 +9,22 @@
 //! with no keys.
 //!
 //! So this module writes that attribute as a **projection**: it is generated from
-//! the entry, never read back, and never the place a key lives. If it fails, an
-//! account still logs in; only the AD-shaped view of it is missing. That is the
-//! whole reason the plan refused to make the AD blob the canonical form — it is
-//! written by us and read by strangers, so a defect in it must not be able to cost
-//! anybody a login.
+//! the entry, never the place a key lives, and never consulted while the entry
+//! has `krb5Key`. If writing it fails, an account still logs in; only the
+//! AD-shaped view of it is missing. That is the whole reason the plan refused to
+//! make the AD blob the canonical form — it is written by us and read by
+//! strangers, so a defect in it must not be able to cost anybody a login.
+//!
+//! # Reading it back
+//!
+//! One case does read it: an account written by an AD-shaped tool has its keys in
+//! `supplementalCredentials` and nowhere else, and a KDC that refused to read that
+//! could only serve directories it wrote itself. [`keys`] is the reader, and the
+//! fallback is in `from_attributes` — used **only** when `krb5Key` is absent, and
+//! lossy by construction: the structure has no key version, so the version comes
+//! from `msDS-KeyVersionNumber`, and it has one salt for every key, so a principal
+//! whose keys used different salts reads back with one of them. That is why
+//! `krb5Key` stays canonical and this stays the fallback.
 //!
 //! # The format
 //!
@@ -67,7 +78,15 @@ const REVISION_NEW: u16 = 4;
 /// are what a reader uses.
 const ITERATION_COUNT: u32 = 4096;
 
-/// `supplementalCredentials` for `entry`.
+/// `KERB_STORED_CREDENTIAL_NEW`'s fixed part: eight 16-bit fields and two
+/// 32-bit ones.
+const CREDENTIAL_HEADER: usize = 24;
+
+/// `KERB_KEY_DATA_NEW`: two 16-bit reserved fields, one 32-bit reserved, the
+/// iteration count, then enctype, length and offset — six words, not four.
+const KEY_DATA_NEW: usize = 24;
+
+/// `supplemental_credentials` for `entry`.
 ///
 /// One property, `Primary:Kerberos-Newer-Keys`, with the entry's current keys as
 /// the credentials and its older ones as the old credentials — which is the
@@ -168,10 +187,10 @@ pub fn kerberos_newer_keys(entry: &HdbEntry) -> Vec<u8> {
 
     // `KERB_STORED_CREDENTIAL_NEW`'s fixed part: eight 16-bit fields and two
     // 32-bit ones.
-    const HEADER: usize = 24;
+    const HEADER: usize = CREDENTIAL_HEADER;
     // `KERB_KEY_DATA_NEW`: two 16-bit reserved fields, one 32-bit reserved, the
     // iteration count, then enctype, length and offset — six words, not four.
-    const KEY_DATA: usize = 24;
+    const KEY_DATA: usize = KEY_DATA_NEW;
     let all: Vec<&crate::hdb::HdbKey> = credentials
         .iter()
         .chain(old.iter())
@@ -216,6 +235,248 @@ pub fn kerberos_newer_keys(entry: &HdbEntry) -> Vec<u8> {
         "the offsets must describe this buffer"
     );
     out
+}
+
+/// Why a `supplementalCredentials` value could not be read.
+///
+/// Reading this attribute is the lossy direction, so every refusal names what is
+/// wrong instead of guessing: an entry whose keys cannot be read is an entry
+/// whose owner cannot log in, and a guess turns that into a mystery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdBlobError {
+    /// Not a `USER_PROPERTIES`: a length, signature or count does not describe
+    /// the buffer it arrived in.
+    NotUserProperties,
+    /// A well-formed `USER_PROPERTIES` with no `Primary:Kerberos-Newer-Keys`
+    /// property — an account whose keys are not kept here at all.
+    MissingProperty,
+    /// The property value is not an even-length run of hexadecimal digits.
+    NotHex,
+    /// `KERB_STORED_CREDENTIAL_NEW` at a revision this reader does not know.
+    /// Reading on would take key material from the wrong offsets.
+    UnknownRevision(u16),
+    /// A count, length or offset that does not describe its own buffer.
+    Inconsistent,
+    /// A key whose enctype this crate does not implement.
+    UnknownEnctype(i32),
+    /// A key whose length is not the one its enctype requires.
+    BadKeyLength(i32, usize),
+}
+
+impl std::fmt::Display for AdBlobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdBlobError::NotUserProperties => write!(f, "not a USER_PROPERTIES structure"),
+            AdBlobError::MissingProperty => {
+                write!(f, "no {PROPERTY_KERBEROS_NEWER_KEYS} property")
+            }
+            AdBlobError::NotHex => write!(f, "the property value is not hexadecimal text"),
+            AdBlobError::UnknownRevision(v) => {
+                write!(f, "KERB_STORED_CREDENTIAL_NEW revision {v}, which is not 4")
+            }
+            AdBlobError::Inconsistent => {
+                write!(f, "a count, length or offset does not describe the buffer")
+            }
+            AdBlobError::UnknownEnctype(id) => write!(f, "enctype {id} is not implemented here"),
+            AdBlobError::BadKeyLength(id, len) => {
+                write!(f, "enctype {id} cannot have a {len}-octet key")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AdBlobError {}
+
+/// One key read out of the projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdCredential {
+    /// The enctype the blob names for this key.
+    pub enctype: Enctype,
+    /// The key material, as the credential structure holds it.
+    pub key: Vec<u8>,
+    /// The structure's *default* salt, which is the only salt AD's form has: a
+    /// blob written from an entry whose keys used different salts carries one of
+    /// them for all. `None` when the blob names none.
+    pub salt: Option<Vec<u8>>,
+}
+
+/// The keys `supplementalCredentials` holds.
+///
+/// The blob carries no key version — `KERB_STORED_CREDENTIAL_NEW` has no field
+/// for it — so a caller that needs one takes it from `msDS-KeyVersionNumber`,
+/// which is where AD keeps it. That is [`keys`]'s second argument.
+///
+/// The three generations the structure has (current, old, older) all come back
+/// in one list: the structure records which generation a key belongs to only by
+/// the order of its counts, and an entry read back at one version has no use for
+/// the distinction.
+pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
+    let value = property_value(blob, PROPERTY_KERBEROS_NEWER_KEYS)?;
+    let inner = unhex(value)?;
+    if inner.len() < CREDENTIAL_HEADER {
+        return Err(AdBlobError::Inconsistent);
+    }
+    let revision = u16_at(&inner, 0);
+    if revision != REVISION_NEW {
+        return Err(AdBlobError::UnknownRevision(revision));
+    }
+    let counts = [
+        u16_at(&inner, 4) as usize,
+        u16_at(&inner, 6) as usize,
+        u16_at(&inner, 8) as usize,
+        u16_at(&inner, 10) as usize,
+    ];
+    let total: usize = counts.iter().sum();
+    let salt_len = u16_at(&inner, 12) as usize;
+    let salt_offset = u32_at(&inner, 16) as usize;
+    let end = salt_offset
+        .checked_add(salt_len)
+        .ok_or(AdBlobError::Inconsistent)?;
+    if end > inner.len() {
+        return Err(AdBlobError::Inconsistent);
+    }
+    let salt = if salt_len == 0 {
+        None
+    } else {
+        Some(inner[salt_offset..end].to_vec())
+    };
+    let array_end = CREDENTIAL_HEADER
+        .checked_add(
+            total
+                .checked_mul(KEY_DATA_NEW)
+                .ok_or(AdBlobError::Inconsistent)?,
+        )
+        .ok_or(AdBlobError::Inconsistent)?;
+    if array_end > inner.len() {
+        return Err(AdBlobError::Inconsistent);
+    }
+
+    let mut keys = Vec::with_capacity(total);
+    for i in 0..total {
+        let at = CREDENTIAL_HEADER + i * KEY_DATA_NEW;
+        let id = u32_at(&inner, at + 12) as i32;
+        let len = u32_at(&inner, at + 16) as usize;
+        let offset = u32_at(&inner, at + 20) as usize;
+        let key_end = offset.checked_add(len).ok_or(AdBlobError::Inconsistent)?;
+        if key_end > inner.len() {
+            return Err(AdBlobError::Inconsistent);
+        }
+        let enctype = Enctype::from_id(id).ok_or(AdBlobError::UnknownEnctype(id))?;
+        // `Key::new` is the one place that knows each enctype's length, so a
+        // structure that claims an impossible length is refused here rather than
+        // becoming a key nothing can ever decrypt with.
+        crate::crypto::Key::new(enctype, inner[offset..key_end].to_vec())
+            .map_err(|_| AdBlobError::BadKeyLength(id, len))?;
+        keys.push(AdCredential {
+            enctype,
+            key: inner[offset..key_end].to_vec(),
+            salt: salt.clone(),
+        });
+    }
+    Ok(keys)
+}
+
+/// [`credentials`] as `HdbKey`s at `kvno`, ready to be handed to a KDC.
+pub fn keys(blob: &[u8], kvno: u32) -> Result<Vec<crate::hdb::HdbKey>, AdBlobError> {
+    Ok(credentials(blob)?
+        .into_iter()
+        .map(|c| crate::hdb::HdbKey {
+            kvno,
+            key: crate::crypto::Key::new(c.enctype, c.key)
+                .expect("credentials() validated every key's length"),
+            salt: c.salt,
+        })
+        .collect())
+}
+
+/// The `USER_PROPERTIES` value of the property called `name`.
+fn property_value<'a>(blob: &'a [u8], name: &str) -> Result<&'a [u8], AdBlobError> {
+    // The fixed part and the final `Reserved5`.
+    const HEADER: usize = 110;
+    if blob.len() < HEADER + 1 {
+        return Err(AdBlobError::NotUserProperties);
+    }
+    // `Length` counts from offset 12 up to, but not including, `Reserved5`.
+    if u32_at(blob, 4) as usize != blob.len() - 13 {
+        return Err(AdBlobError::NotUserProperties);
+    }
+    if u16_at(blob, 8) != 1 || u16_at(blob, 108) != PROPERTY_SIGNATURE {
+        return Err(AdBlobError::NotUserProperties);
+    }
+    // No `PropertyCount` field at all when there is nothing to count.
+    if blob.len() == HEADER + 1 {
+        return Err(AdBlobError::MissingProperty);
+    }
+    if blob.len() < HEADER + 3 {
+        return Err(AdBlobError::NotUserProperties);
+    }
+    let count = u16_at(blob, HEADER) as usize;
+    let end = blob.len() - 1;
+    let mut at = HEADER + 2;
+    for _ in 0..count {
+        if at + 6 > end {
+            return Err(AdBlobError::Inconsistent);
+        }
+        let name_len = u16_at(blob, at) as usize;
+        let value_len = u16_at(blob, at + 2) as usize;
+        let start = at + 6;
+        let stop = start
+            .checked_add(name_len)
+            .and_then(|s| s.checked_add(value_len))
+            .ok_or(AdBlobError::Inconsistent)?;
+        if stop > end {
+            return Err(AdBlobError::Inconsistent);
+        }
+        let raw_name = &blob[start..start + name_len];
+        let value = &blob[start + name_len..stop];
+        at = stop;
+        if utf16(raw_name)? == name {
+            return Ok(value);
+        }
+    }
+    Err(AdBlobError::MissingProperty)
+}
+
+/// UTF-16LE text, which is how `USER_PROPERTY` spells both its name and value.
+fn utf16(bytes: &[u8]) -> Result<String, AdBlobError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(AdBlobError::Inconsistent);
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    String::from_utf16(&units).map_err(|_| AdBlobError::Inconsistent)
+}
+
+/// Hexadecimal text back to octets: the inverse of [`hex_lower`], and as strict.
+fn unhex(text: &[u8]) -> Result<Vec<u8>, AdBlobError> {
+    if !text.len().is_multiple_of(2) {
+        return Err(AdBlobError::NotHex);
+    }
+    let digit = |b: u8| -> Result<u8, AdBlobError> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(AdBlobError::NotHex),
+        }
+    };
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_chunks::<2>().0 {
+        out.push(digit(pair[0])? << 4 | digit(pair[1])?);
+    }
+    Ok(out)
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
 /// Lowercase hexadecimal, which is the spelling AD uses in `PropertyValue`.
@@ -414,5 +675,143 @@ mod tests {
         let inner = kerberos_newer_keys(&entry);
         assert_eq!(u16_at(&inner, 4), 0, "no credentials");
         assert_eq!(u16_at(&inner, 8), 0);
+    }
+
+    #[test]
+    fn the_reader_returns_the_keys_the_writer_wrote() {
+        let entry = entry();
+        let blob = supplemental_credentials(&entry);
+        let read = credentials(&blob).unwrap();
+        assert_eq!(read.len(), 4, "one key per enctype");
+        for (i, credential) in read.iter().enumerate() {
+            let held = entry.key_for(credential.enctype).unwrap();
+            assert_eq!(
+                credential.key,
+                held.key.bytes(),
+                "key {i} must come back byte for byte"
+            );
+            assert_eq!(
+                credential.salt.as_deref(),
+                held.salt.as_deref(),
+                "the entry's one salt is the blob's default salt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rotation_reads_back_as_both_generations() {
+        // The blob names three generations and the reader returns them in one
+        // list: which is current comes from `msDS-KeyVersionNumber`, not from the
+        // blob, which has no field for it.
+        let rotated = entry().rekey(&OwnCipher, b"a new password").unwrap();
+        let blob = supplemental_credentials(&rotated);
+        let read = credentials(&blob).unwrap();
+        assert_eq!(read.len(), 8, "four current and four old keys");
+        let at_two = keys(&blob, 2).unwrap();
+        assert!(
+            at_two.iter().all(|k| k.kvno == 2),
+            "the version is the caller's, since the blob cannot carry one"
+        );
+        assert_eq!(at_two.len(), 8);
+    }
+
+    #[test]
+    fn an_entry_with_no_keys_reads_back_as_no_keys() {
+        let entry = HdbEntry::user(Principal::parse("svc@EXAMPLE.COM").unwrap());
+        assert!(
+            credentials(&supplemental_credentials(&entry))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_empty_blob_says_there_is_no_property_rather_than_no_keys() {
+        // The two are different facts — "this account's keys are not here" versus
+        // "this account has none" — and the reader keeps them apart.
+        assert_eq!(
+            credentials(&empty_supplemental_credentials()),
+            Err(AdBlobError::MissingProperty)
+        );
+    }
+
+    #[test]
+    fn a_blob_that_is_not_user_properties_is_refused() {
+        let full = supplemental_credentials(&entry());
+        // Truncated: the length field no longer describes the buffer.
+        assert_eq!(
+            credentials(&full[..full.len() - 1]),
+            Err(AdBlobError::NotUserProperties)
+        );
+        // Signature tampered with.
+        let mut wrong = full.clone();
+        wrong[108] = 0x51;
+        assert_eq!(credentials(&wrong), Err(AdBlobError::NotUserProperties));
+        // Shorter than the fixed part.
+        assert_eq!(
+            credentials(&full[..40]),
+            Err(AdBlobError::NotUserProperties)
+        );
+    }
+
+    #[test]
+    fn a_property_value_that_is_not_hexadecimal_is_refused() {
+        let mut blob = supplemental_credentials(&entry());
+        let name_len = u16_at(&blob, 112) as usize;
+        let value_at = 118 + name_len;
+        blob[value_at] = b'z';
+        assert_eq!(credentials(&blob), Err(AdBlobError::NotHex));
+    }
+
+    #[test]
+    fn an_unknown_revision_is_refused_instead_of_read() {
+        // Revision 3 has a different layout; reading it as revision 4 would take
+        // key material from the wrong offsets and produce a key that decrypts
+        // nothing, long after the reason is gone.
+        let mut blob = supplemental_credentials(&entry());
+        let name_len = u16_at(&blob, 112) as usize;
+        let value_at = 118 + name_len;
+        // First two octets of the hex text are the revision's low byte.
+        blob[value_at..value_at + 4].copy_from_slice(b"0300");
+        assert_eq!(credentials(&blob), Err(AdBlobError::UnknownRevision(3)));
+    }
+
+    #[test]
+    fn a_key_offset_outside_the_buffer_is_refused() {
+        let mut blob = supplemental_credentials(&entry());
+        let name_len = u16_at(&blob, 112) as usize;
+        let value_at = 118 + name_len;
+        // The first `KERB_KEY_DATA_NEW` starts at octet 24 of the credential, and
+        // its key offset is at +20: hex text position 2 * (24 + 20).
+        let at = value_at + 2 * (CREDENTIAL_HEADER + 20);
+        blob[at..at + 8].copy_from_slice(b"ffff7f00");
+        assert_eq!(credentials(&blob), Err(AdBlobError::Inconsistent));
+    }
+
+    #[test]
+    fn an_unknown_enctype_is_refused_by_number() {
+        let mut blob = supplemental_credentials(&entry());
+        let name_len = u16_at(&blob, 112) as usize;
+        let value_at = 118 + name_len;
+        // Enctype is at +12 of the key entry.
+        let at = value_at + 2 * (CREDENTIAL_HEADER + 12);
+        blob[at..at + 8].copy_from_slice(b"17000000");
+        assert_eq!(credentials(&blob), Err(AdBlobError::UnknownEnctype(23)));
+    }
+
+    #[test]
+    fn a_key_of_the_wrong_length_is_refused() {
+        // An AES-256 key is 32 octets; a structure that says 31 must not become a
+        // key that nothing can decrypt with. Which enctype the first entry holds
+        // depends on the sort order, so the assertion is about the length.
+        let mut blob = supplemental_credentials(&entry());
+        let name_len = u16_at(&blob, 112) as usize;
+        let value_at = 118 + name_len;
+        let at = value_at + 2 * (CREDENTIAL_HEADER + 16);
+        blob[at..at + 8].copy_from_slice(b"1f000000");
+        match credentials(&blob) {
+            Err(AdBlobError::BadKeyLength(_, len)) => assert_eq!(len, 31),
+            other => panic!("expected a refused key length, got {other:?}"),
+        }
     }
 }

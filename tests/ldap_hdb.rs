@@ -209,7 +209,7 @@ fn a_password_changed_through_the_hdb_is_the_one_that_works() {
 }
 
 #[test]
-fn the_ad_key_blob_is_written_and_never_read_back() {
+fn the_ad_key_blob_is_a_projection_and_krb5key_wins() {
     // The projection is for tools that look for an Active Directory's shape. It is
     // generated from `krb5Key` and must not become a second source of truth: an
     // entry whose blob was edited by hand still gets its keys from `krb5Key`.
@@ -228,7 +228,7 @@ fn the_ad_key_blob_is_written_and_never_read_back() {
     assert!(blob.len() >= 111, "a USER_PROPERTIES structure");
 
     // Replace it with garbage: the entry must still read, because the keys are in
-    // `krb5Key` and the blob is not consulted.
+    // `krb5Key` and the blob is not consulted while they are.
     let mut edited = attributes.clone();
     edited.set(attrs::AD_SUPPLEMENTAL_CREDENTIALS, b"not a blob".to_vec());
     let entry = from_attributes(&edited).expect("the blob must not be authoritative");
@@ -240,6 +240,84 @@ fn the_ad_key_blob_is_written_and_never_read_back() {
     keyless.etypes = None;
     let written = to_attributes(&keyless);
     assert!(!written.has(attrs::AD_SUPPLEMENTAL_CREDENTIALS));
+}
+
+#[test]
+fn the_projection_is_read_when_krb5key_is_absent() {
+    // An account written by an AD-shaped tool has its keys in
+    // `supplementalCredentials` and nowhere else. Refusing to read it would mean
+    // this KDC can only serve directories it wrote itself.
+    let directory = FakeDirectory::new();
+    realm(&directory);
+    let attributes = directory
+        .entries
+        .lock()
+        .unwrap()
+        .get(&p("alice").to_string())
+        .cloned()
+        .unwrap();
+    let expected: Vec<(Enctype, Vec<u8>)> = from_attributes(&attributes)
+        .unwrap()
+        .keys
+        .iter()
+        .map(|k| (k.key.enctype(), k.key.bytes().to_vec()))
+        .collect();
+
+    let mut ad_shaped = attributes.clone();
+    assert!(ad_shaped.remove(attrs::KEY), "krb5Key is what we take away");
+    let entry = from_attributes(&ad_shaped).expect("the projection is the only source left");
+    assert_eq!(
+        entry.keys.len(),
+        expected.len(),
+        "every key in the blob comes back"
+    );
+    // Order is not a fact either direction keeps: `krb5Key` comes back in the
+    // order the directory stored it and the blob is sorted by enctype, so the
+    // comparison is by enctype rather than by position.
+    let mut read: Vec<(Enctype, Vec<u8>)> = entry
+        .keys
+        .iter()
+        .map(|k| (k.key.enctype(), k.key.bytes().to_vec()))
+        .collect();
+    let mut expected = expected;
+    read.sort_by_key(|(enctype, _)| enctype.id());
+    expected.sort_by_key(|(enctype, _)| enctype.id());
+    assert_eq!(read, expected, "byte for byte, per enctype");
+    for key in &entry.keys {
+        assert_eq!(
+            key.kvno, entry.kvno,
+            "the blob has no version, so the version comes from the attribute"
+        );
+    }
+    assert_eq!(
+        entry.kvno, 1,
+        "msDS-KeyVersionNumber still says what it said"
+    );
+}
+
+#[test]
+fn a_projection_that_cannot_be_read_is_refused_rather_than_guessed() {
+    // With `krb5Key` gone there is nothing to fall back to, and an account with
+    // invented or missing keys cannot log in. The refusal names the attribute, so
+    // the operator sees which half of the entry is broken.
+    let directory = FakeDirectory::new();
+    realm(&directory);
+    let mut attributes = directory
+        .entries
+        .lock()
+        .unwrap()
+        .get(&p("alice").to_string())
+        .cloned()
+        .unwrap();
+    attributes.remove(attrs::KEY);
+    attributes.set(attrs::AD_SUPPLEMENTAL_CREDENTIALS, b"not a blob".to_vec());
+    match from_attributes(&attributes) {
+        Err(Error::Hdb(text)) => assert!(
+            text.contains(attrs::AD_SUPPLEMENTAL_CREDENTIALS),
+            "the message must name the attribute, not just fail: {text}"
+        ),
+        other => panic!("expected a refusal naming the attribute, got {other:?}"),
+    }
 }
 
 #[test]

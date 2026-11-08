@@ -23,12 +23,21 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use crate::error::{Error, Result};
 use crate::name::Principal;
 
+use crate::acl::{AclRule, AclStore, Targets};
+
 use super::record;
 use super::{Hdb, HdbEntry};
 
 /// `key` → the entry, DER-encoded by [`super::record`].
 const ENTRIES: TableDefinition<'_, &'static str, &'static [u8]> =
     TableDefinition::new("hdb_entries");
+
+/// The change-password rules, in the same database file as the principals.
+///
+/// Same file and not a second one: a backup that has the principals and not the
+/// rules restores a realm where nobody may change a password, and an operator has
+/// no way to notice until they try.
+const ACL: TableDefinition<'_, &'static str, &'static [u8]> = TableDefinition::new("hdb_acl");
 
 /// The `hdb` interface over a redb file.
 #[derive(Debug)]
@@ -49,6 +58,7 @@ impl RedbHdb {
         let txn = db.begin_write().map_err(store_err)?;
         {
             txn.open_table(ENTRIES).map_err(store_err)?;
+            txn.open_table(ACL).map_err(store_err)?;
         }
         txn.commit().map_err(store_err)?;
         Ok(RedbHdb { db, path })
@@ -167,6 +177,99 @@ impl RedbHdb {
         }
         Ok(None)
     }
+}
+
+
+/// The change-password rules live in the same file as the principals, behind
+/// the same handle.
+///
+/// Not a second `Database`: redb takes a lock on the file, and a second handle —
+/// even from the same process — fails to open it. One connection answering two
+/// questions is also the honest model, because a backup that carries the
+/// principals and not the rules restores a realm where nobody may change a
+/// password. A caller that wants both shares one `Arc<RedbHdb>` and views it as
+/// `Arc<dyn Hdb>` and `Arc<dyn AclStore>`.
+impl AclStore for RedbHdb {
+    fn rules(&self) -> Result<Vec<AclRule>> {
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(ACL).map_err(store_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(store_err)? {
+            let (k, _) = entry.map_err(store_err)?;
+            out.push(parse_acl_key(k.value())?);
+        }
+        Ok(out)
+    }
+
+    fn grant(&self, actor: &Principal, targets: Targets) -> Result<()> {
+        let key = acl_key(actor, &targets);
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(ACL).map_err(store_err)?;
+            table.insert(key.as_str(), &[][..]).map_err(store_err)?;
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn revoke(&self, actor: &Principal, targets: &Targets) -> Result<bool> {
+        let key = acl_key(actor, targets);
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let removed = {
+            let mut table = txn.open_table(ACL).map_err(store_err)?;
+            table.remove(key.as_str()).map_err(store_err)?.is_some()
+        };
+        txn.commit().map_err(store_err)?;
+        Ok(removed)
+    }
+
+    fn revoke_all(&self, actor: &Principal) -> Result<usize> {
+        let prefix = format!("{actor}\t");
+        let keys: Vec<String> = {
+            let txn = self.db.begin_read().map_err(store_err)?;
+            let table = txn.open_table(ACL).map_err(store_err)?;
+            let mut keys = Vec::new();
+            for entry in table.iter().map_err(store_err)? {
+                let (k, _) = entry.map_err(store_err)?;
+                let key = k.value();
+                if key.starts_with(&prefix) {
+                    keys.push(key.to_owned());
+                }
+            }
+            keys
+        };
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(ACL).map_err(store_err)?;
+            for key in &keys {
+                table.remove(key.as_str()).map_err(store_err)?;
+            }
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(keys.len())
+    }
+}
+
+/// `actor` and `target` in one key: a tab cannot appear in a principal name, and
+/// redb orders by it, so a listing comes out grouped by actor.
+fn acl_key(actor: &Principal, targets: &Targets) -> String {
+    let target = match targets {
+        Targets::Any => "*".to_owned(),
+        Targets::Only(p) => p.to_string(),
+    };
+    format!("{actor}\t{target}")
+}
+
+fn parse_acl_key(key: &str) -> Result<AclRule> {
+    let (actor, target) = key
+        .split_once('\t')
+        .ok_or_else(|| Error::Hdb(format!("acl key {key:?} has no separator")))?;
+    let actor = Principal::parse(actor)?;
+    Ok(if target == "*" {
+        AclRule::any(actor)
+    } else {
+        AclRule::only(actor, Principal::parse(target)?)
+    })
 }
 
 #[cfg(test)]

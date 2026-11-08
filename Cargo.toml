@@ -23,10 +23,9 @@ tracing = { version = "0.1", optional = true }
 redb = { version = "4.4", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
-# The differential-check backend. Its crypto is the only half used, so the
-# client-oriented features stay off: no tokio, no resolver, no SPNEGO.
-# The version is the one the in-process consumer (rust-rest-ldap) vendors, so
-# one copy serves both.
+# The secondary implementation, kept only for the differential check. Its crypto
+# is the only half used, so the client-oriented features stay off: no tokio, no
+# resolver, no SPNEGO.
 rskrb5 = { version = "0.2", default-features = false, optional = true }
 
 [features]
@@ -38,14 +37,19 @@ trace = ["dep:tracing"]
 hdb-redb = ["dep:redb"]
 serde = ["dep:serde"]
 # A second, independent implementation of RFC 3961/3962/8009 crypto. Every
-# known-answer vector in `tests/` then runs against both, which turns the
-# vectors from a self-test into a differential test.
+# known-answer vector in `tests/` then runs against both, which turns the vectors
+# from a self-test into a differential test.
+#
+# Off by default and secondary on purpose: `krb5` is the client this KDC is
+# judged by, because it is tested against a live MIT KDC and is stricter about
+# what it accepts. `rskrb5` is a cross-check on the crypto only.
 crypto-rskrb5 = ["dep:rskrb5"]
 
 [dev-dependencies]
-# An independent Kerberos client, written by a third party and tested against a
-# live MIT KDC. It is the client half of the acceptance test: it asks this KDC
-# for a TGT exactly as MIT's `kinit` would, and refuses anything MIT refuses.
+# The primary client. Written by a third party and tested against a live MIT KDC,
+# it is the half of every acceptance test that matters: it asks this KDC for a
+# ticket exactly as MIT's `kinit` would and refuses anything MIT refuses, so a
+# reply it accepts is a reply another implementation would accept too.
 krb5 = "1.0"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

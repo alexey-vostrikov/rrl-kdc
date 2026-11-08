@@ -8,9 +8,19 @@ clocks, randomness and storage are supplied by the caller, so the same code
 serves a standalone KDC, an in-process KDC inside a directory server, and a
 deterministic test that replays recorded requests.
 
-Not a fork of anything. Not a client. The clients it is tested against are
-other people's implementations — a KDC that only agrees with itself agrees with
-nothing.
+Not a fork of anything. Not a client. The client it is judged by is somebody
+else's implementation — a KDC that only agrees with itself agrees with nothing.
+
+## Who checks this crate
+
+1. **`krb5` 1.0 (ddalton) — the primary client.** Every acceptance test goes
+   through it: it asks this KDC for a ticket the way MIT's `kinit` does and
+   refuses replies MIT would refuse, so a reply it accepts is a reply another
+   implementation accepts too.
+2. **`rskrb5` 0.2 — secondary, crypto only.** Behind the `crypto-rskrb5`
+   feature, used to run the same known-answer vectors through a second
+   implementation of RFC 3961/3962/8009. A disagreement is worth knowing about,
+   but it does not define this KDC's behaviour — `krb5` does.
 
 ## Status
 
@@ -36,18 +46,21 @@ fails at startup instead of being quietly given AES.
 
 ## Two crypto backends
 
-`OwnCipher` is this crate's implementation. With the `crypto-rskrb5` feature a
-second backend over [`rskrb5::crypto`](https://github.com/clelange/rskrb5) joins
-it, and **every** known-answer vector runs against both:
+`OwnCipher` is this crate's implementation, and it is the one that ships. With
+the optional `crypto-rskrb5` feature a second backend over
+[`rskrb5::crypto`](https://github.com/clelange/rskrb5) joins it, and **every**
+known-answer vector runs against both:
 
 ```sh
-cargo test                                    # this crate's crypto
+cargo test                                    # the default configuration
 cargo test --features crypto-rskrb5           # both, compared
 ```
 
 That turns the vectors from a self-test into a differential test: a
 disagreement names the construction that differs instead of surfacing as
-"`kinit` cannot log in".
+"`kinit` cannot log in". The feature is off by default and the backend is
+secondary: it is a cross-check on the crypto, not a second definition of what
+this KDC does.
 
 ## Evidence
 

@@ -52,13 +52,18 @@ jobs:
       # warning that becomes a defect, and this crate is small enough that
       # holding the line costs nothing.
       - name: clippy
-        run: cargo clippy --all-targets --features crypto-rskrb5 -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
+      # The primary configuration: no second crypto implementation, acceptance
+      # tests against `krb5`. This is what a consumer gets by default, so it is
+      # what the gate must prove.
       - name: test
-        run: cargo test --features crypto-rskrb5
+        run: cargo test
 
-      # The differential backend is optional, so the default-feature build is a
-      # configuration of its own: it is what a consumer who does not want the
-      # second crypto implementation gets.
-      - name: test without the second crypto backend
-        run: cargo test --no-default-features
+      # Secondary: the same vectors against `rskrb5`'s crypto as a cross-check.
+      # A failure here is a disagreement between two implementations and is
+      # worth knowing about, but it is not what defines this KDC's behaviour.
+      - name: cross-check against the secondary crypto backend
+        run: |
+          cargo test --features crypto-rskrb5
+          cargo clippy --all-targets --features crypto-rskrb5 -- -D warnings

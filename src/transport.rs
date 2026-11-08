@@ -124,7 +124,9 @@ fn serve_udp(socket: &UdpSocket, kdc: &Kdc, stop: &AtomicBool) {
             Ok(v) => v,
             Err(_) => continue, // timeout, or a datagram we could not read
         };
-        let reply = kdc.handle(&buf[..n], now());
+        // The peer's address is known here and nowhere else: the engine cannot
+        // see a socket, and a check it cannot answer would have to pass.
+        let reply = kdc.handle_from(&buf[..n], now(), Some(from.ip()));
         let reply = if reply.len() > MAX_DATAGRAM_REPLY {
             too_big(&reply, kdc)
         } else {
@@ -157,9 +159,9 @@ fn serve_tcp(listener: &TcpListener, kdc: &Kdc, stop: &AtomicBool) {
     let _ = listener.set_nonblocking(true);
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
-                serve_stream(stream, kdc, stop);
+                serve_stream(stream, kdc, stop, peer.ip());
             }
             // Nothing waiting: yield instead of spinning.
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
@@ -169,7 +171,7 @@ fn serve_tcp(listener: &TcpListener, kdc: &Kdc, stop: &AtomicBool) {
 
 /// One TCP connection: RFC 4120 §7.2.2 frames each message with a four-octet
 /// big-endian length, and a connection may carry several requests.
-fn serve_stream(mut stream: TcpStream, kdc: &Kdc, stop: &AtomicBool) {
+fn serve_stream(mut stream: TcpStream, kdc: &Kdc, stop: &AtomicBool, peer: std::net::IpAddr) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -187,7 +189,7 @@ fn serve_stream(mut stream: TcpStream, kdc: &Kdc, stop: &AtomicBool) {
         if stream.read_exact(&mut msg).is_err() {
             return;
         }
-        let reply = kdc.handle(&msg, now());
+        let reply = kdc.handle_from(&msg, now(), Some(peer));
         let mut framed = (reply.len() as u32).to_be_bytes().to_vec();
         framed.extend_from_slice(&reply);
         if stream.write_all(&framed).is_err() {
@@ -195,6 +197,134 @@ fn serve_stream(mut stream: TcpStream, kdc: &Kdc, stop: &AtomicBool) {
         }
         let _ = stream.flush();
     }
+}
+
+/// A change-password service on loopback, for the tests and for a stand.
+///
+/// Port 464 in a real deployment; the framing is RFC 3244 §3 — a two-octet total
+/// length, a version, an `AP-REQ` length, then the `AP-REQ` and the sealed
+/// request — wrapped in the same four-octet TCP length everything else uses.
+pub fn serve_kpasswd_loopback(kdc: Kdc) -> RunningKpasswd {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap_or_else(|e| panic!("cannot bind the kpasswd listener: {e}"));
+    let addr = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let kdc = Arc::new(kdc);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_kpasswd_stream(stream, kdc.as_ref()),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        })
+    };
+    RunningKpasswd {
+        addr,
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// A change-password service answering on loopback until it is dropped.
+pub struct RunningKpasswd {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunningKpasswd {
+    /// The address to hand a client, as `host:port`.
+    pub fn addr(&self) -> String {
+        self.addr.to_string()
+    }
+}
+
+impl Drop for RunningKpasswd {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl std::fmt::Debug for RunningKpasswd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RunningKpasswd({})", self.addr)
+    }
+}
+
+/// One request, one reply. RFC 3244 lets a connection carry several, but a
+/// client sends one and closes, and holding the socket open across a password
+/// change is a liability rather than a feature.
+fn serve_kpasswd_stream(mut stream: TcpStream, kdc: &Kdc) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut framing = [0u8; 4];
+    if stream.read_exact(&mut framing).is_err() {
+        return;
+    }
+    let n = u32::from_be_bytes(framing) as usize;
+    if n == 0 || n > 65_536 {
+        return;
+    }
+    let mut request = vec![0u8; n];
+    if stream.read_exact(&mut request).is_err() {
+        return;
+    }
+    let reply = match kpasswd_reply(kdc, &request) {
+        Ok(reply) => reply,
+        Err(err) => {
+            // A refusal still gets a KRB-ERROR, so the client learns why
+            // instead of waiting for a timeout it will read as a network fault.
+            crate::msg::KrbError {
+                ctime: None,
+                cusec: None,
+                stime: now(),
+                susec: 0,
+                code: err.kdc_code(),
+                crealm: None,
+                cname: None,
+                realm: kdc.config().realm().to_owned(),
+                sname: crate::name::Principal::krbtgt(kdc.config().realm()),
+                e_text: err.is_client_facing().then(|| err.to_string()),
+                e_data: None,
+            }
+            .encode()
+        }
+    };
+    let mut framed = (reply.len() as u32).to_be_bytes().to_vec();
+    framed.extend_from_slice(&reply);
+    let _ = stream.write_all(&framed);
+    let _ = stream.flush();
+}
+
+/// Unpacks one RFC 3244 request and answers it.
+fn kpasswd_reply(kdc: &Kdc, request: &[u8]) -> Result<Vec<u8>> {
+    if request.len() < 6 {
+        return Err(Error::Protocol("kpasswd request is too short".into()));
+    }
+    let total = u16::from_be_bytes([request[0], request[1]]) as usize;
+    if total != request.len() {
+        return Err(Error::Protocol(format!(
+            "kpasswd request says {total} octets, {} arrived",
+            request.len()
+        )));
+    }
+    let version = u16::from_be_bytes([request[2], request[3]]);
+    let ap_len = u16::from_be_bytes([request[4], request[5]]) as usize;
+    let rest = &request[6..];
+    if ap_len > rest.len() {
+        return Err(Error::Protocol("the AP-REQ overruns the request".into()));
+    }
+    let (ap_req, priv_message) = rest.split_at(ap_len);
+    let reply = kdc.handle_kpasswd(ap_req, priv_message, version, now())?;
+    Ok(reply.encode(version))
 }
 
 /// The clock, read only here: everything above it takes the instant as a

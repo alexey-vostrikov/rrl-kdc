@@ -35,6 +35,8 @@ pub mod error;
 /// `KerberosTime`: `GeneralizedTime` in `YYYYMMDDHHMMSSZ`.
 pub mod time;
 
+/// Ticket addresses: `HostAddress`, and the check a KDC makes against them.
+pub mod address;
 /// The principal database, shaped after Heimdal's `lib/hdb/hdb.asn1`.
 pub mod hdb;
 /// The protocol engine: AS and TGS exchanges.

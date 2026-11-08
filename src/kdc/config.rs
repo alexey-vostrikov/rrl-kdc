@@ -36,6 +36,9 @@ pub struct KdcConfig {
     /// Heimdal's `allowed_enctypes`, strongest first. The order is this KDC's
     /// preference, and it is what the session key's enctype is chosen from.
     allowed_enctypes: Vec<Enctype>,
+    /// The address policy: `check-ticket-addresses`,
+    /// `allow-null-ticket-addresses`, `warn-ticket-addresses`.
+    addresses: crate::address::AddressPolicy,
 }
 
 impl KdcConfig {
@@ -62,6 +65,7 @@ impl KdcConfig {
             clockskew: DEFAULT_CLOCKSKEW,
             require_preauth: true,
             allowed_enctypes: Enctype::ALL.to_vec(),
+            addresses: crate::address::AddressPolicy::default(),
         })
     }
 
@@ -93,6 +97,29 @@ impl KdcConfig {
     /// `allowed_enctypes`, strongest first.
     pub fn allowed_enctypes(&self) -> &[Enctype] {
         &self.allowed_enctypes
+    }
+
+    /// The address policy, as `crate::address::check` wants it.
+    pub fn address_policy(&self) -> crate::address::AddressPolicy {
+        self.addresses
+    }
+
+    /// Sets `check-ticket-addresses`.
+    pub fn with_check_ticket_addresses(mut self, yes: bool) -> Self {
+        self.addresses.check = yes;
+        self
+    }
+
+    /// Sets `allow-null-ticket-addresses`.
+    pub fn with_allow_null_ticket_addresses(mut self, yes: bool) -> Self {
+        self.addresses.allow_null = yes;
+        self
+    }
+
+    /// Sets `warn-ticket-addresses`.
+    pub fn with_warn_ticket_addresses(mut self, yes: bool) -> Self {
+        self.addresses.warn = yes;
+        self
     }
 
     /// Sets `max_life`. Zero or negative is refused: a ticket that cannot be
@@ -191,6 +218,18 @@ impl KdcConfig {
                 self.require_preauth = parse_bool(value)?;
                 Ok(())
             }
+            "check-ticket-addresses" | "check_ticket_addresses" => {
+                self.addresses.check = parse_bool(value)?;
+                Ok(())
+            }
+            "allow-null-ticket-addresses" | "allow_null_ticket_addresses" => {
+                self.addresses.allow_null = parse_bool(value)?;
+                Ok(())
+            }
+            "warn-ticket-addresses" | "warn_ticket_addresses" => {
+                self.addresses.warn = parse_bool(value)?;
+                Ok(())
+            }
             "allowed_enctypes" | "allowed-enctypes" => {
                 let names: Vec<&str> = value
                     .split(|c: char| c == ',' || c.is_whitespace())
@@ -208,7 +247,8 @@ impl KdcConfig {
             other => Err(Error::Config(format!(
                 "KDC option {other:?} is not implemented by this engine. \
                  Implemented: max_life, max_renewable_life, clockskew, require-preauth, \
-                 allowed_enctypes. Refusing rather than ignoring it: a KDC that silently \
+                 allowed_enctypes, check-ticket-addresses, allow-null-ticket-addresses, \
+                 warn-ticket-addresses. Refusing rather than ignoring it: a KDC that silently \
                  does not do what its configuration says is worse than one that will not start."
             ))),
         }

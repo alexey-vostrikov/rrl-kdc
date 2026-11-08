@@ -51,19 +51,19 @@ jobs:
       # `-D warnings` rather than a tail of output: a warning nobody reads is a
       # warning that becomes a defect, and this crate is small enough that
       # holding the line costs nothing.
+      # Every feature, because a feature that only compiles when somebody
+      # remembers to ask for it is a feature that stops compiling unnoticed. The
+      # backends (redb) and the cross-check (rskrb5) are both in here.
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The primary configuration: no second crypto implementation, acceptance
-      # tests against `krb5`. This is what a consumer gets by default, so it is
-      # what the gate must prove.
+      # The primary configuration: no optional backend and no second crypto
+      # implementation. This is what a consumer gets by default, so it is what
+      # the gate must prove first.
       - name: test
         run: cargo test
 
-      # Secondary: the same vectors against `rskrb5`'s crypto as a cross-check.
-      # A failure here is a disagreement between two implementations and is
-      # worth knowing about, but it is not what defines this KDC's behaviour.
-      - name: cross-check against the secondary crypto backend
-        run: |
-          cargo test --features crypto-rskrb5
-          cargo clippy --all-targets --features crypto-rskrb5 -- -D warnings
+      # Everything on: the redb backend, the change-password service, and the
+      # cross-check against `rskrb5`'s crypto.
+      - name: test with every feature
+        run: cargo test --all-features

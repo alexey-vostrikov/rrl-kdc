@@ -19,8 +19,13 @@ use crate::error::{Error, Result};
 use crate::name::Principal;
 
 pub mod keytab;
+pub mod record;
+#[cfg(feature = "hdb-redb")]
+pub mod redb_store;
 
 pub use keytab::Keytab;
+#[cfg(feature = "hdb-redb")]
+pub use redb_store::RedbHdb;
 
 /// `HDBFlags` (Heimdal `lib/hdb/hdb.asn1`), in BIT STRING order: bit *n* is
 /// `1 << (31 - n)`, exactly as the ASN.1 names them.

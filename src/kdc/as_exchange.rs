@@ -223,13 +223,26 @@ impl Kdc {
             .sname
             .clone()
             .ok_or_else(|| Error::Protocol("AS-REQ without a service name".into()))?;
-        if !sname.is_krbtgt() || sname.components[1] != config.realm() {
-            return Err(Error::UnknownPrincipal(sname.to_string()));
-        }
         let server = self
             .hdb()
             .fetch(&sname)?
             .ok_or_else(|| Error::UnknownPrincipal(sname.to_string()))?;
+        // An AS-REQ may ask for the ticket-granting service, or for one of the
+        // services that must be reached *before* a TGT exists. RFC 3244's
+        // password change is the only such service here: `kpasswd` asks for
+        // kadmin/changepw straight from the AS, because a password that can no
+        // longer be changed is a password nobody can rotate.
+        let krbtgt_here = sname.is_krbtgt() && sname.components[1] == config.realm();
+        let changepw = server.has(entry_flags::CHANGE_PW);
+        if !krbtgt_here && !changepw {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                text: format!("{sname} cannot be reached without a ticket-granting ticket"),
+            });
+        }
+        if !server.has(entry_flags::SERVER) {
+            return Err(Error::UnknownPrincipal(sname.to_string()));
+        }
 
         // 4. Enctypes.
         let usable = usable_enctypes(config, &body.etypes, &client);

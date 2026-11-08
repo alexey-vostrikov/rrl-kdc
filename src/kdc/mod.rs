@@ -27,8 +27,17 @@ pub mod config;
 mod as_exchange;
 mod tgs_exchange;
 
+/// The change-password service (RFC 3244): protocol constants, the reply a
+/// caller frames, and the `kadmin/changepw` entry a realm needs.
+pub mod kpasswd;
+
+pub use kpasswd::{VERSION_CHANGE, VERSION_SET, changepw_entry, result_payload};
+
 use std::sync::Arc;
 
+use std::net::IpAddr;
+
+use crate::address;
 use crate::crypto::Cipher;
 use crate::error::{Error, codes};
 use crate::hdb::Hdb;
@@ -70,20 +79,46 @@ impl Kdc {
         self.cipher.as_ref()
     }
 
-    /// Answers one request: the reply's octets, always a reply.
+    /// Answers one request whose peer address is not known.
+    ///
+    /// Address checks behave as Heimdal's do when the source is unknown: a
+    /// request that names addresses is refused, because a check that cannot be
+    /// answered must not pass. A transport that knows the peer should call
+    /// [`Kdc::handle_from`] instead.
+    pub fn handle(&self, request: &[u8], now: i64) -> Vec<u8> {
+        self.handle_from(request, now, None)
+    }
+
+    /// Answers one request that arrived from `peer`: the reply's octets, always
+    /// a reply.
     ///
     /// Every failure becomes a `KRB-ERROR` rather than a Rust error, because a
     /// KDC that says nothing leaves the client waiting for a timeout and
     /// guessing. The Rust error is what the caller logs.
-    pub fn handle(&self, request: &[u8], now: i64) -> Vec<u8> {
+    pub fn handle_from(&self, request: &[u8], now: i64, peer: Option<IpAddr>) -> Vec<u8> {
         let req = match KdcReq::decode(request) {
             Ok(req) => req,
             Err(err) => return self.error(None, &err, now),
         };
-        let outcome = if req.msg_type == crate::msg::TGS_REQ {
-            self.handle_tgs(&req, now)
-        } else {
-            self.handle_as(&req, now)
+        let outcome = match address::check(
+            self.config.address_policy(),
+            req.body.addresses.as_deref(),
+            peer,
+        ) {
+            Err(err) => Err(err),
+            Ok(verdict) if verdict.is_allowed() => {
+                if req.msg_type == crate::msg::TGS_REQ {
+                    self.handle_tgs(&req, now)
+                } else {
+                    self.handle_as(&req, now)
+                }
+            }
+            Ok(_verdict) => {
+                // `warn-ticket-addresses`: the mismatch is logged and the
+                // request is served anyway, which is what an operator migrating
+                // to address checks needs to see before enforcing them.
+                Err(address::refused())
+            }
         };
         match outcome {
             Ok(reply) => reply,

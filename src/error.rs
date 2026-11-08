@@ -117,6 +117,9 @@ pub mod codes {
     /// The realm's policy forbids what was asked for (a proxiable ticket, a
     /// postdated one, a service that may not be issued).
     pub const KDC_ERR_POLICY: i32 = 12;
+    /// The request asked for an option that does not apply: renewing a ticket
+    /// that is not renewable, validating one that is not invalid.
+    pub const KDC_ERR_BADOPTION: i32 = 13;
     /// No requested enctype is one this KDC implements.
     pub const KDC_ERR_ETYPE_NOSUPP: i32 = 14;
     /// The account is locked, disabled or expired.
@@ -153,6 +156,8 @@ pub mod codes {
     pub const KRB_AP_ERR_MODIFIED: i32 = 42;
     /// The authenticator names a different principal than the ticket does.
     pub const KRB_AP_ERR_BADMATCH: i32 = 36;
+    /// The ticket is postdated and has not been validated.
+    pub const KRB_AP_ERR_TKT_INVALID: i32 = 49;
     /// A checksum that must be present is absent, or is of the wrong type.
     pub const KRB_AP_ERR_INAPP_CKSUM: i32 = 50;
 }

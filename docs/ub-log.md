@@ -203,3 +203,51 @@ vno[0], crealm[1], cname[2], cksum[3], cusec[4], ctime[5], subkey[6], seq[7], ad
 **Чего нет и куда вынесено:** реферралы, S4U2Self/S4U2Proxy, PAC (генерация), FAST, PKINIT,
 renew/validate, `transited` между реалмами, адресные проверки, kpasswd — фазы 2–4. Запрос, которому
 нужно одно из этого, получает код, а не тикет, который делает вид, что умеет.
+
+## Шаг 3: rustup с хоста, redb, kpasswd, адреса, renew/validate
+
+**Снос rustup — сначала замена, потом удаление.** Порядок был именно такой: сначала
+`scripts/cargo.sh` (обёртка над `rust:1.99.1-bookworm`, `-u $(id -u):$(id -g)` и кэш в
+`~/.cache/rust-heimdal-kdc`), проверка `test`/`clippy`/`fmt` через неё, и только потом удаление.
+Иначе остался бы без средства проверки. Итог: `cargo`, `rustc`, `rustup`, `rustfmt` на хосте
+отсутствуют, `~/.cargo` и `~/.rustup` удалены. `target/` принадлежит пользователю, не root.
+
+**Адресные проверки** (`src/address.rs`, `tests/addresses.rs`, 15 тестов): три угла Heimdal —
+нет списка адресов (разрешено или нет по `allow_null`), список из одних NetBIOS-имён считается
+отсутствующим (иначе Windows-клиенты не работают), неизвестный peer при непустом списке — отказ.
+
+**renew/validate** (`src/kdc/tgs_exchange.rs`, `tests/renew_validate.rs`, 11 тестов): `RENEW` и
+`VALIDATE` применимы только к `krbtgt` (иначе `KDC_ERR_BADOPTION`), просроченный TGT не
+обновляется, `renew-till` не продлевается за предел, postdated-тикет нельзя использовать до
+`VALIDATE`.
+
+**redb** (`src/hdb/record.rs`, `src/hdb/redb_store.rs`, `tests/redb_kdc.rs`): запись — DER по
+схеме `hdb.asn1` (таблица соответствия полей в документации модуля), бэкенд — одна таблица
+`hdb_entries`, ключ `name@realm`. Проверено не только юнит-тестами, но и движком: TGT выдаётся
+из файла, после закрытия и повторного открытия — снова выдаётся; удалённая запись не входит;
+служебный тикет из файла работает.
+
+**kpasswd** (`src/msg/kpasswd.rs`, `src/kdc/kpasswd.rs`, `tests/kpasswd_live.rs`, 7 тестов):
+полный обмен RFC 3244 с основным клиентом — initial-тикет для `kadmin/changepw`, `AP-REQ`,
+запечатанный запрос в клиентском subkey, `AP-REP` с эхом часов, результат в `KRB-PRIV`. Пароль
+меняется, kvno растёт, старые ключи остаются.
+
+**Две ошибки, найденные по исходникам, а не по памяти:**
+
+1. Версии протокола: `KRB5_KPASSWD_VERS_CHANGEPW` в Heimdal — это **1**, а `VERS_SETPW` — `0xff80`.
+   Я написал `0xff80`/`0xff81`, и каждый `kpasswd` получал `BAD_VERSION`. Коды статусов тоже
+   были сдвинуты (`AUTHERROR` = 3, не 2).
+2. Сервис с флагом `initial` в `hdb` не выдаётся по TGT (Heimdal `krb5tgs.c`), и это же —
+   механизм, которым RFC 3244 требует initial-тикет для `kadmin/changepw`. Без этого правила
+   `kadmin/changepw` достигался обычным служебным тикетом.
+
+**Мутации (8, все убиты):** kvno при смене пароля, замена старых ключей, проверка «свой аккаунт»,
+пустой пароль, флаг `initial` у сервиса, запись в redb. Две сначала выжили — не было тестов на
+чужой аккаунт и на пустой пароль; тесты дописаны, после чего убиты.
+
+**Ворота расширены на все фичи:** `clippy --all-targets --all-features`, `cargo test`,
+`cargo test --all-features`. `act push -P ubuntu-latest=rust:1.99.1-bookworm` — job succeeded.
+Локально: 177 тестов со всеми фичами, 162 по умолчанию, clippy 0.
+
+**Чего нет:** ACL администратора для set-password другому аккаунту (сейчас `ACCESS_DENIED`),
+`hprop`/репликация, генерация PAC, FAST, PKINIT, S4U, реферралы.

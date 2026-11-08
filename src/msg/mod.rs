@@ -7,6 +7,7 @@
 //! accessors rather than raw octets.
 
 pub mod apreq;
+pub mod kpasswd;
 pub mod req;
 
 pub use apreq::{ApReq, Authenticator};
@@ -99,6 +100,10 @@ pub mod kdc_options {
     pub const POSTDATED: u32 = 0x0200_0000;
     /// `renewable`.
     pub const RENEWABLE: u32 = 0x0100_0000;
+    /// `renew` (bit 30): extend a renewable TGT's lifetime.
+    pub const RENEW: u32 = 0x0000_0002;
+    /// `validate` (bit 31): clear a postdated ticket's `INVALID` flag.
+    pub const VALIDATE: u32 = 0x0000_0001;
     /// `canonicalize` (RFC 6806 §3).
     pub const CANONICALIZE: u32 = 0x0000_0020;
 }

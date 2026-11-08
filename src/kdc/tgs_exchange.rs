@@ -34,18 +34,156 @@ use super::{Kdc, wrong_realm};
 /// TGT it came with.
 #[derive(Debug)]
 struct Proven {
-    /// The client named by the ticket and confirmed by the authenticator.
-    client: Principal,
-    /// The TGT's ticket flags, which bound what the new ticket may claim.
-    tgt_flags: u32,
-    /// The TGT's `endtime`: a service ticket cannot outlive it.
-    tgt_endtime: i64,
+    /// The TGT's own part. A renewal and a validation are defined as edits to
+    /// it, so it is carried whole rather than field by field.
+    tgt: EncTicketPart,
     /// The key the reply is encrypted in: the authenticator's subkey when it
     /// carried one, otherwise the TGT's session key.
     reply_key: Key,
     /// The usage that reply key pairs with (RFC 4120 §7.5.1): 9 for a subkey,
     /// 8 for the session key.
     reply_usage: u32,
+}
+
+/// The ticket's own fields, decided once out of three rules: a service ticket,
+/// a renewal, a validation.
+#[derive(Debug)]
+struct TicketPlan {
+    flags: u32,
+    authtime: i64,
+    starttime: Option<i64>,
+    endtime: i64,
+    renew_till: Option<i64>,
+}
+
+/// `KDC_ERR_BADOPTION`: the request asked for something that does not apply.
+fn badoption(why: &str) -> Error {
+    Error::Kdc {
+        code: codes::KDC_ERR_BADOPTION,
+        text: why.into(),
+    }
+}
+
+/// A service ticket: bounded by the KDC's `max_life`, the service's `max_life`
+/// and, above all, by the TGT's own endtime.
+fn service_plan(
+    config: &super::KdcConfig,
+    body: &msg::KdcReqBody,
+    server: &HdbEntry,
+    tgt_flags: u32,
+    tgt_endtime: i64,
+    now: i64,
+) -> Result<TicketPlan> {
+    let mut endtime = body.till.min(now.saturating_add(config.max_life()));
+    if let Some(max) = server.max_life {
+        endtime = endtime.min(now.saturating_add(max));
+    }
+    // The TGT is the client's proof of identity: a ticket outliving it would let
+    // a revoked client keep working.
+    endtime = endtime.min(tgt_endtime);
+    if endtime <= now {
+        return Err(Error::Kdc {
+            code: codes::KDC_ERR_NEVER_VALID,
+            text: "the TGT expires before the ticket would start".into(),
+        });
+    }
+    let renew_till = (body.kdc_options & kdc_options::RENEWABLE != 0).then(|| {
+        let asked = match body.rtime {
+            None | Some(0) => now.saturating_add(config.max_renewable_life()),
+            Some(rtime) => rtime,
+        };
+        let mut till = asked.min(now.saturating_add(config.max_renewable_life()));
+        if let Some(max) = server.max_renew {
+            till = till.min(now.saturating_add(max));
+        }
+        till.min(tgt_endtime)
+    });
+
+    // Flags carry over from the TGT, not from what the client asks: a client
+    // cannot grant itself a forwardable ticket from a TGT that was not
+    // forwardable (RFC 4120 §3.3.3).
+    let mut flags = 0u32;
+    if tgt_flags & tkt_flags::FORWARDABLE != 0 && body.kdc_options & kdc_options::FORWARDABLE != 0 {
+        flags |= tkt_flags::FORWARDABLE;
+    }
+    if tgt_flags & tkt_flags::PROXIABLE != 0 && body.kdc_options & kdc_options::PROXIABLE != 0 {
+        flags |= tkt_flags::PROXIABLE;
+    }
+    if tgt_flags & tkt_flags::PRE_AUTHENT != 0 {
+        flags |= tkt_flags::PRE_AUTHENT;
+    }
+    if tgt_flags & tkt_flags::RENEWABLE != 0 && renew_till.is_some() {
+        flags |= tkt_flags::RENEWABLE;
+    }
+    if server.has(entry_flags::OK_AS_DELEGATE) {
+        flags |= tkt_flags::OK_AS_DELEGATE;
+    }
+    Ok(TicketPlan {
+        flags,
+        authtime: now,
+        starttime: None,
+        endtime,
+        renew_till,
+    })
+}
+
+/// A validation: clear `INVALID` and change nothing else, because a validation
+/// is not an authentication and must not extend anything.
+fn validate_plan(tgt: &EncTicketPart, now: i64) -> Result<TicketPlan> {
+    if tgt.flags & tkt_flags::INVALID == 0 {
+        return Err(badoption(
+            "the ticket is not invalid, so there is nothing to validate",
+        ));
+    }
+    let start = tgt
+        .starttime
+        .ok_or_else(|| badoption("a postdated ticket without a start time cannot be validated"))?;
+    if start > now {
+        return Err(Error::Kdc {
+            code: codes::KRB_AP_ERR_TKT_NYV,
+            text: format!("the ticket is not valid before {start}"),
+        });
+    }
+    Ok(TicketPlan {
+        flags: tgt.flags & !tkt_flags::INVALID,
+        authtime: tgt.authtime,
+        starttime: Some(start),
+        endtime: tgt.endtime,
+        renew_till: tgt.renew_till,
+    })
+}
+
+/// A renewal: the old lifetime counted from now, capped by `renew-till`.
+///
+/// The requested `till` is deliberately ignored. A renewal exists so a client
+/// does not have to keep its long-term key around; taking the lifetime from the
+/// request would turn renewal into a way to grow a ticket without
+/// re-authenticating, which is the opposite of the point.
+fn renew_plan(tgt: &EncTicketPart, now: i64) -> Result<TicketPlan> {
+    if tgt.flags & tkt_flags::RENEWABLE == 0 {
+        return Err(badoption("the ticket is not renewable"));
+    }
+    let renew_till = tgt
+        .renew_till
+        .ok_or_else(|| badoption("the ticket is renewable but carries no renew-till"))?;
+    let started = tgt.starttime.unwrap_or(tgt.authtime);
+    let old_life = tgt.endtime.saturating_sub(started);
+    let endtime = now.saturating_add(old_life).min(renew_till);
+    if endtime <= now {
+        return Err(Error::Kdc {
+            code: codes::KDC_ERR_NEVER_VALID,
+            text: format!("renew-till {renew_till} has passed, so there is nothing to extend"),
+        });
+    }
+    Ok(TicketPlan {
+        // A renewal is not an authentication either: the flags come from the
+        // ticket being renewed, unchanged.
+        flags: tgt.flags,
+        authtime: tgt.authtime,
+        starttime: tgt.starttime,
+        endtime,
+        renew_till: Some(renew_till),
+    })
 }
 
 impl Kdc {
@@ -77,6 +215,16 @@ impl Kdc {
                 text: format!("{sname} may not be issued a ticket"),
             });
         }
+        // Heimdal's `hdb` flag `initial`: a ticket for this service must come
+        // from an AS-REQ. `kadmin/changepw` is the reason it exists — a password
+        // that could be changed with any stolen TGT is a password an attacker
+        // rotates to lock the owner out.
+        if server.has(entry_flags::INITIAL) {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_POLICY,
+                text: format!("{sname} requires an initial ticket"),
+            });
+        }
 
         // 6: the ticket.
         let usable = super::usable_enctypes(config, &body.etypes, &server);
@@ -85,58 +233,48 @@ impl Kdc {
             .copied()
             .ok_or_else(|| Error::UnsupportedEnctype(body.etypes.first().copied().unwrap_or(0)))?;
 
-        // A service ticket never outlives the TGT it came from: the TGT is the
-        // client's proof of identity, and a ticket that outlived it would let a
-        // revoked client keep working.
-        let start = now;
-        // Bounded by this KDC's `max_life` and the service's `max_life` — the
-        // client's entry does not bound a service ticket, its TGT does.
-        let mut endtime = body.till.min(start.saturating_add(config.max_life()));
-        if let Some(max) = server.max_life {
-            endtime = endtime.min(start.saturating_add(max));
-        }
-        endtime = endtime.min(proven.tgt_endtime);
-        if endtime <= start {
+        let validate = body.kdc_options & kdc_options::VALIDATE != 0;
+        let renew = body.kdc_options & kdc_options::RENEW != 0;
+
+        // A postdated ticket is unusable until it is validated, and validation
+        // is the only thing that may touch an INVALID ticket (RFC 4120
+        // §3.3.3).
+        if !validate && proven.tgt.flags & tkt_flags::INVALID != 0 {
             return Err(Error::Kdc {
-                code: codes::KDC_ERR_NEVER_VALID,
-                text: "the TGT expires before the ticket would start".into(),
+                code: codes::KRB_AP_ERR_TKT_INVALID,
+                text: "the TGT is postdated and has not been validated".into(),
             });
         }
-        let renew_till = (body.kdc_options & kdc_options::RENEWABLE != 0).then(|| {
-            let asked = match body.rtime {
-                None | Some(0) => start.saturating_add(config.max_renewable_life()),
-                Some(rtime) => rtime,
-            };
-            let mut till = asked.min(start.saturating_add(config.max_renewable_life()));
-            if let Some(max) = server.max_renew {
-                till = till.min(start.saturating_add(max));
-            }
-            till.min(proven.tgt_endtime)
-        });
+        if (renew || validate) && !sname.is_krbtgt() {
+            // Renewal and validation ask for the TGT again; a request that aims
+            // them at a service is asking for something the protocol has no
+            // meaning for.
+            return Err(badoption(
+                "renew and validate apply to the ticket-granting ticket only",
+            ));
+        }
 
-        // Flags carry over from the TGT, not from what the client asks: a
-        // client cannot grant itself a forwardable ticket from a TGT that was
-        // not forwardable (RFC 4120 §3.3.3).
-        let mut flags = 0u32; // a service ticket starts with no flags of its own
-        if proven.tgt_flags & tkt_flags::FORWARDABLE != 0
-            && body.kdc_options & kdc_options::FORWARDABLE != 0
-        {
-            flags |= tkt_flags::FORWARDABLE;
-        }
-        if proven.tgt_flags & tkt_flags::PROXIABLE != 0
-            && body.kdc_options & kdc_options::PROXIABLE != 0
-        {
-            flags |= tkt_flags::PROXIABLE;
-        }
-        if proven.tgt_flags & tkt_flags::PRE_AUTHENT != 0 {
-            flags |= tkt_flags::PRE_AUTHENT;
-        }
-        if proven.tgt_flags & tkt_flags::RENEWABLE != 0 && renew_till.is_some() {
-            flags |= tkt_flags::RENEWABLE;
-        }
-        if server.has(entry_flags::OK_AS_DELEGATE) {
-            flags |= tkt_flags::OK_AS_DELEGATE;
-        }
+        let plan = if validate {
+            validate_plan(&proven.tgt, now)?
+        } else if renew {
+            renew_plan(&proven.tgt, now)?
+        } else {
+            service_plan(
+                config,
+                body,
+                &server,
+                proven.tgt.flags,
+                proven.tgt.endtime,
+                now,
+            )?
+        };
+        let TicketPlan {
+            flags,
+            authtime,
+            starttime,
+            endtime,
+            renew_till,
+        } = plan;
 
         let session_key = self.cipher().random(session_enctype)?;
         let server_enctype = server
@@ -151,14 +289,14 @@ impl Kdc {
         let ticket_part = EncTicketPart {
             flags,
             session_key: session_key.clone(),
-            crealm: proven.client.realm.clone(),
-            cname: proven.client.clone(),
+            crealm: proven.tgt.crealm.clone(),
+            cname: proven.tgt.cname.clone(),
             // No realm has been traversed: the ticket came from the realm that
             // names it. Cross-realm `transited` is step 3.
             transited_type: 0,
             transited: Vec::new(),
-            authtime: now,
-            starttime: None,
+            authtime,
+            starttime,
             endtime,
             renew_till,
             caddr: body.addresses.clone(),
@@ -182,8 +320,8 @@ impl Kdc {
             nonce: body.nonce,
             key_expiration: None,
             flags,
-            authtime: now,
-            starttime: None,
+            authtime,
+            starttime,
             endtime,
             renew_till,
             srealm: server.principal.realm.clone(),
@@ -207,8 +345,8 @@ impl Kdc {
             // No PA-DATA in a TGS-REP at this stage: RFC 6806's
             // PA-REQ-ENC-PA-REP belongs with FAST, which is step 4.
             padata: Vec::new(),
-            crealm: proven.client.realm.clone(),
-            cname: proven.client.clone(),
+            crealm: proven.tgt.crealm.clone(),
+            cname: proven.tgt.cname.clone(),
             ticket,
             enc_part,
         }
@@ -323,9 +461,7 @@ impl Kdc {
         };
 
         Ok(Proven {
-            client: ticket_part.cname.clone(),
-            tgt_flags: ticket_part.flags,
-            tgt_endtime: ticket_part.endtime,
+            tgt: ticket_part,
             reply_key,
             reply_usage,
         })

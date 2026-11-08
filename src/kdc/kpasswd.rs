@@ -15,11 +15,11 @@
 //! * **An absent `targname` means "me".** The client may name another account
 //!   (RFC 3244's set-password, an administrator's move); naming nobody is the
 //!   common case and must not be read as "nobody".
-//! * **Self-service only.** Without an administrator ACL there is nobody who may
-//!   set another account's password, so a request that names one is refused with
-//!   `KRB5_KPASSWD_AUTHERROR` rather than silently done. Refusing is the honest
-//!   answer: an ACL is a later stage, and a KDC that ignores the field would let
-//!   any user change any password.
+//! * **Who may change whose password is the embedder's decision.** This crate
+//!   asks a [`super::ChangePolicy`]; the default, [`super::SelfOnly`], allows
+//!   exactly the case that needs no configuration. A KDC that ignored the target
+//!   field would let any user change any password, so an unanswered request is
+//!   refused rather than done.
 //!
 //! The reply is a `KRB-PRIV` in the same subkey whose `user-data` is the RFC 3244
 //! result: a two-octet code followed by a message.
@@ -243,16 +243,14 @@ impl Kdc {
             ));
         }
 
-        // Self-service: there is no administrator ACL yet, so a request for
-        // anybody but the ticket's client is refused rather than done.
+        // Who may change whose password is the embedder's decision, not this
+        // crate's: `ChangePolicy` is asked, and `SelfOnly` — the default — allows
+        // exactly the case that needs no configuration.
         let target = target.unwrap_or_else(|| client.clone());
-        if target != *client {
+        if !self.policy().may_change(client, &target) {
             return Err(ChangeError::Status(
                 STATUS_ACCESSDENIED,
-                format!(
-                    "this server changes only the password of the ticket's client ({client}), \
-                     not {target}"
-                ),
+                format!("{client} may not change the password of {target}"),
             ));
         }
 
@@ -262,43 +260,14 @@ impl Kdc {
             .map_err(ChangeError::Fatal)?
             .ok_or_else(|| ChangeError::Status(STATUS_AUTHERROR, format!("{target} is unknown")))?;
 
-        let updated = self
-            .rekey(&entry, &new_password)
+        // One implementation of "a new password means new keys at the next kvno,
+        // with the salts kept" — on the record, because the administrator's API
+        // makes the same change and the two must not diverge.
+        let updated = entry
+            .rekey(self.cipher(), &new_password)
             .map_err(ChangeError::Fatal)?;
         self.hdb().store(updated).map_err(ChangeError::Fatal)?;
         Ok(())
-    }
-
-    /// A copy of `entry` at the next kvno, with a key per enctype the entry
-    /// already had.
-    ///
-    /// The kvno goes up rather than the keys being replaced in place: a client
-    /// holding a ticket issued a second ago must still be able to use it, and a
-    /// service that has not re-read its keytab yet must still be able to read
-    /// them.
-    fn rekey(&self, entry: &HdbEntry, password: &[u8]) -> Result<HdbEntry> {
-        let next = entry.kvno().saturating_add(1);
-        let enctypes = entry.enctypes();
-        if enctypes.is_empty() {
-            return Err(Error::Hdb(format!(
-                "{} has no keys, so there is no enctype to make new ones in",
-                entry.principal
-            )));
-        }
-        let mut updated = entry.clone();
-        updated.keys.clear();
-        for enctype in enctypes {
-            // The salt is kept: it belongs to the principal's history, and a
-            // client that derived its key with the salt it was told must be able
-            // to derive the new one the same way.
-            let salt = entry
-                .key_for(enctype)
-                .and_then(|k| k.salt.clone())
-                .unwrap_or_else(|| entry.principal.default_salt());
-            let key = self.cipher().s2k(enctype, password, &salt, None)?;
-            updated.add_key(key, next, Some(salt));
-        }
-        Ok(updated)
     }
 
     /// Decrypts the change-password ticket with the service's own key.

@@ -52,7 +52,9 @@ pub struct KdcReqBody {
     pub addresses: Option<Vec<u8>>,
     /// `enc-authorization-data`, kept encoded.
     pub enc_authorization_data: Option<Vec<u8>>,
-    /// `additional-tickets`, kept encoded.
+    /// `additional-tickets`, kept as the `SEQUENCE OF Ticket` it arrived as: a
+    /// user-to-user request puts the server's own TGT here, and the KDC needs
+    /// the ticket's exact octets to find its session key.
     pub additional_tickets: Option<Vec<u8>>,
 }
 

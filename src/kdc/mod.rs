@@ -42,16 +42,43 @@ use crate::crypto::Cipher;
 use crate::error::{Error, codes};
 use crate::hdb::Hdb;
 use crate::msg::KdcReq;
+use crate::name::Principal;
 
 pub use as_exchange::{endtime, renew_till, starttime, ticket_flags, usable_enctypes};
 pub use config::KdcConfig;
 
-/// The engine: a configuration, a database and a cipher.
+/// Who may change whose password (RFC 3244 §2: the service is told, not told
+/// what to decide).
+///
+/// It is a trait rather than a file because the decision is an authorization
+/// question, and this crate does not own authorization: the process that embeds
+/// the KDC almost always has a directory, a group membership and a policy of its
+/// own, and a KDC that read `/var/heimdal/kadmind.acl` would be inventing a
+/// second answer to a question already answered. [`SelfOnly`] is the default,
+/// because it needs no configuration and cannot grant too much.
+pub trait ChangePolicy: std::fmt::Debug + Send + Sync {
+    /// Whether `actor` may set the password of `target`.
+    fn may_change(&self, actor: &Principal, target: &Principal) -> bool;
+}
+
+/// Everyone changes only their own password.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelfOnly;
+
+impl ChangePolicy for SelfOnly {
+    fn may_change(&self, actor: &Principal, target: &Principal) -> bool {
+        actor == target
+    }
+}
+
+/// The engine: a configuration, a database, a cipher, and who may change whose
+/// password.
 #[derive(Debug)]
 pub struct Kdc {
     config: KdcConfig,
     hdb: Arc<dyn Hdb>,
     cipher: Arc<dyn Cipher>,
+    policy: Arc<dyn ChangePolicy>,
 }
 
 impl Kdc {
@@ -61,7 +88,24 @@ impl Kdc {
             config,
             hdb,
             cipher,
+            policy: Arc::new(SelfOnly),
         }
+    }
+
+    /// The same KDC with `policy` deciding who may change whose password.
+    pub fn with_change_policy(mut self, policy: Arc<dyn ChangePolicy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The policy in force.
+    pub fn change_policy(&self) -> &dyn ChangePolicy {
+        self.policy.as_ref()
+    }
+
+    /// Shorthand for the change-password paths, which ask one question.
+    pub(super) fn policy(&self) -> &dyn ChangePolicy {
+        self.policy.as_ref()
     }
 
     /// The configuration in force.

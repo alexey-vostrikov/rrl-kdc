@@ -237,6 +237,44 @@ impl HdbEntry {
     pub fn add_key(&mut self, key: Key, kvno: u32, salt: Option<Vec<u8>>) {
         self.keys.push(HdbKey { kvno, key, salt });
     }
+
+    /// A copy of this entry at the next kvno, with new keys derived from
+    /// `password`.
+    ///
+    /// The kvno goes up rather than the keys being replaced in place: a client
+    /// holding a ticket issued a second ago must still be able to use it, and a
+    /// service that has not re-read its keytab yet must still be able to read it.
+    ///
+    /// The salt of each existing key is kept: it belongs to the principal's
+    /// history, and a client that derived its key with the salt it was told must
+    /// derive the new one the same way. New keys are made for the enctypes the
+    /// entry already has — a password change is not the moment to add an enctype
+    /// the account never had, because a client not told about it cannot use it.
+    ///
+    /// On the record rather than in one of the two callers: the change-password
+    /// service and the administrator's API both set passwords, and two copies of
+    /// this rule would eventually disagree about the salt or the kvno.
+    pub fn rekey(&self, cipher: &dyn Cipher, password: &[u8]) -> Result<HdbEntry> {
+        let enctypes = self.enctypes();
+        if enctypes.is_empty() {
+            return Err(Error::Hdb(format!(
+                "{} has no keys, so there is no enctype to make new ones in",
+                self.principal
+            )));
+        }
+        let next = self.kvno().saturating_add(1);
+        let mut updated = self.clone();
+        updated.keys.clear();
+        for enctype in enctypes {
+            let salt = self
+                .key_for(enctype)
+                .and_then(|k| k.salt.clone())
+                .unwrap_or_else(|| self.principal.default_salt());
+            let key = cipher.s2k(enctype, password, &salt, None)?;
+            updated.add_key(key, next, Some(salt));
+        }
+        Ok(updated)
+    }
 }
 
 /// What a KDC needs from a database (Heimdal's `hdb_open`, `hdb_fetch_kvno`,

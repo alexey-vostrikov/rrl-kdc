@@ -100,6 +100,9 @@ pub mod kdc_options {
     pub const POSTDATED: u32 = 0x0200_0000;
     /// `renewable`.
     pub const RENEWABLE: u32 = 0x0100_0000;
+    /// `enc-tkt-in-skey` (RFC 4120 §5.4.1, bit 28): encrypt the ticket in the
+    /// session key of the ticket in `additional-tickets` — user-to-user.
+    pub const ENC_TKT_IN_SKEY: u32 = 0x0000_0008;
     /// `renew` (bit 30): extend a renewable TGT's lifetime.
     pub const RENEW: u32 = 0x0000_0002;
     /// `validate` (bit 31): clear a postdated ticket's `INVALID` flag.

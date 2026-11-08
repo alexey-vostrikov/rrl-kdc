@@ -277,14 +277,24 @@ impl Kdc {
         } = plan;
 
         let session_key = self.cipher().random(session_enctype)?;
-        let server_enctype = server
-            .enctypes()
-            .first()
-            .copied()
-            .unwrap_or(session_enctype);
-        let server_key = server
-            .key_for(server_enctype)
-            .ok_or_else(|| Error::Hdb(format!("{sname} has no usable key")))?;
+        // A user-to-user ticket is sealed in the session key of the additional
+        // ticket, not in any long-term key: the server holds no keytab, and the
+        // TGT it sent is the only key material the two sides share (RFC 4120
+        // §2.9.2). Everything up to here is the same for both kinds of ticket.
+        let ticket_key = match self.user_to_user_key(body, &sname)? {
+            Some((key, kvno)) => (key, kvno),
+            None => {
+                let server_enctype = server
+                    .enctypes()
+                    .first()
+                    .copied()
+                    .unwrap_or(session_enctype);
+                let key = server
+                    .key_for(server_enctype)
+                    .ok_or_else(|| Error::Hdb(format!("{sname} has no usable key")))?;
+                (key.key.clone(), Some(key.kvno))
+            }
+        };
 
         let ticket_part = EncTicketPart {
             flags,
@@ -307,9 +317,9 @@ impl Kdc {
             sname: server.principal.clone(),
             enc: EncryptedData::seal(
                 self.cipher(),
-                &server_key.key,
+                &ticket_key.0,
                 usage::KDC_REP_TICKET,
-                Some(server_key.kvno),
+                ticket_key.1,
                 &ticket_part.encode(),
             )?,
         };
@@ -351,6 +361,67 @@ impl Kdc {
             enc_part,
         }
         .encode())
+    }
+
+    /// The key a user-to-user ticket is sealed in, when the request asked for
+    /// one: the session key of the ticket in `additional-tickets`.
+    ///
+    /// The rules are Heimdal's (`krb5tgs.c`, `b->kdc_options.enc_tkt_in_skey`):
+    /// there must be an additional ticket, it must be a ticket-granting ticket,
+    /// it must decrypt under this realm's `krbtgt` key, and the service asked for
+    /// must be the client that ticket names. The last one is what makes this
+    /// safe: without it, anybody could get a ticket for anybody sealed in a key
+    /// they chose, which is a ticket they could read.
+    fn user_to_user_key(
+        &self,
+        body: &crate::msg::KdcReqBody,
+        sname: &Principal,
+    ) -> Result<Option<(Key, Option<u32>)>> {
+        if body.kdc_options & kdc_options::ENC_TKT_IN_SKEY == 0 {
+            return Ok(None);
+        }
+        let encoded = body
+            .additional_tickets
+            .as_deref()
+            .ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_BADOPTION,
+                text: "enc-tkt-in-skey without additional-tickets".into(),
+            })?;
+        let ticket = Ticket::decode(&first_ticket(encoded)?)?;
+        if !ticket.sname.is_krbtgt() {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_POLICY,
+                text: format!(
+                    "the additional ticket is for {}, not a ticket-granting ticket",
+                    ticket.sname
+                ),
+            });
+        }
+        let krbtgt = Principal::krbtgt(self.config().realm());
+        if ticket.sname != krbtgt {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_POLICY,
+                text: format!(
+                    "user-to-user across realms is not supported: {}",
+                    ticket.sname
+                ),
+            });
+        }
+        let entry = self
+            .hdb()
+            .fetch(&krbtgt)?
+            .ok_or_else(|| Error::Hdb("the krbtgt entry is missing from the database".into()))?;
+        let part = self.decrypt_ticket(&ticket, &entry)?;
+        if part.cname != *sname {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_MUST_USE_USER2USER,
+                text: format!(
+                    "the additional ticket names {} but the ticket was asked for {sname}",
+                    part.cname
+                ),
+            });
+        }
+        Ok(Some((part.session_key, None)))
     }
 
     /// Steps 1–4: decode `PA-TGS-REQ`, decrypt the ticket, then the
@@ -528,3 +599,28 @@ impl Kdc {
         Authenticator::decode(&plain)
     }
 }
+
+/// The first `Ticket` in the `additional-tickets` SEQUENCE, as DER.
+///
+/// The field arrives as the content of `[11]`, which is the `SEQUENCE OF`
+/// wrapper; its first element is the server's TGT.
+fn first_ticket(encoded: &[u8]) -> Result<Vec<u8>> {
+    let mut r = crate::der::Reader::new(encoded);
+    let content = r.expect("additional-tickets", crate::der::SEQUENCE)?;
+    let mut s = crate::der::Reader::new(content);
+    let tlv = s.next("additional-tickets")?;
+    if tlv.tag != crate::der::app(crate::msg::TICKET) {
+        return Err(Error::Kdc {
+            code: codes::KDC_ERR_BADOPTION,
+            text: format!("additional-tickets holds tag {:#04x}, not a Ticket", tlv.tag),
+        });
+    }
+    // The reader hands back the tag and the content separately; `Ticket::decode`
+    // wants the whole application-tagged value, so the header is rebuilt.
+    let mut out = Vec::with_capacity(tlv.content.len() + 6);
+    out.push(tlv.tag);
+    crate::der::encode_len(&mut out, tlv.content.len());
+    out.extend_from_slice(tlv.content);
+    Ok(out)
+}
+

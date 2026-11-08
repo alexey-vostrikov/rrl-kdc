@@ -40,6 +40,33 @@ the administrator's API over it. The `krb5` crate drives the acceptance tests.
 | `kdc::kpasswd` — RFC 3244 change-password | done: set-password, with a pluggable authorization policy |
 | `acl` — who may change whose password | done: rules in a store, not a file |
 | `admin` — create, delete, modify, re-key, export a keytab | done |
+| `admin::wire` — the operations as values, with the authorization in one place | done |
+| `admin::json` — the JSON form (feature `admin-json`) | done, for a REST front end to wrap |
+
+### Managing a realm without inventing an API
+
+`admin::wire` exists so that a transport carries operations rather than calling
+`Admin`'s methods one by one: every operation is a value, `Admin::handle` runs it,
+and **the authorization is inside `handle`**. A REST route, a CLI and an in-process
+caller therefore cannot forget the check — there is no other entry point that
+performs an operation.
+
+Rights are finer than "administrator": listing a realm, reading an entry and
+exporting a keytab are three different rights, because only the last one hands over
+password-equivalent material. Nothing is granted by default (`DenyAll`), so a
+deployment that forgets to configure authorization serves nobody rather than
+everybody.
+
+With the `admin-json` feature a front end is a one-liner:
+
+```rust
+let reply = admin.handle(serde_json::from_str(&body)?)?;   // -> serde_json::to_value
+```
+
+with three properties worth relying on: binary fields travel as base64 rather than
+as arrays of octets, a misspelled field is an error rather than silently dropped,
+and an error carries a stable `kind` (`not_found`, `already_exists`, `forbidden`,
+`bad_request`, …) for the status code so nobody has to parse prose.
 
 ## Enctypes
 
@@ -90,9 +117,16 @@ Three real bugs were caught by them during step 0 and are worth knowing:
 
 ```sh
 cargo build
-cargo test
-cargo test --features crypto-rskrb5
-cargo clippy --all-targets --features crypto-rskrb5
+cargo test                          # the default configuration
+cargo test --all-features           # + redb, + the JSON form, + the crypto cross-check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Coverage is measured with `cargo llvm-cov` and held to a floor, so a module that
+arrives without tests fails the build rather than lowering a number nobody reads:
+
+```sh
+scripts/coverage.sh --check         # COVERAGE_MIN=88 by default
 ```
 
 Edition 2024, MSRV 1.99.1 — the same toolchain the in-process consumer

@@ -15,6 +15,10 @@ IMAGE  ?= rust:1.99.1-bookworm
 # nobody typed.
 CARGO  ?= ./scripts/cargo.sh
 
+.PHONY: coverage
+coverage:
+	@./scripts/coverage.sh --check
+
 .PHONY: help
 help:
 	@echo "make test        tests in the default configuration"

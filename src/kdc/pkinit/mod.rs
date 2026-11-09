@@ -42,6 +42,9 @@ use rsa_sha2 as rsa_digest;
 #[cfg(feature = "pkinit")]
 use crate::Result;
 
+#[cfg(feature = "pkinit")]
+pub mod dh;
+
 /// `PA-PK-AS-REQ`, RFC 4556 §3.2.1.
 pub const PA_PK_AS_REQ: i32 = 16;
 /// `PA-PK-AS-REP`, RFC 4556 §3.2.3.

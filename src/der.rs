@@ -133,6 +133,23 @@ pub fn int(v: i64) -> Vec<u8> {
     tlv(INTEGER, &bytes[start..])
 }
 
+/// An `INTEGER` from a big-endian magnitude, with the sign octet when the top bit is set.
+///
+/// `int` takes a signed 64-bit value, which is enough for every field of RFC 4120 and far
+/// from enough for a Diffie-Hellman prime: those are two octets short of two thousand.
+pub fn int_bytes(magnitude: &[u8]) -> Vec<u8> {
+    let trimmed = match magnitude.iter().position(|b| *b != 0) {
+        Some(0) if magnitude[0] & 0x80 != 0 => {
+            let mut out = vec![0x00];
+            out.extend_from_slice(magnitude);
+            return tlv(INTEGER, &out);
+        }
+        Some(start) => &magnitude[start..],
+        None => return tlv(INTEGER, &[0]),
+    };
+    tlv(INTEGER, trimmed)
+}
+
 /// An `OCTET STRING`.
 pub fn octets(b: &[u8]) -> Vec<u8> {
     tlv(OCTET_STRING, b)

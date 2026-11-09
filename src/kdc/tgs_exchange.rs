@@ -40,6 +40,20 @@ use super::{Kdc, wrong_realm};
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
+/// What a protocol transition decided.
+///
+/// One struct rather than three return values: the identity, whether the ticket may be
+/// forwardable, and the `PA-DATA` that has to come back are one decision, and separating them
+/// invites a caller to use two of the three.
+struct Transition {
+    /// The user the service acts for.
+    user: Principal,
+    /// Whether `forwardable` survives into the ticket (MS-SFU §3.1.4).
+    may_delegate: bool,
+    /// `PA-S4U-X509-USER` for the reply, when the client sent one.
+    reply: Option<(i32, Vec<u8>)>,
+}
+
 pub(super) struct Proven {
     /// The TGT's own part. A renewal and a validation are defined as edits to
     /// it, so it is carried whole rather than field by field.
@@ -264,7 +278,7 @@ impl Kdc {
             // `check_evidence` looks the `AP-REQ` up itself; the unarmored path does not
             // need it here.
             let proven = self.check_evidence(req, now)?;
-            return self.tgs_answer(&req.body, proven, now, None, false);
+            return self.tgs_answer(&req.body, &req.padata, proven, now, None, false);
         };
 
         let armored = super::fast::ArmoredRequest::decode(fast_bytes)?;
@@ -320,7 +334,7 @@ impl Kdc {
         let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
         let body = KdcReqBody::decode(content)?;
 
-        self.tgs_answer(&body, proven, now, Some(&armor_key), hide)
+        self.tgs_answer(&body, &inner.padata, proven, now, Some(&armor_key), hide)
     }
 
     /// The exchange itself, over a body that has already been recovered from wherever it
@@ -328,6 +342,7 @@ impl Kdc {
     fn tgs_answer(
         &self,
         body: &KdcReqBody,
+        padata: &[(i32, Vec<u8>)],
         proven: Proven,
         now: i64,
         armor: Option<&Key>,
@@ -374,6 +389,13 @@ impl Kdc {
                 text: format!("{sname} requires an initial ticket"),
             });
         }
+
+        // S4U2Self, MS-SFU §3.1: a service asking for a ticket in somebody else's name.
+        //
+        // Before the plan, because the plan's flags depend on it: a ticket issued this way is
+        // forwardable only when the service is trusted for delegation *and* the user is, and
+        // the impersonated user's identity is what the ticket, the PAC and the reply all name.
+        let transition = self.protocol_transition(padata, &proven, &sname, &server, now)?;
 
         // 6: the ticket.
         let usable = super::usable_enctypes(config, &body.etypes, &server, Purpose::Ticket);
@@ -428,7 +450,23 @@ impl Kdc {
             endtime,
             renew_till,
         } = plan;
-        let flags = flags | forwarding;
+        let mut flags = flags | forwarding;
+
+        // The identity the ticket and the PAC name: the service's own, unless this was a
+        // protocol transition.
+        let (client, crealm) = match &transition {
+            Some(t) => (t.user.clone(), t.user.realm.clone()),
+            None => (proven.tgt.cname.clone(), proven.tgt.crealm.clone()),
+        };
+        if let Some(t) = &transition {
+            // MS-SFU §3.1.4: a ticket obtained by protocol transition is forwardable only if
+            // the service is trusted for delegation and the user's own account is. Otherwise
+            // the flag is cleared — leaving it set would hand the service a credential it
+            // could present as S4U2Proxy evidence for a user it was never allowed to delegate.
+            if !t.may_delegate {
+                flags &= !tkt_flags::FORWARDABLE;
+            }
+        }
 
         let session_key = self.cipher().random(session_enctype)?;
         // A user-to-user ticket is sealed in the session key of the additional
@@ -452,8 +490,8 @@ impl Kdc {
         let ticket_part = EncTicketPart {
             flags,
             session_key: session_key.clone(),
-            crealm: proven.tgt.crealm.clone(),
-            cname: proven.tgt.cname.clone(),
+            crealm: crealm.clone(),
+            cname: client.clone(),
             // No realm has been traversed: the ticket came from the realm that
             // names it. Cross-realm `transited` is step 3.
             transited_type: 0,
@@ -466,11 +504,7 @@ impl Kdc {
             // The PAC is rebuilt for this ticket rather than copied from the TGT: its
             // service checksum is keyed by *this* service's key, and the KDC signature
             // is over the whole buffer, so a copied one would not verify.
-            authorization_data: self.pac_authorization_data(
-                &proven.tgt.cname,
-                &ticket_key.0,
-                authtime,
-            )?,
+            authorization_data: self.pac_authorization_data(&client, &ticket_key.0, authtime)?,
         };
         let ticket = Ticket {
             realm: config.realm().to_owned(),
@@ -521,13 +555,17 @@ impl Kdc {
         // RFC 6113 §5.4.2.6: an armored TGS request is answered inside the armor, with a
         // `finished` checksum over the ticket so the client can tell it is the answer to
         // this request and not a substituted one.
-        let mut padata_out = Vec::new();
         let (crealm, cname) = if hide {
             let anonymous = super::fast::anonymous_principal();
             (anonymous.realm.clone(), anonymous)
         } else {
-            (proven.tgt.crealm.clone(), proven.tgt.cname.clone())
+            (crealm, client.clone())
         };
+        let mut padata_out: Vec<(i32, Vec<u8>)> = transition
+            .as_ref()
+            .and_then(|t| t.reply.clone())
+            .into_iter()
+            .collect();
         let rep = KdcRep {
             msg_type: TGS_REP,
             padata: Vec::new(),
@@ -545,16 +583,141 @@ impl Kdc {
                 now,
                 now.rem_euclid(1_000_000) as u32,
             )?;
-            padata_out = vec![(
+            padata_out.push((
                 super::fast::PA_FX_FAST_REPLY,
                 super::fast::wrap_reply(key, &[], None, Some(finish), body.nonce, self.cipher())?,
-            )];
+            ));
         }
         Ok(KdcRep {
             padata: padata_out,
             ..rep
         }
         .encode())
+    }
+
+    /// Evaluates a protocol transition (S4U2Self), MS-SFU §3.1.
+    ///
+    /// Returns `None` when the request carries neither S4U `PA-DATA`, which is every ordinary
+    /// request. When it carries one or both, the claim is verified and the identity is
+    /// returned for the ticket, the PAC and the reply — the three places that must agree, and
+    /// the reason this runs before the ticket is built rather than after.
+    fn protocol_transition(
+        &self,
+        padata: &[(i32, Vec<u8>)],
+        proven: &Proven,
+        sname: &Principal,
+        server: &HdbEntry,
+        now: i64,
+    ) -> Result<Option<Transition>> {
+        let for_user = padata
+            .iter()
+            .find(|(t, _)| *t == super::s4u::PA_FOR_USER)
+            .map(|(_, v)| super::s4u::ForUser::decode(v))
+            .transpose()?;
+        let x509 = padata
+            .iter()
+            .find(|(t, _)| *t == super::s4u::PA_S4U_X509_USER)
+            .map(|(_, v)| super::s4u::X509User::decode(v))
+            .transpose()?;
+        if for_user.is_none() && x509.is_none() {
+            return Ok(None);
+        }
+
+        // MS-SFU §3.1.2: the service may only ask for a ticket *to itself*. Anything else
+        // would let any service with a TGT mint tickets for any other service in the realm,
+        // which is the whole of Kerberos's authorization model in one request.
+        if proven.tgt.cname != *sname {
+            return Err(badoption(&format!(
+                "S4U2Self: {} asked for a ticket to {sname}; a protocol transition is only \
+                 allowed to the service's own name",
+                proven.tgt.cname
+            )));
+        }
+
+        // The checksums, each under the key its specification names: PA-FOR-USER under the
+        // TGT's session key, PA-S4U-X509-USER under the authenticator's subkey.
+        if let Some(f) = &for_user {
+            f.verify(&proven.tgt.session_key)?;
+        }
+        let subkey = proven.subkey.as_ref();
+        if let Some(x) = &x509 {
+            let Some(subkey) = subkey else {
+                return Err(Error::Kdc {
+                    code: codes::KRB_AP_ERR_MODIFIED,
+                    text: "PA-S4U-X509-USER: the authenticator carries no subkey, and the \
+                           checksum is keyed with it; without one there is nothing to verify"
+                        .into(),
+                });
+            };
+            x.verify(self.cipher(), subkey)?;
+        }
+
+        // Both halves are one claim. A request carrying two that disagree is a client that
+        // cannot make up its mind, and picking either would be picking for it.
+        let user = match (&for_user, &x509) {
+            (Some(f), Some(x)) => {
+                if x.cname.as_ref() != Some(&f.user) {
+                    return Err(Error::Kdc {
+                        code: codes::KDC_ERR_BADOPTION,
+                        text: format!(
+                            "S4U2Self: PA-FOR-USER names {} and PA-S4U-X509-USER names {}; \
+                             one request, one user",
+                            f.user,
+                            x.cname
+                                .as_ref()
+                                .map_or_else(|| "(nobody)".to_string(), ToString::to_string)
+                        ),
+                    });
+                }
+                f.user.clone()
+            }
+            (Some(f), None) => f.user.clone(),
+            (None, Some(x)) => x.user().cloned().ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_BADOPTION,
+                text: "PA-S4U-X509-USER names no user; there is nobody to act for".into(),
+            })?,
+            (None, None) => unreachable!("checked above"),
+        };
+
+        // The user has to exist and be loggable in *this* realm: impersonating an account
+        // that does not exist would mint a ticket nobody can check, and looking the name up
+        // is also what decides the PAC's groups.
+        let entry = self.hdb().fetch(&user)?.ok_or_else(|| Error::Kdc {
+            code: codes::KDC_ERR_C_PRINCIPAL_UNKNOWN,
+            text: format!("S4U2Self: {user} is not an account of this realm"),
+        })?;
+        if !entry.is_valid_at(now) {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_CLIENT_REVOKED,
+                text: format!("S4U2Self: {user} is locked, disabled or expired"),
+            });
+        }
+        if !entry.has(entry_flags::CLIENT) {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_POLICY,
+                text: format!("S4U2Self: {user} is not a client principal"),
+            });
+        }
+
+        // MS-SFU §3.1.4: forwardable only when the service is trusted for delegation and the
+        // user's account is forwardable. Neither alone is enough, and the flag is what an
+        // S4U2Proxy request will later demand as evidence.
+        let may_delegate =
+            server.has(entry_flags::TRUSTED_FOR_DELEGATION) && entry.has(entry_flags::FORWARDABLE);
+
+        let reply = match (&x509, subkey) {
+            (Some(x), Some(subkey)) => Some((
+                super::s4u::PA_S4U_X509_USER,
+                x.reply(self.cipher(), subkey)?,
+            )),
+            _ => None,
+        };
+
+        Ok(Some(Transition {
+            user,
+            may_delegate,
+            reply,
+        }))
     }
 
     /// The key a user-to-user ticket is sealed in, when the request asked for

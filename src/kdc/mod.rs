@@ -34,6 +34,8 @@ pub mod kpasswd;
 pub mod logon_info;
 pub mod pac;
 pub mod pkinit;
+/// S4U2Self (MS-SFU): a service asking for a ticket in somebody else's name.
+pub mod s4u;
 
 pub use kpasswd::{VERSION_CHANGE, VERSION_SET, changepw_entry, result_payload};
 

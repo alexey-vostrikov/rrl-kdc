@@ -19,7 +19,7 @@ ensure_image
 docker run --rm -u "$(id -u):$(id -g)" \
     -v "$ROOT:/w" -v "$CARGO_HOME_SRC:/cargo" -v "$CACHE/rustup:/rustup" \
     -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=never \
-    -e CARGO_TARGET_DIR=/w/target/$TAG \
+    -e CARGO_TARGET_DIR=/w/target/$TAG-metrics \
     -w /w "$IMAGE" sh -c '
 set -eu
 PATH=/usr/local/cargo/bin:$PATH

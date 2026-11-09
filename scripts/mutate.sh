@@ -14,8 +14,16 @@
 #   scripts/mutate.sh --file src/kdc/fast.rs
 #   scripts/mutate.sh --in-place --file src/kdc/pkinit/reply.rs --baseline=ignore
 #
-# The output directory is per-image, like `target/`, and `.cargo/mutants/` is the first place
-# to look when a mutant is reported killed but the test never ran.
+# The target directory is per-image **and separate from the one `cargo.sh` uses**. Cargo decides
+# what to rebuild by timestamp, and `cargo-mutants` builds mutated sources into
+# `CARGO_TARGET_DIR`: sharing it means a `cargo test` run beside a measurement picks up a test
+# binary compiled from a mutated file, and the failure looks like a regression in the code just
+# written. Observed exactly that — a test that had passed for months failed with `left: [1]`
+# until the source was touched. Two directories make the two unable to see each other's work.
+#
+# `mutants.out/` is the first place to look when a mutant is reported killed but no test ran;
+# it must not be deleted while a run is in flight, because the run appends its per-mutant logs
+# there and dies with `reopen … for append`.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +37,6 @@ ensure_image
 exec docker run --rm -u "$(id -u):$(id -g)" \
     -v "$ROOT:/w" -v "$CARGO_HOME_SRC:/cargo" -v "$CACHE/rustup:/rustup" \
     -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=always \
-    -e CARGO_TARGET_DIR=/w/target/$TAG -e TIMEOUT="${KDC_MUTANT_TIMEOUT:-120}" \
+    -e CARGO_TARGET_DIR=/w/target/$TAG-mutants -e TIMEOUT="${KDC_MUTANT_TIMEOUT:-120}" \
     -w /w "$IMAGE" \
     sh -c 'PATH=/usr/local/cargo/bin:$PATH; exec cargo mutants --timeout "$TIMEOUT" "$@"' sh "$@"

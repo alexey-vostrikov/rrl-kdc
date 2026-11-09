@@ -46,7 +46,13 @@ use crate::error::{Error, Result};
 pub const PAC_LOGON_INFO: u32 = 1;
 
 /// `PAC_CLIENT_INFO` — the client's name and the logon time, in plain text.
-pub const PAC_CLIENT_INFO: u32 = 2;
+///
+/// Type **10**, not 2: `2` is `PAC_CREDENTIALS_INFO`, the encrypted blob NTLM
+/// credentials travel in. Writing this buffer under type 2 would put a plain-text
+/// name where a reader expects ciphertext, and the reader would refuse the whole
+/// PAC — which is exactly how this was caught, by impacket reporting no client
+/// info at all.
+pub const PAC_CLIENT_INFO: u32 = 10;
 
 /// `PAC_SERVER_CHECKSUM` — the signature over the service key.
 pub const PAC_SERVER_CHECKSUM: u32 = 6;
@@ -63,6 +69,104 @@ pub const KERB_CHECKSUM_HMAC_MD5: i32 = -138;
 /// not a Kerberos one, which is what a PAC signature is. [MS-KILE] §3.4.5.1.1
 /// names it, and getting it wrong produces a signature that verifies nowhere.
 pub const KERB_NON_KERB_CKSUM_SALT: u32 = 17;
+
+/// Seconds from the `FILETIME` epoch (1601-01-01) to the Unix one (1970-01-01).
+///
+/// `FILETIME` counts 100-nanosecond intervals from 1601, so a Unix timestamp is
+/// multiplied by ten million and shifted by this many seconds — the constant every
+/// implementation of `FILETIME` carries and most of them get slightly wrong.
+const FILETIME_UNIX_EPOCH_SECONDS: i64 = 11_644_473_600;
+
+/// `FILETIME` ticks per second.
+const FILETIME_TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// `PAC_CLIENT_INFO`: the client's name and logon time, unencrypted ([MS-PAC]
+/// §2.7.2).
+///
+/// This is the buffer a service reads to learn who the ticket belongs to without
+/// having the client's key — it is plain text inside a PAC whose integrity
+/// the signature protects. Windows writes it in every ticket, and a reader that
+/// finds no `PAC_CLIENT_INFO` treats the ticket as coming from something that is
+/// not a Windows KDC.
+///
+/// Two details are where a hand-built one goes wrong:
+///
+/// * `NameLength` is the length **in octets**, not in characters. A name of six
+///   characters is twelve octets, and a reader that trusts a character count finds
+///   half a name and a stray octet.
+/// * `ClientId` is a `FILETIME` — 100-nanosecond intervals since 1601 — not a Unix
+///   timestamp and not a `time_t`. Writing the Unix value puts the logon in 1601.
+pub fn client_info(name: &str, logon_time: i64) -> Result<Buffer> {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let octets = units.len() * 2;
+    // `NameLength` is a `USHORT`, and the specification has no room for a longer
+    // name. Truncating instead would write a name that is not the client's, which
+    // is worse than refusing.
+    if octets > u16::MAX as usize {
+        return Err(Error::Protocol(format!(
+            "a client name of {octets} octets does not fit in PAC_CLIENT_INFO's USHORT length"
+        )));
+    }
+    let ticks = logon_time
+        .checked_mul(FILETIME_TICKS_PER_SECOND)
+        .and_then(|t| t.checked_add(FILETIME_UNIX_EPOCH_SECONDS * FILETIME_TICKS_PER_SECOND))
+        .ok_or_else(|| {
+            Error::Protocol(format!(
+                "logon time {logon_time} is not representable as FILETIME"
+            ))
+        })?;
+    let mut data = Vec::with_capacity(10 + octets);
+    data.extend_from_slice(&ticks.to_le_bytes());
+    data.extend_from_slice(&(octets as u16).to_le_bytes());
+    for unit in units {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(Buffer::new(PAC_CLIENT_INFO, data))
+}
+
+/// The name and logon time a `PAC_CLIENT_INFO` buffer states.
+///
+/// The read side exists for the same reason the writer does: a value this crate
+/// writes should be one this crate can read back, and the test that compares the
+/// two is what makes the octet-vs-character distinction a fact rather than a
+/// comment.
+pub fn parse_client_info(data: &[u8]) -> Result<(String, i64)> {
+    // `ClientId` (8) plus `NameLength` (2), before any name at all.
+    if data.len() < 10 {
+        return Err(Error::Protocol(
+            "a PAC_CLIENT_INFO shorter than its fixed part".into(),
+        ));
+    }
+    let ticks = i64::from_le_bytes(data[0..8].try_into().expect("eight octets"));
+    let octets = u16::from_le_bytes(data[8..10].try_into().expect("two octets")) as usize;
+    // The name must occupy exactly what the length says: a trailing NUL or a pad
+    // octet is not part of it, and accepting "at least this many" would let a
+    // buffer whose length is wrong read as correct.
+    if data.len() != 10 + octets {
+        return Err(Error::Protocol(format!(
+            "PAC_CLIENT_INFO says {octets} name octets but carries {}",
+            data.len() - 10
+        )));
+    }
+    if !octets.is_multiple_of(2) {
+        return Err(Error::Protocol(format!(
+            "a UTF-16 name of {octets} octets is not a whole number of units"
+        )));
+    }
+    let units: Vec<u16> = data[10..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let name = String::from_utf16(&units)
+        .map_err(|_| Error::Protocol("PAC_CLIENT_INFO: the name is not UTF-16".into()))?;
+    let seconds = ticks
+        .checked_div(FILETIME_TICKS_PER_SECOND)
+        .and_then(|s| s.checked_sub(FILETIME_UNIX_EPOCH_SECONDS))
+        .ok_or_else(|| Error::Protocol("PAC_CLIENT_INFO: a FILETIME before 1601".into()))?;
+    Ok((name, seconds))
+}
 
 /// One buffer of a PAC: its type and its payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +632,142 @@ mod tests {
                 u8::from_str_radix(s, 16).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_buffer_types_are_the_numbers_the_specification_gives() {
+        // Pinned because they are wire constants, and because getting one wrong is
+        // silent: a `PAC_CLIENT_INFO` written under type 2 becomes
+        // `PAC_CREDENTIALS_INFO`, so a reader looks for ciphertext where a name is
+        // and refuses the whole PAC. That is how this happened the first time —
+        // impacket reported no client info at all, and nothing in this crate
+        // noticed.
+        assert_eq!(PAC_LOGON_INFO, 1);
+        assert_eq!(PAC_CLIENT_INFO, 10, "2 is PAC_CREDENTIALS_INFO");
+        assert_eq!(PAC_SERVER_CHECKSUM, 6);
+        assert_eq!(PAC_PRIVSVR_CHECKSUM, 7);
+    }
+
+    #[test]
+    fn the_client_info_name_length_counts_octets_and_not_characters() {
+        // The mistake this test exists for: a six-character name is twelve octets
+        // of UTF-16, and a reader that believes a character count finds half a
+        // name followed by a stray octet.
+        let buffer = client_info("alice", 1_700_000_000).unwrap();
+        assert_eq!(buffer.kind, PAC_CLIENT_INFO);
+        assert_eq!(
+            u16::from_le_bytes(buffer.data[8..10].try_into().unwrap()),
+            10,
+            "five characters, ten octets"
+        );
+        assert_eq!(buffer.data.len(), 20, "8 + 2 + ten octets of name");
+    }
+
+    #[test]
+    fn a_name_with_an_accent_round_trips_through_utf16() {
+        // Non-ASCII is where a length computed from `str::len()` would be right by
+        // accident (octets, not characters) and one computed from `chars().count()`
+        // wrong; the round trip is what tells them apart.
+        for name in ["alice", "алексей", "Jörg", "日本語", "a😀b"] {
+            let buffer = client_info(name, 1_700_000_000).unwrap();
+            let (read, _) = parse_client_info(&buffer.data).unwrap();
+            assert_eq!(read, name, "{name} must come back as itself");
+        }
+    }
+
+    #[test]
+    fn the_client_id_is_a_filetime_and_not_a_unix_time() {
+        // One second after the Unix epoch is 11644473601 seconds of FILETIME, and
+        // writing the Unix value would say 1601 — the failure a reader sees as "the
+        // logon happened before the operating system existed".
+        let buffer = client_info("alice", 1).unwrap();
+        let ticks = i64::from_le_bytes(buffer.data[0..8].try_into().unwrap());
+        assert_eq!(
+            ticks,
+            (FILETIME_UNIX_EPOCH_SECONDS + 1) * FILETIME_TICKS_PER_SECOND
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                client_info("alice", 0).unwrap().data[0..8]
+                    .try_into()
+                    .unwrap()
+            ),
+            FILETIME_UNIX_EPOCH_SECONDS * FILETIME_TICKS_PER_SECOND,
+            "the Unix epoch is 11644473600 FILETIME seconds, not zero"
+        );
+    }
+
+    #[test]
+    fn a_logon_time_round_trips_to_the_second() {
+        for seconds in [0i64, 1_700_000_000, 2_000_000_000, 4_000_000_000] {
+            let buffer = client_info("alice", seconds).unwrap();
+            let (_, read) = parse_client_info(&buffer.data).unwrap();
+            assert_eq!(read, seconds, "{seconds} must survive the conversion");
+        }
+    }
+
+    #[test]
+    fn a_client_info_of_the_wrong_shape_is_refused() {
+        let good = client_info("alice", 1_700_000_000).unwrap().data;
+        // Shorter than the fixed part.
+        assert!(parse_client_info(&good[..9]).is_err());
+        // The length says more than the buffer carries.
+        assert!(parse_client_info(&good[..good.len() - 2]).is_err());
+        // A trailing octet the length does not account for — a NUL terminator
+        // somebody added out of habit.
+        let mut padded = good.clone();
+        padded.push(0);
+        assert!(
+            parse_client_info(&padded).is_err(),
+            "the name must be exactly what the length says, not at least"
+        );
+        // An odd length is not a whole number of UTF-16 units.
+        let mut odd = good.clone();
+        odd[8..10].copy_from_slice(&9u16.to_le_bytes());
+        odd.truncate(19);
+        assert!(parse_client_info(&odd).is_err());
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_length_field_is_refused_rather_than_truncated() {
+        // Truncating would write a name that is not the client's, and the ticket
+        // would claim an identity nobody holds.
+        let long = "a".repeat(40_000);
+        assert!(client_info(&long, 1_700_000_000).is_err());
+    }
+
+    #[test]
+    fn the_client_info_survives_the_envelope_and_the_signature() {
+        // What a service actually does: find the buffer by type, read it, and
+        // trust it because the signature verified. If the envelope's padding were
+        // counted in `cbBufferSize`, the buffer read back would carry eight zero
+        // octets of padding and the length check would refuse it.
+        let mut blob = pac(&[
+            Buffer::new(PAC_LOGON_INFO, vec![0xaa; 60]),
+            client_info("alice", 1_700_000_000).unwrap(),
+            Buffer::new(PAC_SERVER_CHECKSUM, vec![0u8; 16]),
+            Buffer::new(PAC_PRIVSVR_CHECKSUM, vec![0u8; 16]),
+        ]);
+        let server = Key::new(Enctype::Aes256Sha1, vec![7u8; 32]).unwrap();
+        let kdc = Key::new(Enctype::Aes256Sha1, vec![9u8; 32]).unwrap();
+        seal(
+            &mut blob,
+            &server,
+            &kdc,
+            SignatureType::HmacSha1_96Aes(Enctype::Aes256Sha1),
+        )
+        .unwrap();
+
+        let found = buffers_of(&blob)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == PAC_CLIENT_INFO)
+            .map(|(_, size, offset)| blob[offset..offset + size as usize].to_vec())
+            .next()
+            .expect("the client info is in the envelope");
+        let (name, seconds) = parse_client_info(&found).unwrap();
+        assert_eq!(name, "alice");
+        assert_eq!(seconds, 1_700_000_000);
     }
 
     #[test]

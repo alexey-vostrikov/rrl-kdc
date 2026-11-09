@@ -21,6 +21,26 @@ pub enum Error {
     /// An enctype this KDC does not implement (it issues 17, 18, 19 and 20).
     UnsupportedEnctype(i32),
 
+    #[error(
+        "no enctype in the request is allowed for {principal}: it may be issued {allowed:?}, \
+         and the request asked for {asked:?}"
+    )]
+    /// The intersection of what the client asked for, what this KDC issues, and what the entry
+    /// allows is empty.
+    ///
+    /// A separate variant from [`Error::UnsupportedEnctype`] because the two need different
+    /// answers: "this KDC does not implement that" is a client asking for DES, while "this
+    /// account may not be issued that" is an administrator's restriction, and an operator who
+    /// reads one when the other is true goes looking in the wrong place.
+    NoUsableEnctype {
+        /// The principal that restricts.
+        principal: crate::name::Principal,
+        /// What its entry declares, or an empty list when it has no keys at all.
+        allowed: Vec<crate::crypto::Enctype>,
+        /// What the request asked for.
+        asked: Vec<i32>,
+    },
+
     #[error("enctype {enctype:?} takes a {want}-octet key, got {got}")]
     /// A key of the wrong size for its enctype.
     KeyLength {
@@ -218,7 +238,7 @@ impl Error {
         use codes::*;
         match self {
             Error::Der(_) | Error::NotARequest(_) | Error::Protocol(_) => KRB_AP_ERR_MODIFIED,
-            Error::UnsupportedEnctype(_) => KDC_ERR_ETYPE_NOSUPP,
+            Error::UnsupportedEnctype(_) | Error::NoUsableEnctype { .. } => KDC_ERR_ETYPE_NOSUPP,
             Error::KeyLength { .. } | Error::Crypto(_) => KRB_AP_ERR_BAD_INTEGRITY,
             Error::UnknownPrincipal(_) => KDC_ERR_C_PRINCIPAL_UNKNOWN,
             Error::NotFound(_) => KDC_ERR_S_PRINCIPAL_UNKNOWN,
@@ -250,7 +270,10 @@ impl Error {
     pub fn kind(&self) -> &'static str {
         match self {
             Error::Der(_) => "der",
-            Error::UnsupportedEnctype(_) | Error::KeyLength { .. } | Error::Crypto(_) => "crypto",
+            Error::UnsupportedEnctype(_)
+            | Error::NoUsableEnctype { .. }
+            | Error::KeyLength { .. }
+            | Error::Crypto(_) => "crypto",
             Error::NotARequest(_) | Error::Protocol(_) => "protocol",
             Error::UnknownPrincipal(_) | Error::NotFound(_) => "not_found",
             Error::Exists(_) => "already_exists",

@@ -547,8 +547,14 @@ fn enctypes(attributes: &Attributes, principal: &str) -> Result<Option<Vec<Encty
         })
         .collect::<Result<Vec<Enctype>>>()?;
 
+    // A zero is "declared nothing", not "nothing allowed": [MS-KILE] 2.2.7 gives the attribute
+    // no bit for a prohibition, and an account that declares nothing is one the KDC applies its
+    // defaults to. Read literally, zero becomes an empty set, and every such account can be
+    // issued nothing at all — a login that fails with `KDC_ERR_ETYPE_NOSUPP` while the
+    // directory looks perfectly ordinary.
     let ad = attributes
         .number(attrs::AD_SUPPORTED_ENCRYPTION_TYPES, principal)?
+        .filter(|bits| *bits != 0)
         .map(ad_bits_to_enctypes);
 
     match (krb5.is_empty(), ad) {
@@ -998,12 +1004,39 @@ mod tests {
             None
         );
 
+        // `Some([])` — "issued nothing" — has no spelling in a directory: `msDS-Supported`
+        // `EncryptionTypes` has no bit for it, and writing 0 means "declared nothing", which
+        // [MS-KILE] 2.2.7 reads as no restriction. It therefore degrades to `None` on a round
+        // trip, and that is stated here rather than assumed: a realm that needs the
+        // prohibition keeps it in the record backend.
         entry.etypes = Some(Vec::new());
         assert_eq!(
             from_attributes(&to_attributes(&entry)).unwrap().etypes,
-            Some(Vec::new()),
-            "a principal that may be issued nothing is a decision, not an absence"
+            None,
+            "a directory cannot say `issued nothing`; it reads back as no restriction"
         );
+    }
+
+    #[test]
+    fn a_zero_in_the_ad_attribute_means_no_restriction_not_none_allowed() {
+        // [MS-KILE] 2.2.7 and RRL-2.26: an account whose `msDS-SupportedEncryptionTypes` is 0
+        // (or absent) has declared nothing, and the KDC applies its defaults. Reading the zero
+        // as "no enctypes allowed" makes every such account unusable — the ticket request is
+        // refused with `KDC_ERR_ETYPE_NOSUPP` and the operator sees an account that cannot log
+        // in, with nothing in the directory that looks wrong.
+        let mut attributes = to_attributes(&entry());
+        attributes.set(attrs::AD_SUPPORTED_ENCRYPTION_TYPES, "0");
+        let back = from_attributes(&attributes).unwrap();
+        assert_eq!(
+            back.etypes, None,
+            "zero is a declaration of nothing, not a prohibition"
+        );
+
+        // The pair: a non-zero value is a restriction and is still read as one.
+        let mut attributes = to_attributes(&entry());
+        attributes.set(attrs::AD_SUPPORTED_ENCRYPTION_TYPES, "16"); // 0x10, AES256-SHA1
+        let back = from_attributes(&attributes).unwrap();
+        assert_eq!(back.etypes, Some(vec![Enctype::Aes256Sha1]));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
 use rust_kdc::der;
 use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
+use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb, flags as entry_flags};
 use rust_kdc::kdc::{Kdc, KdcConfig};
 use rust_kdc::msg::{
     self, ApReq, Authenticator, EncKdcRepPart, EncTicketPart, EncryptedData, Ticket,
@@ -455,4 +455,35 @@ fn tgs_req_with_options(ticket: &[u8], session_key: &Key, till: i64, options: u3
             der::field(4, body),
         ])],
     )
+}
+
+#[test]
+fn an_account_that_allows_no_requested_enctype_is_refused_by_name() {
+    // RRL-2.26 point 3: the refusal has to say whose restriction it is. "enctype 23 is not one
+    // this KDC implements" sends an operator to look at the KDC's configuration; the truth here
+    // is that the *service* declares a narrower set, and the answer should say so.
+    let (db, krbtgt_key) = realm(NOW + 7200);
+    let mut svc = db.fetch(&service()).unwrap().unwrap();
+    svc.etypes = Some(vec![Enctype::Aes128Sha1]);
+    db.insert(svc).unwrap();
+    let kdc = Kdc::new(
+        KdcConfig::new(REALM).unwrap().with_require_preauth(false),
+        Arc::new(db),
+        Arc::new(OwnCipher),
+    );
+
+    let (ticket, session) = tgt(&krbtgt_key, NOW + 7200);
+    // The test's `tgs_req` asks for AES256 only, which this service may not be issued.
+    let reply = kdc.handle(&tgs_req(&ticket, &session, NOW + 3600), NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_ETYPE_NOSUPP);
+    let text = err.e_text.unwrap_or_default();
+    assert!(
+        text.contains("cifs/files.example.com") && text.contains("may be issued"),
+        "the refusal must name the account and its declaration: {text}"
+    );
+    assert!(
+        text.contains("Aes128Sha1"),
+        "and say what it allows: {text}"
+    );
 }

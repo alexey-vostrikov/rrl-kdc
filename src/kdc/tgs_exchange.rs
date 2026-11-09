@@ -420,10 +420,24 @@ impl Kdc {
 
         // 6: the ticket.
         let usable = super::usable_enctypes(config, &body.etypes, &server, Purpose::Ticket);
-        let session_enctype = usable
-            .first()
-            .copied()
-            .ok_or_else(|| Error::UnsupportedEnctype(body.etypes.first().copied().unwrap_or(0)))?;
+        let session_enctype = usable.first().copied().ok_or_else(|| {
+            // The three-way intersection is empty, and which side caused it is the first thing
+            // an operator needs: the enctype the client asked for, the enctypes this KDC
+            // implements, and the ones `server`'s own entry allows.
+            let allowed: Vec<_> = match &server.etypes {
+                Some(declared) => declared.clone(),
+                None => server.enctypes(),
+            };
+            if allowed.is_empty() || !allowed.iter().any(|e| body.etypes.contains(&e.id())) {
+                Error::NoUsableEnctype {
+                    principal: server.principal.clone(),
+                    allowed,
+                    asked: body.etypes.clone(),
+                }
+            } else {
+                Error::UnsupportedEnctype(body.etypes.first().copied().unwrap_or(0))
+            }
+        })?;
 
         let validate = body.kdc_options & kdc_options::VALIDATE != 0;
         let renew = body.kdc_options & kdc_options::RENEW != 0;

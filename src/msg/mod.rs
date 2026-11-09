@@ -107,6 +107,9 @@ pub mod kdc_options {
     /// `enc-tkt-in-skey` (RFC 4120 §5.4.1, bit 28): encrypt the ticket in the
     /// session key of the ticket in `additional-tickets` — user-to-user.
     pub const ENC_TKT_IN_SKEY: u32 = 0x0000_0008;
+    /// `cname-in-addl-tkt` (RFC 6806 §11, bit 14): the client comes from the ticket in
+    /// `additional-tickets`, which is what S4U2Proxy asks for.
+    pub const CNAME_IN_ADDL_TKT: u32 = 0x0002_0000;
     /// `renew` (bit 30): extend a renewable TGT's lifetime.
     pub const RENEW: u32 = 0x0000_0002;
     /// `validate` (bit 31): clear a postdated ticket's `INVALID` flag.

@@ -280,7 +280,7 @@ pub fn reply_usage_for(x509: &X509User) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{Enctype, OwnCipher};
+    use crate::crypto::{Cipher, Enctype, OwnCipher};
 
     fn user() -> Principal {
         Principal::parse("alice@EXAMPLE.COM").unwrap()
@@ -461,6 +461,144 @@ mod tests {
             ),
             der::field(3, der::general_string(auth)),
         ])
+    }
+
+    #[test]
+    fn the_option_bit_is_read_from_the_encoded_id_not_assumed() {
+        // `options [4]` decides the usage of the reply checksum, and the two usages are not
+        // interchangeable: MIT's client picks one from the bit and rejects a checksum under the
+        // other. A decode that read the bit as "always set" would answer usage 27 to a client
+        // asking for 26, and the client would report a modified reply.
+        let without = der::seq(&[
+            der::field(0, der::int(1)),
+            der::field(1, user().encode_name()),
+            der::field(2, der::general_string("EXAMPLE.COM")),
+        ]);
+        let encoded = der::seq(&[
+            der::field(0, without),
+            der::field(
+                1,
+                der::seq(&[
+                    der::field(0, der::int(Enctype::Aes256Sha1.checksum_type() as i64)),
+                    der::field(1, der::octets(&[0u8; 32])),
+                ]),
+            ),
+        ]);
+        let decoded = X509User::decode(&encoded).unwrap();
+        assert!(!decoded.use_reply_usage, "no bit, no usage 27");
+        assert_eq!(reply_usage_for(&decoded), KU_S4U_X509_USER_REQUEST);
+
+        // And with the bit set the same decode flips it, so the bit is what is read.
+        let with = der::seq(&[
+            der::field(0, der::int(1)),
+            der::field(1, user().encode_name()),
+            der::field(2, der::general_string("EXAMPLE.COM")),
+            der::field(4, der::flags32(S4U_OPTS_USE_REPLY_KEY_USAGE)),
+        ]);
+        let encoded = der::seq(&[
+            der::field(0, with),
+            der::field(
+                1,
+                der::seq(&[
+                    der::field(0, der::int(Enctype::Aes256Sha1.checksum_type() as i64)),
+                    der::field(1, der::octets(&[0u8; 32])),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            reply_usage_for(&X509User::decode(&encoded).unwrap()),
+            KU_S4U_X509_USER_REPLY
+        );
+    }
+
+    #[test]
+    fn a_decoded_x509_user_names_its_user() {
+        // Heimdal accepts a request carrying only this half; a decoder that answered "nobody"
+        // would make such a client unable to use S4U at all.
+        let id = der::seq(&[
+            der::field(0, der::int(3)),
+            der::field(1, user().encode_name()),
+            der::field(2, der::general_string("EXAMPLE.COM")),
+        ]);
+        let encoded = der::seq(&[
+            der::field(0, id),
+            der::field(
+                1,
+                der::seq(&[
+                    der::field(0, der::int(Enctype::Aes256Sha1.checksum_type() as i64)),
+                    der::field(1, der::octets(&[0u8; 32])),
+                ]),
+            ),
+        ]);
+        let decoded = X509User::decode(&encoded).unwrap();
+        let named = decoded.user().expect("the id names a user");
+        assert_eq!(named.components, vec!["alice"]);
+        assert_eq!(named.realm, "EXAMPLE.COM");
+    }
+
+    #[test]
+    fn a_checksum_that_differs_in_two_equal_places_is_not_equal() {
+        // The comparison folds with `|`, not `^`. With `^` two identical differences cancel and
+        // a tampered checksum reads as intact — the exact failure a constant-time compare exists
+        // to prevent, hidden inside the constant-time code itself.
+        let a = [0x00, 0x11, 0x22, 0x33];
+        let mut b = a;
+        b[1] ^= 0x01;
+        b[3] ^= 0x01;
+        assert!(
+            !super::constant_time_eq(&a, &b),
+            "two cancellations are still a difference"
+        );
+
+        let mut c = a;
+        c[2] ^= 0x80;
+        assert!(!super::constant_time_eq(&a, &c));
+        assert!(super::constant_time_eq(&a, &a));
+        assert!(
+            !super::constant_time_eq(&a, &a[..2]),
+            "a length difference is a difference"
+        );
+    }
+
+    #[test]
+    fn a_checksum_that_does_not_match_the_id_is_refused() {
+        // Verifying the X509 half means actually verifying it: a forged id with a checksum of
+        // the attacker's own making must not be accepted just because its shape is right.
+        let id = der::seq(&[
+            der::field(0, der::int(3)),
+            der::field(1, user().encode_name()),
+            der::field(2, der::general_string("EXAMPLE.COM")),
+        ]);
+        let subkey = Key::new(Enctype::Aes256Sha1, vec![0x55; 32]).unwrap();
+        let cipher = OwnCipher;
+        let x509 = X509User {
+            id_der: id.clone(),
+            nonce: 3,
+            cname: Some(user()),
+            crealm: "EXAMPLE.COM".into(),
+            use_reply_usage: true,
+            checksum: cipher.checksum(&subkey, 26, &id).unwrap(),
+        };
+        x509.verify(&cipher, &subkey)
+            .expect("the honest checksum verifies");
+
+        // The same checksum over a different id: the bytes the client signed are what count.
+        let other_id = der::seq(&[
+            der::field(0, der::int(3)),
+            der::field(
+                1,
+                Principal::parse("mallory@EXAMPLE.COM")
+                    .unwrap()
+                    .encode_name(),
+            ),
+            der::field(2, der::general_string("EXAMPLE.COM")),
+        ]);
+        let forged = X509User {
+            id_der: other_id,
+            ..x509
+        };
+        let err = forged.verify(&cipher, &subkey).unwrap_err().to_string();
+        assert!(err.contains("does not verify"), "{err}");
     }
 
     #[test]

@@ -202,15 +202,33 @@ fn tgs_req_with_subkey(
     subkey: Option<&Key>,
     extra: &[(i32, Vec<u8>)],
 ) -> Vec<u8> {
+    tgs_req_proxy(ticket, session_key, target, options, subkey, extra, None)
+}
+
+/// The same, with an evidence ticket in `additional-tickets [10]`.
+fn tgs_req_proxy(
+    ticket: &[u8],
+    session_key: &Key,
+    target: &Principal,
+    options: u32,
+    subkey: Option<&Key>,
+    extra: &[(i32, Vec<u8>)],
+    additional: Option<&[u8]>,
+) -> Vec<u8> {
     let cipher = OwnCipher;
-    let body = der::seq(&[
+    let mut parts = vec![
         der::field(0, der::flags32(options)),
         der::field(2, der::general_string(REALM)),
         der::field(3, target.encode_name()),
         der::field(5, der::time(NOW + 3600)),
         der::field(7, der::int(0x4242)),
         der::field(8, der::seq(&[der::int(18)])),
-    ]);
+    ];
+    if let Some(evidence) = additional {
+        // `additional-tickets [11]`: [10] is `enc-authorization-data`.
+        parts.push(der::field(11, der::seq(&[evidence.to_vec()])));
+    }
+    let body = der::seq(&parts);
 
     let cksum = cipher
         .checksum(session_key, usage::TGS_REQ_AUTH_CKSUM, &body)
@@ -570,4 +588,477 @@ fn two_halves_naming_different_users_are_refused() {
     assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
     let text = err.e_text.unwrap_or_default();
     assert!(text.contains("one request, one user"), "{text}");
+}
+
+// ---- S4U2Proxy (constrained delegation, MS-SFU §3.1.5) --------------------------------
+
+/// An evidence ticket for `user`, sealed in `key` — the delegating service's key, which is what
+/// proves the service received it.
+fn evidence_ticket(user: &Principal, key: &Key, flags: u32, authtime: i64) -> Vec<u8> {
+    let cipher = OwnCipher;
+    let part = EncTicketPart {
+        flags: tkt_flags::FORWARDABLE | flags,
+        session_key: cipher.random(Enctype::Aes256Sha1).unwrap(),
+        crealm: user.realm.clone(),
+        cname: user.clone(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime,
+        starttime: None,
+        endtime: NOW + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    Ticket {
+        realm: REALM.into(),
+        sname: service(),
+        enc: EncryptedData::seal(&cipher, key, usage::KDC_REP_TICKET, Some(1), &part.encode())
+            .unwrap(),
+    }
+    .encode()
+}
+
+/// A realm where the delegating service may delegate to `target`.
+fn realm_with_delegation(acl: Option<Vec<Principal>>) -> (Kdc, Key, Key, Key) {
+    let cipher = OwnCipher;
+    let db = MemoryHdb::new();
+
+    let mut krbtgt = HdbEntry::krbtgt(REALM);
+    let krbtgt_key = cipher.random(Enctype::Aes256Sha1).unwrap();
+    krbtgt.add_key(krbtgt_key.clone(), 1, None);
+    db.insert(krbtgt).unwrap();
+
+    let mut user = HdbEntry::user(alice());
+    user.add_password_key(&cipher, Enctype::Aes256Sha1, b"password", 1)
+        .unwrap();
+    db.insert(user).unwrap();
+
+    let mut svc = HdbEntry::service(service());
+    let svc_key = cipher.random(Enctype::Aes256Sha1).unwrap();
+    svc.add_key(svc_key.clone(), 1, None);
+    svc.flags |= entry_flags::TRUSTED_FOR_DELEGATION;
+    svc.constrained_delegation = acl;
+    db.insert(svc).unwrap();
+
+    let mut files = HdbEntry::service(Principal::parse(&format!("cifs/files@{REALM}")).unwrap());
+    let files_key = cipher.random(Enctype::Aes256Sha1).unwrap();
+    files.add_key(files_key.clone(), 1, None);
+    db.insert(files).unwrap();
+
+    (
+        Kdc::new(
+            KdcConfig::new(REALM).unwrap().with_require_preauth(false),
+            Arc::new(db),
+            Arc::new(OwnCipher),
+        ),
+        krbtgt_key,
+        svc_key,
+        files_key,
+    )
+}
+
+fn files() -> Principal {
+    Principal::parse(&format!("cifs/files@{REALM}")).unwrap()
+}
+
+#[test]
+fn a_listed_service_receives_a_ticket_in_the_users_name() {
+    // The whole of S4U2Proxy: the service proves it holds the user's ticket, is allowed to
+    // delegate there, and receives a ticket the other service can actually open.
+    let (kdc, krbtgt_key, svc_key, files_key) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let evidence = evidence_ticket(&alice(), &svc_key, 0, NOW - 300);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    assert!(
+        msg::KrbError::decode(&reply).is_err(),
+        "a listed delegation must be answered: {:?}",
+        msg::KrbError::decode(&reply)
+    );
+
+    // The ticket is sealed in `cifs/files`'s key and names the user — the two things the
+    // receiving service checks before it believes anything the delegating service says.
+    let part = ticket_part(&reply, &files_key);
+    assert_eq!(part.cname.components, vec!["alice"]);
+    assert_eq!(part.cname.realm, REALM);
+}
+
+#[test]
+fn the_proxy_ticket_names_the_user_and_keeps_the_evidence_authtime() {
+    // Both halves of §3.1.5.2 that are easy to lose: the client must be the user (not the
+    // service), and `authtime` must be when the *user* authenticated, not now.
+    let (kdc, krbtgt_key, svc_key, _files_key) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let authtime = NOW - 3000;
+    let evidence = evidence_ticket(&alice(), &svc_key, 0, authtime);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    assert!(msg::KrbError::decode(&reply).is_err());
+
+    // The reply's cleartext client is the user.
+    let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
+    let mut r = der::Reader::new(f.get(4, "TGS-REP").expect("cname"));
+    let seq = r.next("cname").unwrap();
+    let named = Principal::decode("cname", seq.content, REALM).unwrap();
+    assert_eq!(named.components, vec!["alice"], "the ticket is the user's");
+
+    // And the reply part, sealed in the TGT's session key, carries the evidence's authtime.
+    let enc = EncryptedData::decode("enc-part", f.get(6, "TGS-REP").expect("enc-part")).unwrap();
+    let plain = OwnCipher
+        .decrypt(&session, usage::TGS_REP_ENCPART_SESSKEY, &enc.cipher)
+        .expect("the reply opens with the TGT's session key");
+    let rep = EncKdcRepPart::decode(&plain).expect("an EncTGSRepPart");
+    assert_eq!(
+        rep.authtime, authtime,
+        "the user authenticated then; this ticket exists because the service remembered it"
+    );
+}
+
+#[test]
+fn a_service_not_in_the_acl_may_not_delegate() {
+    // The absence of a list is not a permission: a service with no ACL delegates only to
+    // itself, and the refusal says so.
+    let (kdc, krbtgt_key, svc_key, _files_key) = realm_with_delegation(None);
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let evidence = evidence_ticket(&alice(), &svc_key, 0, NOW - 300);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
+    let text = err.e_text.unwrap_or_default();
+    assert!(
+        text.contains("may not delegate") && text.contains("nothing"),
+        "the refusal must say there is no list: {text}"
+    );
+}
+
+#[test]
+fn an_empty_acl_is_a_decision_not_a_permission() {
+    // `Some([])` is an administrator saying "to nobody". Treating it as "no restriction" would
+    // turn a deliberate denial into a grant.
+    let (kdc, krbtgt_key, svc_key, _files_key) = realm_with_delegation(Some(Vec::new()));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let evidence = evidence_ticket(&alice(), &svc_key, 0, NOW - 300);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
+    assert!(
+        err.e_text.unwrap_or_default().contains("nobody"),
+        "an empty list reads as `nobody`, and the refusal says it"
+    );
+}
+
+#[test]
+fn an_evidence_ticket_that_is_not_forwardable_cannot_be_delegated() {
+    // The flag is what a user says about their ticket: without it, the service may use it and
+    // may not hand it on.
+    let (kdc, krbtgt_key, svc_key, _files_key) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let cipher = OwnCipher;
+    let part = EncTicketPart {
+        flags: tkt_flags::INITIAL,
+        session_key: cipher.random(Enctype::Aes256Sha1).unwrap(),
+        crealm: REALM.into(),
+        cname: alice(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: NOW - 300,
+        starttime: None,
+        endtime: NOW + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let evidence = Ticket {
+        realm: REALM.into(),
+        sname: service(),
+        enc: EncryptedData::seal(
+            &cipher,
+            &svc_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
+    }
+    .encode();
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
+    assert!(
+        err.e_text.unwrap_or_default().contains("not forwardable"),
+        "the refusal names the missing flag"
+    );
+}
+
+#[test]
+fn an_evidence_ticket_from_another_key_proves_nothing() {
+    // The service has to have received the ticket. A ticket sealed in somebody else's key is
+    // one the service never held, and honouring it would let any service delegate any user.
+    let (kdc, krbtgt_key, _, _) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let other = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let evidence = evidence_ticket(&alice(), &other, 0, NOW - 300);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KRB_AP_ERR_BAD_INTEGRITY);
+}
+
+#[test]
+fn cname_in_addl_tkt_without_a_ticket_is_refused_by_name() {
+    let (kdc, krbtgt_key, _, _) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        None,
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
+    assert!(
+        err.e_text.unwrap_or_default().contains("evidence ticket"),
+        "the refusal names what is missing"
+    );
+}
+
+#[test]
+fn both_s4u_requests_at_once_are_refused() {
+    // Heimdal applies the transition and then the proxy, which verifies the evidence against
+    // the impersonated user's key — an order nobody's client relies on. Refusing is honest.
+    let (kdc, krbtgt_key, svc_key, _files_key) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let evidence = evidence_ticket(&alice(), &svc_key, 0, NOW - 300);
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &service(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[(s4u::PA_FOR_USER, for_user(&alice(), &session))],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
+    assert!(
+        err.e_text.unwrap_or_default().contains("two exchanges"),
+        "the refusal explains why"
+    );
+}
+#[test]
+fn an_expired_evidence_ticket_cannot_be_delegated() {
+    // An evidence ticket is a credential the user issued once. Past its lifetime there is
+    // nothing to delegate, and a KDC that honoured it would extend the user's authority for
+    // as long as the service kept the octets.
+    let (kdc, krbtgt_key, svc_key, _) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let cipher = OwnCipher;
+    let part = EncTicketPart {
+        flags: tkt_flags::FORWARDABLE,
+        session_key: cipher.random(Enctype::Aes256Sha1).unwrap(),
+        crealm: REALM.into(),
+        cname: alice(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: NOW - 7200,
+        starttime: None,
+        // Expired an hour ago: `now` is what the KDC is told, and the evidence is older.
+        endtime: NOW - 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let evidence = Ticket {
+        realm: REALM.into(),
+        sname: service(),
+        enc: EncryptedData::seal(
+            &cipher,
+            &svc_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
+    }
+    .encode();
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KRB_AP_ERR_TKT_EXPIRED);
+    assert!(err.e_text.unwrap_or_default().contains("expired"));
+}
+
+#[test]
+fn evidence_from_another_realm_cannot_be_delegated() {
+    // Constrained delegation is a statement this realm makes about its own services. An
+    // evidence ticket from elsewhere would ask it to extend a foreign realm's authority.
+    let (kdc, krbtgt_key, svc_key, _) = realm_with_delegation(Some(vec![files()]));
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let cipher = OwnCipher;
+    let part = EncTicketPart {
+        flags: tkt_flags::FORWARDABLE,
+        session_key: cipher.random(Enctype::Aes256Sha1).unwrap(),
+        crealm: "OTHER.EXAMPLE".into(),
+        cname: Principal::parse("alice@OTHER.EXAMPLE").unwrap(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: NOW - 300,
+        starttime: None,
+        endtime: NOW + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let evidence = Ticket {
+        realm: "OTHER.EXAMPLE".into(),
+        sname: service(),
+        enc: EncryptedData::seal(
+            &cipher,
+            &svc_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
+    }
+    .encode();
+    let request = tgs_req_proxy(
+        &tgt,
+        &session,
+        &files(),
+        kdc_options::CNAME_IN_ADDL_TKT,
+        None,
+        &[],
+        Some(&evidence),
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
+    assert!(
+        err.e_text
+            .unwrap_or_default()
+            .contains("does not cross realms"),
+        "the refusal says which rule it broke"
+    );
+}
+
+#[test]
+fn a_request_with_only_the_x509_half_is_answered_for_that_user() {
+    // Heimdal accepts either half; MIT's client sends both. A KDC that required PA-FOR-USER
+    // would refuse a client that sent only the modern one, and the client would read that as
+    // a KDC without S4U rather than as a policy.
+    let (kdc, krbtgt_key, svc_key) = kdc(Knobs::default());
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let subkey = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let request = tgs_req_with_subkey(
+        &tgt,
+        &session,
+        &service(),
+        0,
+        Some(&subkey),
+        &[(
+            s4u::PA_S4U_X509_USER,
+            x509_user(&alice(), 0x99, &subkey, true),
+        )],
+    );
+    let reply = kdc.handle(&request, NOW);
+    assert!(
+        msg::KrbError::decode(&reply).is_err(),
+        "the X509 half alone is a complete claim: {:?}",
+        msg::KrbError::decode(&reply)
+    );
+    assert_eq!(
+        ticket_part(&reply, &svc_key).cname.components,
+        vec!["alice"]
+    );
+}
+
+#[test]
+fn an_x509_half_with_a_foreign_checksum_is_refused() {
+    // The modern half is not decoration: a client that sends it is signing the id it wants a
+    // ticket for, and a checksum over other bytes proves nothing.
+    let (kdc, krbtgt_key, _) = kdc(Knobs::default());
+    let (tgt, session) = service_tgt(&krbtgt_key);
+    let subkey = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let other = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let request = tgs_req_with_subkey(
+        &tgt,
+        &session,
+        &service(),
+        0,
+        Some(&subkey),
+        // Checksummed with a key the request does not carry.
+        &[(
+            s4u::PA_S4U_X509_USER,
+            x509_user(&alice(), 0x99, &other, true),
+        )],
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, codes::KRB_AP_ERR_BAD_INTEGRITY);
 }

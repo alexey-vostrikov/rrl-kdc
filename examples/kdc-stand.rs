@@ -120,6 +120,7 @@ fn main() {
         max_renew: None,
         etypes: None,
         modified: 0,
+        constrained_delegation: None,
     };
     for enctype in Enctype::ALL {
         machine_entry

@@ -134,6 +134,27 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
         ));
     }
     parts.push(der::field(10, der::int(entry.kvno as i64)));
+    if let Some(acl) = &entry.constrained_delegation {
+        // `extensions [13] HDB-extensions`: a SEQUENCE OF `HDB-extension`, and this crate
+        // writes the one extension it understands. `mandatory` is false on purpose: a KDC that
+        // does not know this extension denies delegation, and denying is the safe direction —
+        // marking it mandatory would make every older KDC reject the whole entry instead.
+        parts.push(der::field(
+            13,
+            der::seq(&[der::seq(&[
+                der::field(0, der::int(0)),
+                // `data [1]` holds a CHOICE, whose `allowed-to-delegate-to [2]` alternative is
+                // `SEQUENCE OF Principal`.
+                der::field(
+                    1,
+                    der::seq(&[der::field(
+                        2,
+                        der::seq(&acl.iter().map(|p| p.encode_name()).collect::<Vec<_>>()),
+                    )]),
+                ),
+            ])]),
+        ));
+    }
     der::seq(&parts)
 }
 
@@ -225,9 +246,14 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         Ok(Some(out))
     };
 
+    // Read before the struct is built: `principal` takes ownership of the realm, and the ACL's
+    // principals are named in it.
+    let delegation_acl = constrained_delegation(&f, ctx, &principal.realm)?;
+
     Ok(HdbEntry {
         principal,
         keys,
+        constrained_delegation: delegation_acl,
         flags: f.flags32(2, ctx)?,
         valid_start: time_field(3)?,
         valid_end: time_field(4)?,
@@ -245,6 +271,47 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         etypes: etypes_field()?,
         modified: time_field(8)?.unwrap_or(0),
     })
+}
+
+/// `allowed-to-delegate-to` out of `extensions [13]`, when the record carries one.
+///
+/// The extension is optional and the list may legitimately be empty, so three outcomes are
+/// kept apart: absent (no restriction was ever set), present and empty (an administrator said
+/// "nobody"), present with names.
+fn constrained_delegation(
+    f: &Fields<'_>,
+    ctx: &'static str,
+    realm: &str,
+) -> Result<Option<Vec<Principal>>> {
+    if f.opt(13).is_none() {
+        return Ok(None);
+    }
+    let mut r = Reader::new(f.get(13, ctx)?);
+    let mut list = Reader::new(r.expect(ctx, der::SEQUENCE)?);
+    while !list.is_empty() {
+        let ef = Fields::parse(ctx, list.expect(ctx, der::SEQUENCE)?)?;
+        // The other extensions (PKINIT's, password, aliases) are not decoded here and are
+        // skipped rather than refused: an entry written by a foreign tool would otherwise be
+        // unreadable for a field this KDC has no use for.
+        let Some(_) = ef.opt(1) else { continue };
+        let mut dr = Reader::new(ef.get(1, ctx)?);
+        let choice = Fields::parse(ctx, dr.expect(ctx, der::SEQUENCE)?)?;
+        let Some(_) = choice.opt(2) else { continue };
+        let mut ar = Reader::new(choice.get(2, ctx)?);
+        let mut acl = Reader::new(ar.expect(ctx, der::SEQUENCE)?);
+        let mut out = Vec::new();
+        while !acl.is_empty() {
+            // `Principal` in `krb5.asn1` carries no realm: a delegation target is named in this
+            // entry's own realm, which is also what Heimdal's ACLs mean.
+            out.push(Principal::decode(
+                ctx,
+                acl.expect(ctx, der::SEQUENCE)?,
+                realm,
+            )?);
+        }
+        return Ok(Some(out));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -287,6 +354,45 @@ mod tests {
         assert_eq!(back.keys[0].kvno, 3);
         assert_eq!(back.keys[0].key, e.keys[0].key);
         assert_eq!(back.keys[0].salt.as_deref(), Some(&b"EXAMPLE.COMalice"[..]));
+    }
+
+    #[test]
+    fn a_delegation_acl_round_trips_and_absent_stays_absent() {
+        // Three states, and the difference between them is the authorization decision: no list
+        // (never set), an empty list ("to nobody"), and names. Collapsing any two of them would
+        // either grant delegation nobody configured or deny one that was.
+        let mut e = entry();
+        e.constrained_delegation = Some(vec![
+            Principal::parse("cifs/files.example.com@EXAMPLE.COM").unwrap(),
+            Principal::parse("http/web.example.com@EXAMPLE.COM").unwrap(),
+        ]);
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(
+            back.constrained_delegation.as_ref().map(|v| v.len()),
+            Some(2),
+            "both names survive"
+        );
+        let acl = back.constrained_delegation.unwrap();
+        assert_eq!(acl[0].components, vec!["cifs", "files.example.com"]);
+        assert_eq!(acl[1].components, vec!["http", "web.example.com"]);
+        assert_eq!(
+            acl[0].realm, "EXAMPLE.COM",
+            "named in the entry's own realm"
+        );
+
+        // An empty list is a decision, not an absence.
+        e.constrained_delegation = Some(Vec::new());
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(
+            back.constrained_delegation,
+            Some(Vec::new()),
+            "`to nobody` must not become `no restriction`"
+        );
+
+        // And an entry that never had one keeps the absence.
+        e.constrained_delegation = None;
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(back.constrained_delegation, None);
     }
 
     #[test]

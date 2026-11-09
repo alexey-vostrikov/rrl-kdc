@@ -38,5 +38,8 @@ exec docker run --rm -u "$(id -u):$(id -g)" \
     -v "$ROOT:/w" -v "$CARGO_HOME_SRC:/cargo" -v "$CACHE/rustup:/rustup" \
     -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=always \
     -e CARGO_TARGET_DIR=/w/target/$TAG-mutants -e TIMEOUT="${KDC_MUTANT_TIMEOUT:-120}" \
+    -e JOBS="${KDC_MUTANT_JOBS:-}" \
     -w /w "$IMAGE" \
-    sh -c 'PATH=/usr/local/cargo/bin:$PATH; exec cargo mutants --timeout "$TIMEOUT" "$@"' sh "$@"
+    sh -c 'PATH=/usr/local/cargo/bin:$PATH
+if [ -n "$JOBS" ]; then exec cargo mutants --timeout "$TIMEOUT" --jobs "$JOBS" "$@"; fi
+exec cargo mutants --timeout "$TIMEOUT" "$@"' sh "$@"

@@ -139,6 +139,15 @@ pub struct HdbEntry {
     pub etypes: Option<Vec<Enctype>>,
     /// `modified`.
     pub modified: i64,
+    /// `HDB-Ext-Constrained-delegation-acl`: the services this principal may delegate to.
+    ///
+    /// Heimdal keeps this in the entry's extensions (`allowed-to-delegate-to [2]`) rather than
+    /// in a flag, because a boolean can only say "may delegate" while S4U2Proxy has to answer
+    /// "may delegate *to whom*". `None` means no list at all, which is not the same as an empty
+    /// one: an empty list is an administrator saying "to nobody", and a service may still
+    /// delegate to itself in either case (MS-SFU §3.1.4 — a service holding a ticket in its own
+    /// name needs no permission to keep it).
+    pub constrained_delegation: Option<Vec<Principal>>,
 }
 
 impl HdbEntry {
@@ -163,6 +172,7 @@ impl HdbEntry {
             max_renew: None,
             etypes: None,
             modified: 0,
+            constrained_delegation: None,
         }
     }
 
@@ -180,6 +190,7 @@ impl HdbEntry {
             max_renew: None,
             etypes: None,
             modified: 0,
+            constrained_delegation: None,
         }
     }
 
@@ -198,6 +209,7 @@ impl HdbEntry {
             max_renew: None,
             etypes: None,
             modified: 0,
+            constrained_delegation: None,
         }
     }
 

@@ -40,6 +40,15 @@ use super::{Kdc, wrong_realm};
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
+/// What a constrained delegation decided.
+///
+/// The client comes from the evidence ticket, and so does `authtime`: the user authenticated
+/// then, and this ticket exists because the service was trusted to remember it.
+struct Proxy {
+    user: Principal,
+    authtime: i64,
+}
+
 /// What a protocol transition decided.
 ///
 /// One struct rather than three return values: the identity, whether the ticket may be
@@ -396,6 +405,18 @@ impl Kdc {
         // forwardable only when the service is trusted for delegation *and* the user is, and
         // the impersonated user's identity is what the ticket, the PAC and the reply all name.
         let transition = self.protocol_transition(padata, &proven, &sname, &server, now)?;
+        let proxy = self.constrained_delegation(body, &proven, &sname, &server, now)?;
+
+        if transition.is_some() && proxy.is_some() {
+            // Heimdal applies the transition first and then the proxy, which leaves the
+            // evidence ticket verified against the *impersonated* user's key — a request
+            // nobody writes, and one whose two halves would have to be read in a particular
+            // order to mean anything. Refusing says so instead of picking an order.
+            return Err(badoption(
+                "a request carries both S4U2Self and S4U2Proxy; they are two exchanges, and \
+                 a KDC that applied both would have to choose which one owns the client",
+            ));
+        }
 
         // 6: the ticket.
         let usable = super::usable_enctypes(config, &body.etypes, &server, Purpose::Ticket);
@@ -445,18 +466,23 @@ impl Kdc {
         };
         let TicketPlan {
             flags,
-            authtime,
+            authtime: plan_authtime,
             starttime,
             endtime,
             renew_till,
         } = plan;
+        // MS-SFU §3.1.5.2: a proxy ticket inherits the evidence ticket's `authtime`, because
+        // that is when the user actually authenticated — the whole point of delegation is that
+        // the user did not authenticate now.
+        let authtime = proxy.as_ref().map_or(plan_authtime, |p| p.authtime);
         let mut flags = flags | forwarding;
 
         // The identity the ticket and the PAC name: the service's own, unless this was a
         // protocol transition.
-        let (client, crealm) = match &transition {
-            Some(t) => (t.user.clone(), t.user.realm.clone()),
-            None => (proven.tgt.cname.clone(), proven.tgt.crealm.clone()),
+        let (client, crealm) = match (&transition, &proxy) {
+            (Some(t), _) => (t.user.clone(), t.user.realm.clone()),
+            (None, Some(p)) => (p.user.clone(), p.user.realm.clone()),
+            (None, None) => (proven.tgt.cname.clone(), proven.tgt.crealm.clone()),
         };
         if let Some(t) = &transition {
             // MS-SFU §3.1.4: a ticket obtained by protocol transition is forwardable only if
@@ -717,6 +743,122 @@ impl Kdc {
             user,
             may_delegate,
             reply,
+        }))
+    }
+
+    /// Evaluates a constrained delegation (S4U2Proxy), MS-SFU §3.1.5.
+    ///
+    /// The delegating service holds a ticket for itself; the user's ticket — obtained by
+    /// S4U2Self, or sent by a user who authenticated to the service — travels in
+    /// `additional-tickets`; and the service asks for a ticket to *another* service in the
+    /// user's name. The evidence is what makes it delegation rather than impersonation: no
+    /// user ticket, no delegation.
+    ///
+    /// Every refusal here is a rule from Heimdal's `validate_constrained_delegation`
+    /// (`kdc/mssfu.c`), and the most important one is that the evidence is decrypted with the
+    /// **delegating service's** key: the service has to prove it received that ticket, not
+    /// merely that it can name a user.
+    fn constrained_delegation(
+        &self,
+        body: &KdcReqBody,
+        proven: &Proven,
+        sname: &Principal,
+        server: &HdbEntry,
+        now: i64,
+    ) -> Result<Option<Proxy>> {
+        // §3.1.5.1: the option says the client comes from the additional ticket. Without it
+        // this is an ordinary request that happens to carry a ticket (user-to-user does), and
+        // `enc-tkt-in-skey` means the ticket travels encrypted in a session key, which is a
+        // different mechanism with its own handling.
+        if body.kdc_options & kdc_options::CNAME_IN_ADDL_TKT == 0 {
+            return Ok(None);
+        }
+        if body.kdc_options & kdc_options::ENC_TKT_IN_SKEY != 0 {
+            return Err(badoption(
+                "cname-in-addl-tkt with enc-tkt-in-skey: the evidence ticket cannot be both \
+                 the source of the client and sealed in a session key",
+            ));
+        }
+
+        let raw = body.additional_tickets.as_deref().ok_or_else(|| {
+            badoption(
+                "cname-in-addl-tkt without additional-tickets: there is no evidence ticket, \
+                 and a delegation nobody can prove is impersonation",
+            )
+        })?;
+        // `first_ticket` is the user-to-user path's reader; it returns the ticket's own
+        // TLV, which is exactly what `Ticket::decode` wants.
+        let evidence = Ticket::decode(&first_ticket(raw)?)?;
+
+        // The delegator is the client of the TGT — the service making the request. Its own key
+        // opens the evidence, which is what proves the service received it.
+        let delegator = self
+            .hdb()
+            .fetch(&proven.tgt.cname)?
+            .ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_C_PRINCIPAL_UNKNOWN,
+                text: format!("S4U2Proxy: {} is not in this realm", proven.tgt.cname),
+            })?;
+        let part = self
+            .decrypt_ticket(&evidence, &delegator)
+            .map_err(|e| Error::Kdc {
+                code: codes::KRB_AP_ERR_BAD_INTEGRITY,
+                text: format!(
+                    "S4U2Proxy: the evidence ticket does not open with {}'s key: {e}",
+                    proven.tgt.cname
+                ),
+            })?;
+
+        // §3.1.5.2: the evidence has to be usable. Not forwardable means the user (or the KDC,
+        // for an S4U2Self ticket) said it may not travel further, and expired means there is
+        // nothing to delegate.
+        if part.flags & tkt_flags::FORWARDABLE == 0 {
+            return Err(badoption(
+                "S4U2Proxy: the evidence ticket is not forwardable, so it may not be \
+                 presented for another service",
+            ));
+        }
+        if now > part.endtime {
+            return Err(Error::Kdc {
+                code: codes::KRB_AP_ERR_TKT_EXPIRED,
+                text: "S4U2Proxy: the evidence ticket has expired".into(),
+            });
+        }
+        if part.crealm != self.config().realm() {
+            return Err(badoption(&format!(
+                "S4U2Proxy: the evidence ticket is for {}, not this realm; constrained \
+                 delegation does not cross realms",
+                part.crealm
+            )));
+        }
+
+        // §3.1.4: delegation is allowed when the service delegates to itself, or when the
+        // requested service is one the service's administrator listed. `None` and an empty list
+        // both mean "nobody but itself": the absence of a list is not a permission.
+        let to_itself = proven.tgt.cname == *sname || delegator.principal == *sname;
+        let listed = delegator
+            .constrained_delegation
+            .as_ref()
+            .is_some_and(|acl| {
+                acl.iter()
+                    .any(|p| p == sname || p.components == server.principal.components)
+            });
+        if !to_itself && !listed {
+            return Err(badoption(&format!(
+                "S4U2Proxy: {} may not delegate to {sname}; a service delegates to itself and \
+                 to the names its entry lists, and this one lists {}",
+                proven.tgt.cname,
+                match &delegator.constrained_delegation {
+                    None => "nothing".to_string(),
+                    Some(acl) if acl.is_empty() => "nobody".to_string(),
+                    Some(acl) => acl.len().to_string() + " other name(s)",
+                }
+            )));
+        }
+
+        Ok(Some(Proxy {
+            user: part.cname.clone(),
+            authtime: part.authtime,
         }))
     }
 

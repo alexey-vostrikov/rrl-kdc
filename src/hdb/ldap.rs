@@ -423,6 +423,11 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
         keys,
         kvno,
         flags,
+        // A directory has no column for Heimdal's HDB extensions, and inventing one would put
+        // this crate's private format into somebody's schema. Delegation limits therefore come
+        // from the record backend; an LDAP-backed realm delegates only to itself, which is the
+        // conservative reading of "no list".
+        constrained_delegation: None,
         valid_start: attributes.time(attrs::VALID_START, &name)?,
         valid_end: attributes.time(attrs::VALID_END, &name)?,
         pw_end: attributes.time(attrs::PASSWORD_END, &name)?,

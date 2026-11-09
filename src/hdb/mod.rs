@@ -332,6 +332,23 @@ pub trait Hdb: Send + Sync + std::fmt::Debug {
     /// The entry for `principal`, or `None` if there is none.
     fn fetch(&self, principal: &Principal) -> Result<Option<HdbEntry>>;
 
+    /// The entry a ticket for `service` is issued from, or `None`.
+    ///
+    /// Usually the same as [`Self::fetch`], and the default is exactly that. The two
+    /// differ when a directory names an account one way and clients ask for it
+    /// another: a Windows directory holds `HOST$@REALM` and publishes
+    /// `cifs/host.example.com` in `servicePrincipalName`, so `fetch` on the name the
+    /// client used finds nothing. A backend that can resolve a service principal name
+    /// overrides this; one that cannot keeps the honest default.
+    ///
+    /// The entry returned may have a principal **different from the name asked for**,
+    /// and the KDC must then put the requested name in the ticket while sealing it
+    /// with the found entry's key. That is what Active Directory does, and it is why
+    /// this is a separate question from "what is this principal".
+    fn fetch_for_service(&self, service: &Principal) -> Result<Option<HdbEntry>> {
+        self.fetch(service)
+    }
+
     /// Inserts or replaces an entry.
     fn store(&self, entry: HdbEntry) -> Result<()>;
 

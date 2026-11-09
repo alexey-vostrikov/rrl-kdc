@@ -206,10 +206,19 @@ impl Kdc {
         let proven = self.check_evidence(req, now)?;
 
         // 5: the service.
-        let server = self.hdb().fetch(&sname)?.ok_or_else(|| Error::Kdc {
-            code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
-            text: format!("{sname} is not a service in this realm"),
-        })?;
+        //
+        // `fetch_for_service`, not `fetch`: a directory may hold the account under one
+        // name and publish another. `HOST$@REALM` carries `cifs/host.example.com` in
+        // `servicePrincipalName`, and a client asks for the latter — the ticket is
+        // then sealed with `HOST$`'s key while naming `cifs/host` (that is what
+        // [MS-ADTS] does, and what Samba needs to join).
+        let server = self
+            .hdb()
+            .fetch_for_service(&sname)?
+            .ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                text: format!("{sname} is not a service in this realm"),
+            })?;
         if !server.has(entry_flags::SERVER) {
             return Err(Error::Kdc {
                 code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
@@ -321,7 +330,10 @@ impl Kdc {
         };
         let ticket = Ticket {
             realm: config.realm().to_owned(),
-            sname: server.principal.clone(),
+            // What the client asked for, which may not be the entry's own name: the
+            // service is addressed by the name it published, and a ticket naming
+            // `HOST$` instead of `cifs/host` would be accepted by nobody.
+            sname: sname.clone(),
             enc: EncryptedData::seal(
                 self.cipher(),
                 &ticket_key.0,
@@ -342,7 +354,12 @@ impl Kdc {
             endtime,
             renew_till,
             srealm: server.principal.realm.clone(),
-            sname: server.principal.clone(),
+            // The name the client asked for, as in the ticket: the reply's encrypted
+            // part states which service the ticket is for, and a client compares it
+            // with the name it asked for before accepting the answer
+            // (`KRB5_KDCREP_MODIFIED` otherwise). The entry's own name — `HOST$` — is
+            // not what was asked for.
+            sname: sname.clone(),
             caddr: body.addresses.clone(),
         };
         // The reply is encrypted in the TGT's session key (usage 8) or in the

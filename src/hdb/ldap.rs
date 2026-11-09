@@ -648,6 +648,21 @@ pub fn service_principal_name(principal: &Principal) -> Option<String> {
     Some(principal.components.join("/"))
 }
 
+/// Whether this entry publishes `spn`, case-insensitively.
+///
+/// LDAP compares `servicePrincipalName` case-insensitively and a client may ask in
+/// either case, so the check does too. The octets come from the directory as it
+/// stored them; a value that is not UTF-8 cannot name anything and is skipped rather
+/// than turned into an error, because one broken value is not a reason to refuse a
+/// ticket for a name that another value publishes.
+fn names_service(attributes: &Attributes, spn: &str) -> bool {
+    attributes
+        .get(attrs::AD_SERVICE_PRINCIPAL_NAME)
+        .iter()
+        .filter_map(|value| std::str::from_utf8(value).ok())
+        .any(|value| value.eq_ignore_ascii_case(spn))
+}
+
 /// The principal an SPN names, in `realm`.
 pub fn principal_from_spn(spn: &str, realm: &str) -> Result<Principal> {
     let mut parts = spn.split('/');
@@ -714,6 +729,23 @@ pub trait Directory: std::fmt::Debug + Send + Sync {
     /// The attributes of `principal`'s entry, or `None` if there is no such entry.
     fn get(&self, principal: &Principal) -> Result<Option<Attributes>>;
 
+    /// The entry whose `servicePrincipalName` holds `spn`, or `None`.
+    ///
+    /// A client asks for a ticket by service principal name — `cifs/host.example.com`
+    /// — while a Windows directory names the account that holds it
+    /// `HOST$@REALM` and keeps the name the client used in an attribute. Looking the
+    /// entry up by principal alone therefore misses it, and `net ads join` cannot
+    /// proceed past the first SMB ticket.
+    ///
+    /// The default answers `None`, which is the truth for a directory that carries no
+    /// SPNs: nothing is guessed, and a realm without them behaves exactly as before.
+    /// A directory that does carry them implements this as one search on
+    /// `servicePrincipalName` — the index exists for it in every LDAP server.
+    fn get_by_spn(&self, spn: &str) -> Result<Option<Attributes>> {
+        let _ = spn;
+        Ok(None)
+    }
+
     /// Writes `principal`'s entry, creating it if it is not there.
     fn put(&self, principal: &Principal, attributes: &Attributes) -> Result<()>;
 
@@ -760,6 +792,32 @@ impl Hdb for LdapHdb {
                 Ok(Some(entry))
             }
         }
+    }
+
+    fn fetch_for_service(&self, service: &Principal) -> Result<Option<HdbEntry>> {
+        // By name first: a realm that keeps no SPNs, or one whose service account is
+        // named exactly as clients ask, answers here and nothing else is consulted.
+        if let Some(entry) = self.fetch(service)? {
+            return Ok(Some(entry));
+        }
+        // Then by service principal name. The entry is expected to belong to a
+        // *different* principal — `HOST$` holds `cifs/host` — so the check `fetch`
+        // makes cannot apply; instead the store is asked to have published the name,
+        // and an entry that did not would be a directory answering the wrong question.
+        let Some(spn) = service_principal_name(service) else {
+            return Ok(None);
+        };
+        let Some(attributes) = self.directory.get_by_spn(&spn)? else {
+            return Ok(None);
+        };
+        let entry = from_attributes(&attributes)?;
+        if !names_service(&attributes, &spn) {
+            return Err(Error::Hdb(format!(
+                "{spn}: the directory answered with {}, which does not publish that                  service principal name",
+                entry.principal
+            )));
+        }
+        Ok(Some(entry))
     }
 
     fn store(&self, entry: HdbEntry) -> Result<()> {

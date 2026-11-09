@@ -89,6 +89,24 @@ impl Directory for FakeDirectory {
             .is_some())
     }
 
+    fn get_by_spn(&self, spn: &str) -> Result<Option<Attributes>, Error> {
+        // An equality search on `servicePrincipalName`, which is what an LDAP server
+        // does with the index it keeps for that attribute.
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .find(|attributes| {
+                attributes
+                    .get(attrs::AD_SERVICE_PRINCIPAL_NAME)
+                    .iter()
+                    .filter_map(|value| std::str::from_utf8(value).ok())
+                    .any(|value| value.eq_ignore_ascii_case(spn))
+            })
+            .cloned())
+    }
+
     fn list(&self) -> Result<Vec<Principal>, Error> {
         Ok(self
             .entries
@@ -554,5 +572,141 @@ fn a_dn_names_the_principal_and_the_realm() {
     assert_eq!(
         dn_for(&service, ""),
         "krb5PrincipalName=host/web.example.com@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM"
+    );
+}
+
+/// A machine account as a Windows directory holds it: the principal is `HOST$`, and
+/// the name clients ask for lives in `servicePrincipalName`.
+fn machine(directory: &FakeDirectory) -> Principal {
+    let principal = Principal::parse(&format!("HOST$@{REALM}")).unwrap();
+    let mut entry = HdbEntry::service(principal.clone());
+    for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
+        entry
+            .add_password_key(&OwnCipher, e, b"machine-password", 1)
+            .unwrap();
+    }
+    directory.insert(&entry);
+    // `to_attributes` derives `servicePrincipalName` from `host/NAME` for a service
+    // principal; the stand needs `cifs/…` as well, which is the name Samba asks for.
+    let mut attributes = to_attributes(&entry);
+    attributes.add(
+        attrs::AD_SERVICE_PRINCIPAL_NAME,
+        format!("cifs/{}", HOST).into_bytes(),
+    );
+    directory.put(&principal, &attributes).unwrap();
+    principal
+}
+
+const HOST: &str = "host.ad.example.com";
+
+#[test]
+fn a_ticket_is_issued_for_a_name_the_account_publishes() {
+    // The defect this pins: a client asks for `cifs/host.ad.example.com`, the
+    // directory holds `HOST$` and publishes that name, and a lookup by principal
+    // found nothing — `net ads join` stopped at the first SMB ticket.
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    let machine_principal = machine(&directory);
+
+    let asked = Principal::parse(&format!("cifs/{HOST}@{REALM}")).unwrap();
+    let entry = LdapHdb::new(shared(&directory))
+        .fetch_for_service(&asked)
+        .expect("the lookup must not fail")
+        .expect("the published name must be found");
+    assert_eq!(
+        entry.principal, machine_principal,
+        "the keys come from the machine account"
+    );
+}
+
+#[test]
+fn a_name_the_account_does_not_publish_is_not_found() {
+    // The other half: resolving by SPN must not turn into "any service will do".
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    machine(&directory);
+    let asked = Principal::parse(&format!("http/nowhere@{REALM}")).unwrap();
+    assert!(
+        LdapHdb::new(shared(&directory))
+            .fetch_for_service(&asked)
+            .unwrap()
+            .is_none(),
+        "an unregistered name must not resolve"
+    );
+}
+
+#[test]
+fn a_directory_that_answers_with_the_wrong_entry_is_refused() {
+    // A directory with a broken SPN index must not produce a ticket for whichever
+    // account it happened to return: the entry has to publish the name asked for.
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    machine(&directory);
+    #[derive(Debug)]
+    struct Liar(Arc<FakeDirectory>);
+    impl Directory for Liar {
+        fn get(&self, principal: &Principal) -> Result<Option<Attributes>, Error> {
+            self.0.get(principal)
+        }
+        fn get_by_spn(&self, _spn: &str) -> Result<Option<Attributes>, Error> {
+            // Answers every name with the machine's entry.
+            Ok(self.0.get(&p("HOST$")).unwrap())
+        }
+        fn put(&self, principal: &Principal, attributes: &Attributes) -> Result<(), Error> {
+            self.0.put(principal, attributes)
+        }
+        fn delete(&self, principal: &Principal) -> Result<bool, Error> {
+            self.0.delete(principal)
+        }
+        fn list(&self) -> Result<Vec<Principal>, Error> {
+            self.0.list()
+        }
+    }
+    let asked = Principal::parse(&format!("http/nowhere@{REALM}")).unwrap();
+    let err = LdapHdb::new(Arc::new(Liar(Arc::clone(&directory))))
+        .fetch_for_service(&asked)
+        .expect_err("an entry that does not publish the name must be refused");
+    let text = format!("{err}");
+    assert!(text.contains("service principal name"), "{text}");
+}
+
+#[test]
+fn a_live_client_gets_a_ticket_for_the_name_it_asked_for() {
+    // The end-to-end half of the SPN lookup, through a third-party client: it asks for
+    // `cifs/host.ad.example.com`, the directory holds `HOST$`, and the answer must be
+    // a ticket naming what the client asked for and sealed in `HOST$`'s key.
+    //
+    // Naming `HOST$` in the reply would be the subtle failure: the client would hold a
+    // ticket it believes belongs to another service, and an SMB server comparing
+    // `sname` against its own name would refuse it.
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    let machine_principal = machine(&directory);
+    let stand = serve_loopback(kdc_over(shared(&directory)));
+
+    let client = krb5::KdcClient::new(REALM, [stand.addr().as_str()]);
+    let alice = krb5::Principal::parse(&p("alice").to_string()).unwrap();
+    let ctx = client
+        .login_with_password(&alice, PASSWORD)
+        .expect("alice logs in");
+
+    let asked = krb5::Principal::parse(&format!("cifs/{HOST}@{REALM}")).unwrap();
+    let ticket = client
+        .service_ticket(&ctx, &asked)
+        .expect("a service ticket for a published name must be issued");
+
+    // The proof is that the client could open the ticket at all: its `enc-part` is
+    // sealed in the key of the entry the lookup found, and the client checks the
+    // reply's checksum against it. A ticket sealed in a different account's key would
+    // fail here rather than at the SMB server.
+    assert_eq!(
+        ticket.ticket_server().map(|p| p.to_string()),
+        Some(asked.to_string()),
+        "the ticket names the service the client asked for, not the account that holds it"
+    );
+    assert_ne!(
+        asked.to_string(),
+        machine_principal.to_string(),
+        "the two names really differ, or this test proves nothing"
     );
 }

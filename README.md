@@ -49,6 +49,9 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `hdb::ad_blob` — `supplementalCredentials` (feature `hdb-ldap`) | done both ways: written as a projection, read back when `krb5Key` is absent |
 | `kdc::pac` — the privilege attribute certificate | done: envelope, `PAC_CLIENT_INFO`, `KERB_VALIDATION_INFO`, both signatures |
 | `kdc::logon_info` — NDR for `KERB_VALIDATION_INFO` | done: encoded by hand, checked by impacket and by a live client |
+| `kdc::names` — RFC 6806 §6 enterprise names | done: `NT-ENTERPRISE` client names resolve to the principal they name when the request sets `canonicalize`, and are refused when it does not |
+| `kdc::fast` — RFC 6113 FAST | done: armored AS exchange, the implicit armor of a TGS request, `hide-client-names`, `PA-ENCRYPTED-CHALLENGE` instead of a plain timestamp inside the armor, and the reply key strengthened by a secret that travels only in the armor |
+| `kdc::pkinit` — RFC 4556 certificate login | done for finite-field Diffie-Hellman: CMS verification and signing, the chain to a configured anchor, `id-pkinit-san` for the principal, `PA-PK-AS-REQ` → `PA-PK-AS-REP`, reply key per RFC 8636. Judged by `openssl cms -verify` and by a wiring test that derives the key the client would |
 
 ### Managing a realm without inventing an API
 
@@ -180,6 +183,17 @@ a `kadmin` user without rights gets MIT's `KADM5_AUTH_*` and no data.
 
 Not implemented, and answered with an error rather than a fabricated success:
 policies, string attributes, `extract_keys`.
+
+Not implemented in the exchanges either, and refused by name rather than half-done:
+
+| Missing | What a caller sees |
+|---|---|
+| PKINIT RSA key transport (`encKeyPack`) | `Unsupported`; MIT's own client rejects the mode too |
+| PKINIT elliptic-curve ECDH | `Unsupported`, with the offered algorithm named |
+| `PA-FX-COOKIE` | a plain cookie; a realm with single-round pre-authentication has no state to carry |
+| `kdc-options` `forwarded` / `proxy` | no ticket; the option is not read |
+
+| S4U2Self / S4U2Proxy, cross-realm | no ticket |
 
 ## Building
 

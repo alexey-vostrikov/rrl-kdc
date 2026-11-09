@@ -112,6 +112,33 @@ The ticket and the reply then state the name the **client** asked for, which is 
 Active Directory does and what a client checks: a reply naming `HOST$` is refused with
 `KRB5_KDCREP_MODIFIED`.
 
+## What Heimdal's KDC has and this one does not
+
+The target is behavioural parity with Heimdal's `kdc/`, so the gaps are worth stating rather
+than leaving to be discovered. Measured against `kdc/*.c` of the Heimdal tree and `src/` of
+this crate, thirteen capabilities are absent. Six are planned work; seven are outside the
+intent and would need a decision.
+
+Planned:
+
+* **S4U2Self / S4U2Proxy** (`kdc/mssfu.c`) — service delegation without a client's password.
+* **Cross-realm** — a `krbtgt` of another realm, `transited` fields and referrals
+  (`kdc/krb5tgs.c`).
+* **SPAKE (RFC 9179) and OTP (RFC 8179)** — pre-authentication that survives an attacker who
+  records the exchange, and the multi-round flow that `PA-FX-COOKIE` exists to carry.
+* **Audit trail and pre-authentication hooks** (`kdc/kdc-plugin.c`) — one stable record per
+  decision, and a way to add a method without editing the exchange.
+* **`PA-FX-COOKIE`** — the state a multi-round exchange carries between messages. Nothing
+  today needs it, which is why it is not written yet.
+* **Replication** (`kdc/hprop.c`, `hpropd.c`) — a second domain controller.
+
+Outside the intent: the Heimdal CA and its issuance protocols (`kdc/ca.c`, `kx509.c`,
+`bx509.c`, `httpkadmind`), JWT and token validators, `mit_dump`, and `announce`. These serve
+"Kerberos as a certificate authority", which is not what this crate is for. Of the seven,
+only two are worth revisiting: **PKINIT key transport** and **PKINIT with elliptic curves**
+(`lib/krb5/pkinit-ec.c`) are refused today by name, and a client is entitled to ask for
+either.
+
 ## Enctypes
 
 Only the AES four: 17/18 (RFC 3962) and 19/20 (RFC 8009). DES3 and RC4 are

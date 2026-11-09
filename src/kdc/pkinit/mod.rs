@@ -44,6 +44,10 @@ use crate::Result;
 
 #[cfg(feature = "pkinit")]
 pub mod dh;
+// The whole reply half needs the X.509 stack and RSA signing, so it travels with the
+// feature rather than being half-present in a password-only build.
+#[cfg(feature = "pkinit")]
+pub mod reply;
 
 /// `PA-PK-AS-REQ`, RFC 4556 §3.2.1.
 pub const PA_PK_AS_REQ: i32 = 16;
@@ -60,6 +64,17 @@ pub const ID_PKINIT_KP_CLIENT_AUTH: &str = "1.3.6.1.5.2.3.4";
 pub const ID_PKINIT_SAN: &str = "1.3.6.1.5.2.2";
 
 const ID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
+/// `id-sha256`, the digest CMS and X.509 both name.
+const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
+/// `id-sha384`.
+const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
+/// `contentType`, the signed attribute naming what the signature is over.
+const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
+/// `messageDigest`, the signed attribute carrying the content's digest.
+const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
+/// `rsaEncryption`: PKCS#1 v1.5, with the hash named beside it. A `SignerInfo` uses this
+/// where a certificate uses `sha256WithRSAEncryption`.
+pub const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 
 /// A `SEQUENCE`'s members, by position.
 ///
@@ -460,14 +475,6 @@ pub use trusted::*;
 mod trusted {
     use super::*;
 
-    /// `id-sha256`, the digest CMS and X.509 both name.
-    const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
-    /// `id-sha384`.
-    const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
-    /// `contentType`, the signed attribute naming what the signature is over.
-    const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
-    /// `messageDigest`, the signed attribute carrying the content's digest.
-    const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
     use x509_parser::certificate::X509Certificate;
     use x509_parser::prelude::*;
 
@@ -508,7 +515,10 @@ mod trusted {
         }
     }
 
-    fn parse_cert<'a>(der: &'a [u8]) -> std::result::Result<X509Certificate<'a>, PkinitError> {
+    /// Parses a DER certificate, refusing trailing octets.
+    pub(super) fn parse_cert<'a>(
+        der: &'a [u8],
+    ) -> std::result::Result<X509Certificate<'a>, PkinitError> {
         let (rest, cert) = X509Certificate::from_der(der)
             .map_err(|e| PkinitError::Malformed(format!("certificate: {e}")))?;
         if !rest.is_empty() {
@@ -1061,6 +1071,15 @@ mod trusted {
         }
         Ok(())
     }
+}
+
+/// Parses a DER certificate with the same strictness the trust code applies: no trailing
+/// octets, and a structure that parses end to end.
+#[cfg(feature = "pkinit")]
+pub(super) fn parse_certificate(
+    der: &[u8],
+) -> std::result::Result<x509_parser::certificate::X509Certificate<'_>, PkinitError> {
+    trusted::parse_cert(der)
 }
 
 #[cfg(not(feature = "pkinit"))]

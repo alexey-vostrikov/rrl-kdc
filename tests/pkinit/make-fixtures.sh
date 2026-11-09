@@ -138,5 +138,20 @@ openssl x509 -req -in "$WORK/serverauth.csr" -CA ca.pem -CAkey "$WORK/ca.key" -C
     -days 7300 -extfile "$WORK/serverauth.ext" -out wrong-purpose.pem 2>/dev/null
 cp "$WORK/serverauth.key" wrong-purpose-key.pem
 
+# The KDC's own certificate: `id-pkinit-KPKdc` (1.3.6.1.5.2.3.5) and a PKINIT SAN naming
+# `krbtgt/EXAMPLE.COM@EXAMPLE.COM`, which is how a client decides the signer may speak for
+# the realm.
+openssl req -newkey rsa:2048 -nodes -keyout "$WORK/kdc.key" \
+    -out "$WORK/kdc.csr" -subj "/CN=kdc.example.com" 2>/dev/null
+cat > "$WORK/kdc.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=1.3.6.1.5.2.3.5
+subjectAltName=DER:$(san_der krbtgt/EXAMPLE.COM EXAMPLE.COM)
+EOF
+openssl x509 -req -in "$WORK/kdc.csr" -CA ca.pem -CAkey "$WORK/ca.key" -CAcreateserial \
+    -days 7300 -extfile "$WORK/kdc.ext" -out kdc.pem 2>/dev/null
+cp "$WORK/kdc.key" kdc-key.pem
+
 echo "certificates written. Next: build the signed requests with"
 echo "  cargo run --features pkinit --example pkinit-fixture"

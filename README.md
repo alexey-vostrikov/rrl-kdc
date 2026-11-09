@@ -25,8 +25,10 @@ else's implementation — a KDC that only agrees with itself agrees with nothing
 ## Status
 
 The protocol engine is in place and green: AS and TGS exchanges, the
-change-password service, user-to-user tickets, keytab files, a redb store, and
-the administrator's API over it. The `krb5` crate drives the acceptance tests.
+change-password service, user-to-user tickets, keytab files, a redb store, the
+administrator's API over it, and a PAC in the tickets it issues. The `krb5` crate
+drives the acceptance tests; impacket checks the PAC and the AD key projection, and
+`scripts/verify-pac-live.sh` has it ask this KDC for a ticket and read the PAC out.
 
 | Layer | State |
 |---|---|
@@ -44,6 +46,9 @@ the administrator's API over it. The `krb5` crate drives the acceptance tests.
 | `admin::json` — the JSON form (feature `admin-json`) | done, for a REST front end to wrap |
 | `hdb::ldap` — an entry as directory attributes (feature `hdb-ldap`) | done: Heimdal's schema, plus the Microsoft spellings |
 | `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, chpass, chrand |
+| `hdb::ad_blob` — `supplementalCredentials` (feature `hdb-ldap`) | done both ways: written as a projection, read back when `krb5Key` is absent |
+| `kdc::pac` — the privilege attribute certificate | done: envelope, `PAC_CLIENT_INFO`, `KERB_VALIDATION_INFO`, both signatures |
+| `kdc::logon_info` — NDR for `KERB_VALIDATION_INFO` | done: encoded by hand, checked by impacket and by a live client |
 
 ### Managing a realm without inventing an API
 
@@ -69,6 +74,39 @@ with three properties worth relying on: binary fields travel as base64 rather th
 as arrays of octets, a misspelled field is an error rather than silently dropped,
 and an error carries a stable `kind` (`not_found`, `already_exists`, `forbidden`,
 `bad_request`, …) for the status code so nobody has to parse prose.
+
+### A PAC, and where the identity comes from
+
+Tickets carry a privilege attribute certificate when the realm is told to issue one:
+`Kdc::with_pac(Arc<dyn PacIdentities>)`. The trait is the seam, not an implementation
+detail — the RID, the group list and the domain SID belong to a directory, and this
+crate does not own one. A realm without it issues plain Kerberos tickets, which is
+correct when no Windows service reads them, and an account the directory does not
+know gets a ticket without a PAC rather than a refusal.
+
+The PAC is rebuilt for every ticket rather than copied out of the TGT: its service
+signature is keyed by *that* service's key, and the signature type follows the key's
+enctype (15/16 for the AES-SHA1 enctypes, −138 for RC4).
+
+Three things are checked by somebody else's code, because a self-test would agree
+with whatever the encoder did: `scripts/verify-pac.sh` (envelope and signatures),
+`scripts/verify-logon-info.sh` (every NDR field and referent), and
+`scripts/verify-pac-live.sh`, which starts a KDC, has impacket request a TGT and
+reads the PAC out of the reply.
+
+### A service is found by the name it publishes
+
+A client asks for `cifs/host.example.com`; a Windows directory holds that account as
+`HOST$` and keeps the requested name in `servicePrincipalName`. `Hdb::fetch` answers
+the first question only, so `Hdb::fetch_for_service` is the one the TGS asks — by
+default it is `fetch`, and a backend that can see SPNs overrides it. `LdapHdb` does:
+name first, then `Directory::get_by_spn`, and the entry it finds must itself publish
+the requested name, or the lookup fails instead of handing out one account's ticket
+under another's name.
+
+The ticket and the reply then state the name the **client** asked for, which is what
+Active Directory does and what a client checks: a reply naming `HOST$` is refused with
+`KRB5_KDCREP_MODIFIED`.
 
 ## Enctypes
 

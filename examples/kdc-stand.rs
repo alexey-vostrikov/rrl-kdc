@@ -22,14 +22,54 @@
 //! KDC_REALM=AD.EXAMPLE.COM KDC_HOST=samba.ad.example.com \
 //!   cargo run --example kdc-stand --features hdb-redb -- 0.0.0.0:88 /shared
 //! ```
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
 use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, keytab::KeytabEntry};
+use rust_heimdal_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
 use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
 use rust_heimdal_kdc::name::Principal;
 use rust_heimdal_kdc::transport::serve_on;
+
+/// The identities a PAC states, taken from the same table that seeds the database.
+///
+/// A real KDC asks a directory; a stand has no directory, so the RIDs are written
+/// down here and nowhere else. Keeping them in one table is the point: an RID that
+/// disagreed with the principal it belongs to would produce a PAC naming somebody
+/// else, and nothing in the ticket would show it.
+struct StandIdentities {
+    domain: Sid,
+    /// NetBIOS spelling: `AD` for `AD.EXAMPLE.COM`, which is what a Windows service
+    /// compares against. The DNS name there would never match.
+    domain_name: String,
+    logon_server: String,
+    /// `principal` as a string → RID, relative to [`Self::domain`].
+    rids: BTreeMap<String, u32>,
+}
+
+impl PacIdentities for StandIdentities {
+    fn identity(&self, principal: &Principal) -> rust_heimdal_kdc::Result<Option<Identity>> {
+        let Some(rid) = self.rids.get(&principal.to_string()) else {
+            // Not an error: a principal the directory has not been told about gets a
+            // ticket without a PAC, which is what `TASQ-3.4`'s seam promises.
+            return Ok(None);
+        };
+        Ok(Some(Identity {
+            domain: self.domain.clone(),
+            domain_name: self.domain_name.clone(),
+            logon_server: self.logon_server.clone(),
+            user_rid: *rid,
+            // 513 `Domain Users`, the group every account in a realm is in.
+            primary_group: 513,
+            groups: vec![(513, 7)],
+            full_name: String::new(),
+            user_account_control: 0x200,
+            extra_sids: Vec::new(),
+        }))
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -52,6 +92,14 @@ fn main() {
             .add_password_key(&cipher, enctype, format!("krbtgt-{realm}").as_bytes(), 1)
             .unwrap();
     }
+    // The `krbtgt` key, kept so the stand can write it out for a verifier. A real
+    // deployment never writes this anywhere: the key opens every ticket in the
+    // realm. It exists here so that `scripts/verify-pac-live.sh` can decrypt a
+    // ticket and read the PAC the KDC put in it.
+    let krbtgt_key = krbtgt
+        .key_for(Enctype::Aes256Sha1)
+        .map(|k| k.key.bytes().to_vec())
+        .expect("the krbtgt entry has an AES-256 key");
     eprintln!("kdc-stand: krbtgt seeded");
     db.insert(krbtgt).unwrap();
 
@@ -177,6 +225,45 @@ fn main() {
         .unwrap();
     let kdc = Kdc::new(config, Arc::new(db) as Arc<dyn Hdb>, Arc::new(cipher));
 
+    // A PAC only when asked for: the AD-join stand runs this example against a
+    // realm whose accounts have no SIDs, and a PAC stating an invented identity
+    // would be worse than none.
+    let kdc = if env("KDC_PAC", "0") == "1" {
+        let mut rids: BTreeMap<String, u32> = BTreeMap::new();
+        // `administrator` is 500 because that is the RID AD reserves for it, and a
+        // client that reads 1105 there would see a different account.
+        rids.insert(format!("administrator@{realm}"), 500);
+        rids.insert(machine_principal.to_string(), 1100);
+        for (i, service) in ["host", "cifs", "ldap"].iter().enumerate() {
+            rids.insert(format!("{service}/{host}@{realm}"), 1101 + i as u32);
+        }
+        let realm_name = realm
+            .split('.')
+            .next()
+            .unwrap_or(&realm)
+            .to_ascii_uppercase();
+        let identities = StandIdentities {
+            domain: Sid::parse(&env("KDC_DOMAIN_SID", "S-1-5-21-100-200-300")).unwrap(),
+            domain_name: realm_name,
+            logon_server: env("KDC_LOGON_SERVER", &instance_name(&host)),
+            rids,
+        };
+        if let Err(e) = write(
+            out.join("krbtgt.key"),
+            &krbtgt_key_file(&krbtgt_key, &realm),
+        ) {
+            eprintln!("kdc-stand: cannot write the krbtgt key: {e}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "kdc-stand: issuing PACs, {} identities",
+            identities.rids.len()
+        );
+        kdc.with_pac(Arc::new(identities))
+    } else {
+        kdc
+    };
+
     let running = serve_on(listen.as_str(), kdc);
     println!("kdc-stand: serving on {}", running.addr());
     // Serve until the process is told to stop: a stand's KDC is a service, and a
@@ -184,6 +271,29 @@ fn main() {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
+}
+
+/// The `krbtgt` key as the stand's verifier reads it.
+///
+/// A file with a comment saying what it is and why it must not exist in a real
+/// deployment, then the key in lowercase hex. A reader that took the comment for
+/// data would fail on the parse rather than silently use the wrong bytes.
+fn krbtgt_key_file(key: &[u8], realm: &str) -> Vec<u8> {
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "# The krbtgt AES-256 key of {realm}, in hex.\n\
+         #\n\
+         # This key decrypts every ticket in the realm. A real deployment never writes\n\
+         # it to a file, and this file exists only so that a test can open a ticket and\n\
+         # read the PAC inside it. Delete it when the stand stops.\n\
+         {hex}\n"
+    )
+    .into_bytes()
+}
+
+/// The DC's own name, as a client would write it: the host's first label, uppercased.
+fn instance_name(host: &str) -> String {
+    host.split('.').next().unwrap_or(host).to_ascii_uppercase()
 }
 
 /// `host:port` from a bind address, with `0.0.0.0` replaced by the loopback a

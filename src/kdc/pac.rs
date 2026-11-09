@@ -54,6 +54,13 @@ pub const PAC_LOGON_INFO: u32 = 1;
 /// info at all.
 pub const PAC_CLIENT_INFO: u32 = 10;
 
+/// `AD-IF-RELEVANT`: the authorization-data type whose payload may be skipped by a
+/// reader that does not understand it.
+pub const AD_IF_RELEVANT: i64 = 1;
+
+/// `AD-WIN2K-PAC`: the entry that carries the PAC octets.
+pub const AD_WIN2K_PAC: i64 = 128;
+
 /// `PAC_SERVER_CHECKSUM` — the signature over the service key.
 pub const PAC_SERVER_CHECKSUM: u32 = 6;
 
@@ -493,15 +500,25 @@ fn hmac_for(enctype: Enctype, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 /// are opaque to everything between the KDC and the service.
 pub fn authorization_data(pac: &[u8]) -> Vec<u8> {
     // `AuthorizationData ::= SEQUENCE OF SEQUENCE { ad-type [0] Int32,
-    // ad-data [1] OCTET STRING }` — two fields per entry, wrapped in one
-    // `AD-IF-RELEVANT` (type 1).
-    crate::der::seq(&[crate::der::field(
-        1,
-        crate::der::seq(&[crate::der::field(0, crate::der::int(1)), {
-            // `ad-data` is an OCTET STRING, whose contents are the PAC itself.
-            crate::der::octets(pac)
-        }]),
-    )])
+    // ad-data [1] OCTET STRING }`.
+    //
+    // The PAC travels two levels down: `AD-IF-RELEVANT` (type 1) whose `ad-data` is
+    // itself an `AuthorizationData` holding one `AD-WIN2K-PAC` (type 128) entry with
+    // the octets. Both levels are load-bearing and neither is decoration — a reader
+    // looks for type 1, then decodes its payload as a sequence of entries and takes
+    // the PAC from the first. Writing the PAC straight into the outer entry is the
+    // shape this was first written in, and impacket rejected it as a tag it did not
+    // expect, which is exactly what an unexpected nesting looks like from outside.
+    let inner = crate::der::seq(&[authorization_entry(AD_WIN2K_PAC, pac)]);
+    crate::der::seq(&[authorization_entry(AD_IF_RELEVANT, &inner)])
+}
+
+/// One `AuthorizationData` entry: `SEQUENCE { [0] ad-type, [1] ad-data }`.
+fn authorization_entry(ad_type: i64, data: &[u8]) -> Vec<u8> {
+    crate::der::seq(&[
+        crate::der::field(0, crate::der::int(ad_type)),
+        crate::der::field(1, crate::der::octets(data)),
+    ])
 }
 
 #[cfg(test)]
@@ -883,15 +900,66 @@ mod tests {
     }
 
     #[test]
-    fn the_authorization_data_wraps_the_pac_as_if_relevant() {
+    fn the_authorization_data_wraps_the_pac_twice_as_windows_does() {
+        // Two levels, and both are read by every client: an `AD-IF-RELEVANT` (type 1)
+        // entry whose `ad-data` is an `AuthorizationData` with one `AD-WIN2K-PAC`
+        // (type 128) entry holding the octets.
+        //
+        // Writing the PAC straight into the outer entry is what this crate did first,
+        // and impacket refused the ticket with a tag it did not expect. Parsing the
+        // DER by hand here is deliberate: the point is the shape, and a test that
+        // reused the encoder's own helper would agree with whatever the encoder did.
         let pac = pac(&[body(PAC_LOGON_INFO, 8)]);
         let ad = authorization_data(&pac);
-        // `30 (SEQ) { A1 (if-relevant) { 30 (SEQ) { A0 02 01 01, A1 .. 04 .. } } }`
-        assert_eq!(ad[0], 0x30);
-        assert!(ad.contains(&0xa1), "AD-IF-RELEVANT is [1]");
-        assert!(
-            ad.windows(pac.len()).any(|w| w == pac.as_slice()),
-            "the PAC travels verbatim"
+
+        // The outer `AuthorizationData` is a SEQUENCE OF entries, so the reader walks
+        // TLVs rather than fields: `Fields` reads `[n]`-tagged members of one
+        // SEQUENCE, which is the level below.
+        let entry = |bytes: &[u8]| -> (i64, Vec<u8>) {
+            let mut r = crate::der::Reader::new(bytes);
+            let sequence = r.next("entry").unwrap();
+            assert_eq!(sequence.tag, 0x30, "an entry is a SEQUENCE");
+            let fields = crate::der::Fields::parse("entry", sequence.content).unwrap();
+            // Each field is `[n]` wrapping the value's own tag: `[0]` holds an
+            // INTEGER, `[1]` an OCTET STRING, and the octets wanted are the content
+            // of that inner TLV rather than its header.
+            let integer = crate::der::Reader::new(fields.get(0, "entry").unwrap())
+                .next("ad-type")
+                .unwrap();
+            assert_eq!(integer.tag, 0x02, "ad-type is an INTEGER");
+            let data = crate::der::Reader::new(fields.get(1, "entry").unwrap())
+                .next("ad-data")
+                .unwrap();
+            assert_eq!(data.tag, 0x04, "ad-data is an OCTET STRING");
+            (read_int(integer.content), data.content.to_vec())
+        };
+
+        let outer = crate::der::Reader::new(&ad)
+            .next("AuthorizationData")
+            .unwrap();
+        assert_eq!(outer.tag, 0x30);
+        let (outer_type, outer_data) = entry(outer.content);
+        assert_eq!(outer_type, 1, "AD-IF-RELEVANT");
+
+        let inner = crate::der::Reader::new(&outer_data)
+            .next("IfRelevant")
+            .unwrap();
+        assert_eq!(inner.tag, 0x30, "the payload is an AuthorizationData");
+        let (inner_type, inner_data) = entry(inner.content);
+        assert_eq!(inner_type, 128, "AD-WIN2K-PAC");
+        assert_eq!(
+            inner_data, pac,
+            "the innermost ad-data is the PAC, verbatim"
         );
+    }
+
+    /// The value of a DER INTEGER as `i64`.
+    fn read_int(bytes: &[u8]) -> i64 {
+        let negative = bytes[0] & 0x80 != 0;
+        let mut value: i64 = if negative { -1 } else { 0 };
+        for byte in bytes {
+            value = (value << 8) | i64::from(*byte);
+        }
+        value
     }
 }

@@ -5,4 +5,4 @@ Cargo.lock
 /.idea
 
 # cargo-mutants writes its report here
-/mutants.out
+/mutants.out*

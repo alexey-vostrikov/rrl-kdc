@@ -22,6 +22,7 @@
 use crate::crypto::{Key, usage};
 use crate::error::{Error, Result, codes};
 use crate::hdb::{HdbEntry, flags as entry_flags};
+use crate::msg::KdcReqBody;
 use crate::msg::{
     self, ApReq, Authenticator, EncKdcRepPart, EncTicketPart, EncryptedData, KdcRep, KdcReq,
     PA_TGS_REQ, TGS_REP, Ticket, kdc_options, tkt_flags,
@@ -44,6 +45,10 @@ struct Proven {
     /// The usage that reply key pairs with (RFC 4120 §7.5.1): 9 for a subkey,
     /// 8 for the session key.
     reply_usage: u32,
+    /// The authenticator's subkey, when it carried one. RFC 6113 §5.4.2.6 builds the
+    /// implicit FAST armor key from this and the TGT's session key, so it has to survive
+    /// the check rather than being folded into `reply_key`.
+    subkey: Option<Key>,
 }
 
 /// The ticket's own fields, decided once out of three rules: a service ticket,
@@ -190,7 +195,84 @@ fn renew_plan(tgt: &EncTicketPart, now: i64) -> Result<TicketPlan> {
 impl Kdc {
     /// Handles a `TGS-REQ`.
     pub(super) fn handle_tgs(&self, req: &KdcReq, now: i64) -> Result<Vec<u8>> {
-        let body = &req.body;
+        // RFC 6113 §5.4.2.6: a TGS request can be armored **implicitly** — there is no
+        // `armor` field, because the armor already travelled: the `AP-REQ` in `PA-TGS-REQ`
+        // presents the client's TGT and carries its subkey, and the armor key is derived
+        // from both. That is why a client that armors its AS exchange can armor its TGS
+        // requests without holding a second ticket.
+        let Some(fast_bytes) = req.padata(super::fast::PA_FX_FAST) else {
+            // `check_evidence` looks the `AP-REQ` up itself; the unarmored path does not
+            // need it here.
+            let proven = self.check_evidence(req, now)?;
+            return self.tgs_answer(&req.body, proven, now, None, false);
+        };
+
+        let armored = super::fast::ArmoredRequest::decode(fast_bytes)?;
+        if armored.armor.is_some() {
+            // Explicit armor in a TGS request is legal (RFC 6113 allows a different ticket
+            // to armor), and is not implemented here: a caller that needs it should hear
+            // that, not receive a reply that ignored the ticket it sent.
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_PREAUTH_FAILED,
+                text: "PA-FX-FAST in a TGS-REQ with an explicit armor ticket is not \
+                       implemented; this KDC supports the implicit armor of RFC 6113 \
+                       §5.4.2.6, whose key comes from the PA-TGS-REQ subkey"
+                    .into(),
+            });
+        }
+        let ap_req_bytes = req.padata(PA_TGS_REQ).ok_or_else(|| Error::Kdc {
+            code: codes::KRB_AP_ERR_MODIFIED,
+            text: "PA-FX-FAST in a TGS-REQ without PA-TGS-REQ: there is nothing to \
+                   derive the implicit armor key from"
+                .into(),
+        })?;
+
+        // The evidence is checked first because the armor key does not exist until the
+        // authenticator's subkey is known — and the subkey is only trustworthy after the
+        // ticket and the authenticator have been verified.
+        let proven = self.check_evidence(req, now)?;
+        let Some(subkey) = &proven.subkey else {
+            return Err(Error::Kdc {
+                code: codes::KRB_AP_ERR_MODIFIED,
+                text: "PA-FX-FAST in a TGS-REQ whose authenticator has no subkey: the \
+                       implicit armor key is cf2(subkey, \"subkeyarmor\", session key, \
+                       \"ticketarmor\") and cannot be derived without one"
+                    .into(),
+            });
+        };
+        let armor_key = super::fast::implicit_armor_key(subkey, &proven.tgt.session_key)?;
+
+        // The request checksum covers the `AP-REQ`, not the body: under FAST the body the
+        // client meant travels inside the armor, and the outer body is only a container.
+        let inner =
+            super::fast::unwrap_implicit(&armored, &armor_key, ap_req_bytes, self.cipher())?;
+
+        let options = inner.options();
+        if let Some(bad) = super::fast::unsupported_critical(options) {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
+                text: format!("PA-FX-FAST: unsupported critical fast-options {bad:#010x}"),
+            });
+        }
+        let hide = options & super::fast::HIDE_CLIENT_NAMES != 0;
+
+        let mut r = crate::der::Reader::new(&inner.req_body);
+        let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
+        let body = KdcReqBody::decode(content)?;
+
+        self.tgs_answer(&body, proven, now, Some(&armor_key), hide)
+    }
+
+    /// The exchange itself, over a body that has already been recovered from wherever it
+    /// travelled — the outer request, or inside an armor.
+    fn tgs_answer(
+        &self,
+        body: &KdcReqBody,
+        proven: Proven,
+        now: i64,
+        armor: Option<&Key>,
+        hide: bool,
+    ) -> Result<Vec<u8>> {
         let config = self.config();
         if body.realm != config.realm() {
             return Err(wrong_realm(&body.realm, config.realm()));
@@ -201,9 +283,6 @@ impl Kdc {
             .sname
             .clone()
             .ok_or_else(|| Error::Protocol("TGS-REQ without a service name".into()))?;
-
-        // 1–4: the evidence.
-        let proven = self.check_evidence(req, now)?;
 
         // 5: the service.
         //
@@ -374,15 +453,41 @@ impl Kdc {
             &rep_part.encode(msg::ENC_TGS_REP_PART),
         )?;
 
-        Ok(KdcRep {
+        // RFC 6113 §5.4.2.6: an armored TGS request is answered inside the armor, with a
+        // `finished` checksum over the ticket so the client can tell it is the answer to
+        // this request and not a substituted one.
+        let mut padata_out = Vec::new();
+        let (crealm, cname) = if hide {
+            let anonymous = super::fast::anonymous_principal();
+            (anonymous.realm.clone(), anonymous)
+        } else {
+            (proven.tgt.crealm.clone(), proven.tgt.cname.clone())
+        };
+        let rep = KdcRep {
             msg_type: TGS_REP,
-            // No PA-DATA in a TGS-REP at this stage: RFC 6806's
-            // PA-REQ-ENC-PA-REP belongs with FAST, which is step 4.
             padata: Vec::new(),
-            crealm: proven.tgt.crealm.clone(),
-            cname: proven.tgt.cname.clone(),
+            crealm,
+            cname,
             ticket,
             enc_part,
+        };
+        if let Some(key) = armor {
+            let finish = super::fast::finished(
+                self.cipher(),
+                key,
+                &rep.ticket.encode(),
+                &proven.tgt.cname,
+                now,
+                now.rem_euclid(1_000_000) as u32,
+            )?;
+            padata_out = vec![(
+                super::fast::PA_FX_FAST_REPLY,
+                super::fast::wrap_reply(key, &[], None, Some(finish), body.nonce, self.cipher())?,
+            )];
+        }
+        Ok(KdcRep {
+            padata: padata_out,
+            ..rep
         }
         .encode())
     }
@@ -507,9 +612,14 @@ impl Kdc {
             });
         }
 
-        // The checksum covers the exact octets of KDC-REQ-BODY as they arrived.
-        // Re-encoding a decoded body would produce equal-looking DER that is not
-        // byte-identical, and the client's own checksum is over what it sent.
+        // The checksum covers the exact octets of KDC-REQ-BODY as they arrived. That is
+        // true under FAST as well, and not by accident: a TGS request sends its body both
+        // outside the armor and inside it (RFC 6113 §5.4.2.6 keeps `PA-TGS-REQ` outer and
+        // mirrors the body), so the client checksums the same octets either way. What FAST
+        // changes is the *other* checksum — the `req-checksum` over the `AP-REQ`, which
+        // `fast::unwrap` verifies. Re-encoding a decoded body would produce equal-looking
+        // DER that is not byte-identical, and the client's own checksum is over what it
+        // sent.
         let (cksum_type, cksum) = authenticator.cksum.as_ref().ok_or_else(|| Error::Kdc {
             code: codes::KRB_AP_ERR_INAPP_CKSUM,
             text: "the authenticator has no checksum over the request".into(),
@@ -559,6 +669,7 @@ impl Kdc {
             tgt: ticket_part,
             reply_key,
             reply_usage,
+            subkey: authenticator.subkey.clone(),
         })
     }
 

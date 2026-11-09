@@ -60,12 +60,6 @@ pub const ID_PKINIT_KP_CLIENT_AUTH: &str = "1.3.6.1.5.2.3.4";
 pub const ID_PKINIT_SAN: &str = "1.3.6.1.5.2.2";
 
 const ID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
-/// `id-sha256`, the digest CMS and X.509 both name.
-const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
-/// `id-sha384`.
-const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
-const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
-const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 
 /// A `SEQUENCE`'s members, by position.
 ///
@@ -121,6 +115,7 @@ impl<'a> Seq<'a> {
     }
 
     /// The member at `index` as an `AlgorithmIdentifier`, yielding its algorithm OID.
+    #[cfg(feature = "pkinit")]
     ///
     /// CMS puts the algorithm one structure deep — `SEQUENCE { OID, parameters }` — in
     /// every place that names one, and each of those places is somewhere a reader can
@@ -464,6 +459,15 @@ pub use trusted::*;
 #[cfg(feature = "pkinit")]
 mod trusted {
     use super::*;
+
+    /// `id-sha256`, the digest CMS and X.509 both name.
+    const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
+    /// `id-sha384`.
+    const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
+    /// `contentType`, the signed attribute naming what the signature is over.
+    const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
+    /// `messageDigest`, the signed attribute carrying the content's digest.
+    const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
     use x509_parser::certificate::X509Certificate;
     use x509_parser::prelude::*;
 

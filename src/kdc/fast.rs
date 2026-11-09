@@ -407,10 +407,26 @@ pub fn unwrap(
                 .into(),
         });
     }
+    unwrap_implicit(armored, armor_key, outer_body, cipher)
+}
+
+/// The same unwrapping for a request whose armor is **implicit** (RFC 6113 §5.4.2.6): a
+/// TGS request, where the ticket already travelled in `PA-TGS-REQ` and the `armor` field is
+/// absent by design rather than by omission.
+///
+/// `checksummed` is the `PA-TGS-REQ` `AP-REQ` in that case — RFC 6113 §5.4.2.6 has the
+/// request checksum cover the ticket-bearing `AP-REQ`, not the body, because the body is
+/// also sent outside and would say nothing about which ticket is being used.
+pub fn unwrap_implicit(
+    armored: &ArmoredRequest,
+    armor_key: &Key,
+    checksummed: &[u8],
+    cipher: &dyn Cipher,
+) -> Result<FastRequest> {
     cipher.verify_checksum(
         armor_key,
         usage::FAST_REQ_CHKSUM,
-        outer_body,
+        checksummed,
         &armored.req_checksum.1,
     )?;
     let enc = EncryptedData::decode("enc-fast-req", &armored.enc_fast_req)?;
@@ -528,6 +544,24 @@ pub fn finished(
             ]),
         ),
     ]))
+}
+
+/// The armor key of an **implicit** armor (RFC 6113 §5.4.2.6): a TGS request whose
+/// `PA-TGS-REQ` already presents the ticket, so no `armor` field is sent.
+///
+/// `cf2(subkey, "subkeyarmor", ticket session key, "ticketarmor")` — the same construction
+/// the explicit form uses, with the subkey coming from the TGS authenticator instead of an
+/// armor `AP-REQ`. One derivation for both, because two ways to compute one key is how a
+/// client and a KDC end up disagreeing about the same field.
+pub fn implicit_armor_key(subkey: &Key, session_key: &Key) -> Result<Key> {
+    let mixed = crate::crypto::kdf::cf2(
+        subkey.bytes(),
+        "subkeyarmor",
+        session_key.enctype(),
+        session_key.bytes(),
+        "ticketarmor",
+    )?;
+    Key::new(session_key.enctype(), mixed)
 }
 
 /// A `strengthen_key` and the reply key it produces (RFC 6113 §5.4.2.2).

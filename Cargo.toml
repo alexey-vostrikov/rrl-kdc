@@ -30,6 +30,20 @@ base64 = { version = "0.22", optional = true }
 # resolver, no SPNEGO.
 rskrb5 = { version = "0.2", default-features = false, optional = true }
 
+# PKINIT. `x509-parser` reads the certificate and its `id-pkinit-san` otherName;
+# `rsa` verifies the CMS signature and, in the key-transport mode, encrypts the
+# reply. The MODP groups of RFC 3526 need arithmetic wider than the language has,
+# hence `num-bigint`.
+x509-parser = { version = "0.18", default-features = false, optional = true }
+rsa = { version = "0.9", optional = true }
+num-bigint = { version = "0.4", default-features = false, optional = true }
+num-traits = { version = "0.2", default-features = false, optional = true }
+# `rsa` 0.9 is built on `digest` 0.10 while this crate uses `sha2` 0.11, and the
+# two do not interop: `Pkcs1v15Sign::new::<D>()` needs the `Digest` the signature
+# crate knows. Rather than downgrade the crate's own SHA-2, the verification path
+# brings its own copy under a name that says why it exists.
+rsa-sha2 = { package = "sha2", version = "0.10", features = ["oid"], optional = true }
+
 [features]
 default = []
 # Heimdal writes its audit log through the host's syslog; here it is `tracing`.
@@ -60,6 +74,10 @@ admin-json = ["serde"]
 # judged by, because it is tested against a live MIT KDC and is stricter about
 # what it accepts. `rskrb5` is a cross-check on the crypto only.
 crypto-rskrb5 = ["dep:rskrb5"]
+# PKINIT (RFC 4556): certificate parsing, CMS, and the public-key arithmetic the
+# exchange needs. Off by default because it pulls in an X.509 stack, which a realm
+# that authenticates with passwords never touches.
+pkinit = ["dep:x509-parser", "dep:rsa", "dep:num-bigint", "dep:num-traits", "dep:rsa-sha2"]
 
 # An example that needs a feature is declared with `required-features`, so that a
 # default build does not compile it. Without this, `cargo test` builds every example
@@ -84,6 +102,7 @@ hex = "0.4"
 rskrb5 = { version = "0.2", default-features = false, features = ["messages"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# PEM in the PKINIT fixtures: a test should not need openssl at run time.
 base64 = "0.22"
 
 [profile.release]

@@ -33,6 +33,7 @@ pub mod fast;
 pub mod kpasswd;
 pub mod logon_info;
 pub mod pac;
+pub mod pkinit;
 
 pub use kpasswd::{VERSION_CHANGE, VERSION_SET, changepw_entry, result_payload};
 

@@ -150,7 +150,16 @@ pub fn options_bits(options: u32) -> Vec<u8> {
 /// `WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS` — the realm is not the client's, because the
 /// whole point is that the reply no longer says which realm the client belongs to.
 pub fn anonymous_principal() -> crate::name::Principal {
-    crate::name::Principal::new(1, ["WELLKNOWN", "ANONYMOUS"], "WELLKNOWN:ANONYMOUS")
+    // Name type **11**, `KRB_NT_WELLKNOWN` (RFC 6111), not 1: a client reads an anonymous
+    // name by its type, and the components under any other type are a different name. This
+    // went unnoticed because `Principal`'s identity is (components, realm) and the type is
+    // decoration — every comparison inside this crate passed while the wire carried the
+    // wrong number.
+    crate::name::Principal::new(
+        crate::name::NT_WELLKNOWN,
+        ["WELLKNOWN", "ANONYMOUS"],
+        "WELLKNOWN:ANONYMOUS",
+    )
 }
 
 /// `PA-FX-COOKIE`: the stateless pre-authentication state a KDC hands back.

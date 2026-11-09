@@ -72,6 +72,17 @@ pub fn usable_enctypes(
         .collect()
 }
 
+/// Whether the request names the well-known anonymous principal (RFC 6111, RFC 8062 §3).
+///
+/// The identity is the name type and the components: `WELLKNOWN/ANONYMOUS` under any other
+/// type is a different principal, which is why the type is checked rather than the spelling.
+fn is_anonymous(name: &Principal) -> bool {
+    name.name_type == crate::name::NT_WELLKNOWN
+        && name.components.len() == 2
+        && name.components[0] == "WELLKNOWN"
+        && name.components[1] == "ANONYMOUS"
+}
+
 /// Resolves an `NT-ENTERPRISE` client name to the principal it names (RFC 6806 §6).
 ///
 /// A name that is not enterprise passes through untouched — the option permits a rename, it
@@ -507,6 +518,31 @@ impl Kdc {
         // reply carries that canonical name — which is only legal because the client asked
         // for it with `canonicalize`.
         let cname = canonical_client_name(&cname, body.kdc_options, config.realm())?;
+
+        // RFC 8062 §4.1: an anonymous client is answered before the directory is
+        // consulted. There is no account behind `WELLKNOWN/ANONYMOUS`, and inventing one
+        // would defeat the mode: the whole point is that the KDC learns nothing about who
+        // asked, which it cannot do while looking the asker up.
+        if is_anonymous(&cname) {
+            // PKINIT is what makes an anonymous ticket possible at all: without a KDC key
+            // pair there is nothing to derive a reply key from (RFC 8062 §4.1). A build
+            // without the feature therefore refuses the name, rather than answering as
+            // though the anonymous path did not exist.
+            #[cfg(feature = "pkinit")]
+            {
+                return self.answer_anonymous_as(body, padata, now, raw, body_der, &cname);
+            }
+            #[cfg(not(feature = "pkinit"))]
+            {
+                let _ = (padata, raw, body_der);
+                return Err(Error::Kdc {
+                    code: codes::KDC_ERR_NULL_KEY,
+                    text: "anonymous PKINIT is not compiled into this build: the `pkinit` \
+                           feature carries the certificate handling it needs"
+                        .into(),
+                });
+            }
+        }
         let client = self
             .hdb()
             .fetch(&cname)?
@@ -937,6 +973,201 @@ impl Kdc {
             });
         }
         Ok(key.key.clone())
+    }
+
+    /// Answers an anonymous `AS-REQ` (RFC 8062 §4.1).
+    ///
+    /// Kept apart from the password path on purpose: an anonymous login has no account, no
+    /// long-term key, no `etype-info`, no PAC and no pre-authentication list, so threading it
+    /// through the ordinary flow would fill that flow with branches about a case it is not.
+    #[cfg(feature = "pkinit")]
+    fn answer_anonymous_as(
+        &self,
+        body: &KdcReqBody,
+        padata: &[(i32, Vec<u8>)],
+        now: i64,
+        raw: &[u8],
+        body_der: &[u8],
+        cname: &Principal,
+    ) -> Result<Vec<u8>> {
+        let config = self.config();
+        let anonymous = super::fast::anonymous_principal();
+
+        // §4.1: "If the client in the AS request is anonymous, the anonymous KDC option MUST
+        // be set"; without it the refusal is a named code, not a guess at intent.
+        if body.kdc_options & crate::msg::kdc_options::ANONYMOUS == 0 {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_BADOPTION,
+                text: "the anonymous principal needs the `anonymous` kdc-option (RFC 8062 \
+                       §4.1); without it this is a request to log in as a name that exists \
+                       nowhere"
+                    .into(),
+            });
+        }
+
+        // An anonymous ticket is an opening into the realm. A realm that did not open it
+        // says so, with its own code rather than a failure the client would retry.
+        if !config.anonymous_pkinit() {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_POLICY,
+                text: "anonymous PKINIT is not enabled for this realm; an anonymous ticket \
+                       is issued only where an administrator asked for one"
+                    .into(),
+            });
+        }
+
+        let Some(state) = self.pkinit() else {
+            // RFC 8062 §4.1: with no key to encrypt the reply the KDC returns NULL_KEY.
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_NULL_KEY,
+                text: "anonymous PKINIT needs a KDC certificate, and this KDC has none \
+                       configured"
+                    .into(),
+            });
+        };
+
+        let value =
+            padata_value(padata, super::pkinit::PA_PK_AS_REQ).ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_PREAUTH_FAILED,
+                text: "anonymous PKINIT carries an unsigned PA-PK-AS-REQ (RFC 8062 §4.1); \
+                   without one there is nothing to derive a reply key from"
+                    .into(),
+            })?;
+
+        // The reply key's enctype comes from what the client asked for and this realm
+        // allows — there is no entry whose keys could answer the question instead.
+        let enctype = config
+            .allowed_enctypes()
+            .iter()
+            .copied()
+            .find(|e| body.etypes.contains(&e.id()))
+            .ok_or_else(|| Error::UnsupportedEnctype(body.etypes.first().copied().unwrap_or(0)))?;
+
+        let server = Principal::krbtgt(config.realm());
+        let entry = self
+            .hdb()
+            .fetch(&server)?
+            .ok_or_else(|| Error::Hdb("the krbtgt entry is missing from the database".into()))?;
+        let server_key = usable_enctypes(config, &body.etypes, &entry, Purpose::Ticket)
+            .into_iter()
+            .find_map(|e| entry.key_for(e))
+            .ok_or_else(|| {
+                Error::Hdb("the krbtgt entry has no key for any usable enctype".into())
+            })?;
+
+        // The private exponent comes from the same source as every other secret here. A
+        // broken RNG must fail loudly rather than produce a predictable key.
+        let entropy = self.cipher().random(Enctype::Aes256Sha1)?.bytes().to_vec();
+        let answer = super::pkinit::reply::answer_anonymous(
+            state,
+            value,
+            body_der,
+            raw,
+            cname,
+            &server,
+            enctype,
+            &|n| entropy.iter().copied().cycle().take(n).collect(),
+        )
+        .map_err(|e| match e {
+            super::pkinit::PkinitError::Unsupported(ref why) => Error::Kdc {
+                code: if why.contains("public value") {
+                    codes::KDC_ERR_PUBLIC_KEY_ENCRYPTION_NOT_SUPPORTED
+                } else {
+                    codes::KDC_ERR_PREAUTH_FAILED
+                },
+                text: format!("anonymous PKINIT: {e}"),
+            },
+            other => Error::Kdc {
+                code: codes::KDC_ERR_PREAUTH_FAILED,
+                text: format!("anonymous PKINIT: {other}"),
+            },
+        })?;
+        let session_key = answer.session_key.clone().ok_or_else(|| Error::Kdc {
+            code: codes::KDC_ERR_PREAUTH_FAILED,
+            text: "anonymous PKINIT produced no session key".into(),
+        })?;
+
+        // Short-lived by policy: this ticket proves "somebody" and is meant to be replaced
+        // by a real one as soon as the client can obtain it. It never outlives what the
+        // client asked for.
+        let endtime = body.till.min(now + 3600);
+        if endtime <= now {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_NEVER_VALID,
+                text: "the requested lifetime ends before it starts".into(),
+            });
+        }
+        let flags = tkt_flags::INITIAL | tkt_flags::PRE_AUTHENT | tkt_flags::ANONYMOUS;
+
+        let ticket_part = EncTicketPart {
+            flags,
+            session_key: session_key.clone(),
+            // §4.1: the reply's client realm is the anonymous realm, and the ticket's
+            // client must match the reply's — a ticket and a reply that disagree are
+            // unusable by any client.
+            crealm: anonymous.realm.clone(),
+            cname: anonymous.clone(),
+            transited_type: 0,
+            transited: Vec::new(),
+            authtime: now,
+            starttime: None,
+            endtime,
+            renew_till: None,
+            caddr: body.addresses.clone(),
+            // §4.1: no authorization data. A PAC here would name the account, which is the
+            // one thing an anonymous ticket must not carry.
+            authorization_data: None,
+        };
+        let ticket = Ticket {
+            realm: config.realm().to_owned(),
+            sname: server.clone(),
+            enc: EncryptedData::seal(
+                self.cipher(),
+                &server_key.key,
+                usage::KDC_REP_TICKET,
+                Some(server_key.kvno),
+                &ticket_part.encode(),
+            )?,
+        };
+
+        let rep_part = EncKdcRepPart {
+            session_key,
+            last_req: vec![(0, 0)],
+            nonce: body.nonce,
+            key_expiration: None,
+            flags,
+            authtime: now,
+            starttime: None,
+            endtime,
+            renew_till: None,
+            srealm: server.realm.clone(),
+            sname: server.clone(),
+            caddr: body.addresses.clone(),
+        };
+        let enc_part = EncryptedData::seal(
+            self.cipher(),
+            &answer.reply_key,
+            usage::AS_REP_ENCPART,
+            None,
+            &rep_part.encode(crate::msg::ENC_AS_REP_PART),
+        )?;
+
+        let mut padata_out = vec![(super::pkinit::PA_PK_AS_REP, answer.pa_pk_as_rep.clone())];
+        if let Some(kx) = &answer.pa_pkinit_kx {
+            // §7: the KDC's contribution to the session key. Without it the client cannot
+            // recompute the key and — correctly — refuses the reply.
+            padata_out.push((super::pkinit::PA_PKINIT_KX, kx.clone()));
+        }
+
+        Ok(KdcRep {
+            msg_type: AS_REP,
+            padata: padata_out,
+            crealm: anonymous.realm.clone(),
+            cname: anonymous,
+            ticket,
+            enc_part,
+        }
+        .encode())
     }
 }
 

@@ -33,6 +33,8 @@ pub struct KdcConfig {
     clockskew: i64,
     /// Heimdal's `require-preauth`: refuse an AS-REQ with no pre-authentication.
     require_preauth: bool,
+    /// Whether this realm issues anonymous tickets (RFC 8062).
+    anonymous_pkinit: bool,
     /// Heimdal's `allowed_enctypes`, strongest first. The order is this KDC's
     /// preference, and it is what the session key's enctype is chosen from.
     allowed_enctypes: Vec<Enctype>,
@@ -64,6 +66,9 @@ impl KdcConfig {
             max_renewable_life: DEFAULT_MAX_RENEWABLE_LIFE,
             clockskew: DEFAULT_CLOCKSKEW,
             require_preauth: true,
+            // Off by default: an anonymous ticket is an opening into the realm, and an
+            // opening nobody configured is a surprise rather than a convenience.
+            anonymous_pkinit: false,
             allowed_enctypes: Enctype::ALL.to_vec(),
             addresses: crate::address::AddressPolicy::default(),
         })
@@ -92,6 +97,17 @@ impl KdcConfig {
     /// `require-preauth`.
     pub fn require_preauth(&self) -> bool {
         self.require_preauth
+    }
+
+    /// Whether anonymous PKINIT is offered (RFC 8062).
+    pub fn anonymous_pkinit(&self) -> bool {
+        self.anonymous_pkinit
+    }
+
+    /// Enables or disables anonymous PKINIT.
+    pub fn with_anonymous_pkinit(mut self, yes: bool) -> Self {
+        self.anonymous_pkinit = yes;
+        self
     }
 
     /// `allowed_enctypes`, strongest first.

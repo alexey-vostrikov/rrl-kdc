@@ -26,6 +26,12 @@ pub const NT_PRINCIPAL: i32 = 1;
 pub const NT_SRV_INST: i32 = 2;
 /// `KRB5_NT_SRV_HST` — a service named by host.
 pub const NT_SRV_HST: i32 = 3;
+/// `KRB5_NT_WELLKNOWN` (RFC 6111): the name type of a well-known principal.
+///
+/// `WELLKNOWN/ANONYMOUS` carries it, and a client that receives an anonymous ticket reads
+/// the name by this type: the same components under another type are a different name.
+pub const NT_WELLKNOWN: i32 = 11;
+
 /// `KRB5_NT_ENTERPRISE` (RFC 6806 §6): one component, `user@realm`.
 ///
 /// A client that knows only a UPN sends this form, and resolving it means answering with a

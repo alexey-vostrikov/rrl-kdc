@@ -49,6 +49,15 @@ pub mod dh;
 #[cfg(feature = "pkinit")]
 pub mod reply;
 
+/// `PA-PKINIT-KX` (RFC 8062 §7): the KDC's contribution to an anonymous session key.
+pub const PA_PKINIT_KX: i32 = 147;
+
+/// The key usage of that contribution (RFC 8062 §7).
+pub const KU_PA_PKINIT_KX: u32 = 44;
+
+/// Re-exported so that the anonymous path and its tests name one principal, not two.
+pub use super::fast::anonymous_principal as fast_anonymous_principal;
+
 /// `PA-PK-AS-REQ`, RFC 4556 §3.2.1.
 pub const PA_PK_AS_REQ: i32 = 16;
 /// `PA-PK-AS-REP`, RFC 4556 §3.2.3.

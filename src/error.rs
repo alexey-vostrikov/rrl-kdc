@@ -157,6 +157,12 @@ pub mod codes {
     pub const KDC_ERR_RESPONSE_TOO_BIG: i32 = 52;
     /// The realm in the request is not one this KDC serves.
     pub const KDC_ERR_WRONG_REALM: i32 = 68;
+    /// RFC 4120 §7.5.9: the KDC has no key to encrypt the reply with. Anonymous PKINIT
+    /// says this when the realm has no KDC certificate (RFC 8062 §4.1).
+    pub const KDC_ERR_NULL_KEY: i32 = 21;
+    /// RFC 4556 §3.2.1: a PKINIT client asked for key transport where the exchange needs
+    /// Diffie-Hellman (which is also the anonymous case, where it has no key pair at all).
+    pub const KDC_ERR_PUBLIC_KEY_ENCRYPTION_NOT_SUPPORTED: i32 = 81;
     /// RFC 6113 §5.4.4.2: a `fast-options` bit this KDC does not implement, set by the
     /// client. Bits 1 through 15 are critical, so an unknown one must fail the request
     /// rather than be ignored — the client asked for something it will not get.

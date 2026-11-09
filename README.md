@@ -52,6 +52,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `kdc::names` — RFC 6806 §6 enterprise names | done: `NT-ENTERPRISE` client names resolve to the principal they name when the request sets `canonicalize`, and are refused when it does not |
 | `kdc::fast` — RFC 6113 FAST | done: armored AS exchange, the implicit armor of a TGS request, `hide-client-names`, `PA-ENCRYPTED-CHALLENGE` instead of a plain timestamp inside the armor, and the reply key strengthened by a secret that travels only in the armor |
 | `kdc::pkinit` — RFC 4556 certificate login | done for finite-field Diffie-Hellman: CMS verification and signing, the chain to a configured anchor, `id-pkinit-san` for the principal, `PA-PK-AS-REQ` → `PA-PK-AS-REP`, reply key per RFC 8636. Judged by `openssl cms -verify` and by a wiring test that derives the key the client would |
+| `kdc::pkinit::anonymous` — RFC 8062 anonymous PKINIT | done: an unsigned `PA-PK-AS-REQ`, `WELLKNOWN/ANONYMOUS` in `WELLKNOWN:ANONYMOUS` with name type 11 and the anonymous flag, no authorization data, and the session key taken from `cf2` over the KDC's contribution in `PA-PKINIT-KX` so neither side picks it alone. Off unless a realm enables it; a build without the `pkinit` feature answers `KDC_ERR_NULL_KEY` |
 
 ### Managing a realm without inventing an API
 

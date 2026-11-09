@@ -294,6 +294,14 @@ pub struct Answer {
     pub pa_pk_as_rep: Vec<u8>,
     /// The client's DH public value, for a log line — not for a decision.
     pub client_group_bits: u32,
+    /// `PA-PKINIT-KX`, when the exchange was anonymous: the KDC's contribution to the
+    /// session key, encrypted in the reply key.
+    pub pa_pkinit_kx: Option<Vec<u8>>,
+    /// The session key, when the exchange dictates it rather than the KDC choosing one.
+    ///
+    /// Anonymous PKINIT does: RFC 8062 §7 derives it from both contributions, so that a KDC
+    /// or a relay cannot pick a key the client does not know.
+    pub session_key: Option<crate::crypto::Key>,
 }
 
 /// Runs the KDC's half of PKINIT over a `PA-PK-AS-REQ`.
@@ -380,6 +388,121 @@ pub fn answer(
         reply_key,
         pa_pk_as_rep,
         client_group_bits: group.bits(),
+        pa_pkinit_kx: None,
+        session_key: None,
+    })
+}
+
+/// Runs the KDC's half of **anonymous** PKINIT over an unsigned `PA-PK-AS-REQ`.
+///
+/// RFC 8062 §4.1: the client has no certificate and no key pair, so there is nothing to
+/// authenticate and everything else still applies — the domain parameters are checked, the
+/// exchange must be Diffie-Hellman, and the reply is signed by the KDC so the client can tell
+/// a real KDC from a relay.
+///
+/// Two things differ from the authenticated path, and both are in the return value: the
+/// session key is derived from **both** contributions (§7), and the KDC's half travels in
+/// `PA-PKINIT-KX` so the client can recompute it.
+#[allow(clippy::too_many_arguments)]
+pub fn answer_anonymous(
+    state: &State,
+    pa_value: &[u8],
+    body_der: &[u8],
+    as_req_der: &[u8],
+    client: &Principal,
+    server: &Principal,
+    enctype: Enctype,
+    rng: &dyn Fn(usize) -> Vec<u8>,
+) -> Result<Answer, PkinitError> {
+    // No timestamp is consulted here: RFC 8062 §4.1 authenticates nobody, so there is no
+    // validity window to judge — the ticket's lifetime is the KDC's policy, not the client's
+    // claim.
+    let request = super::Request::decode(pa_value)?;
+    if request.signed.is_some() {
+        // A signed request in the anonymous mode is a client that cannot make up its mind:
+        // it proved an identity and asked to hide it in the same message. Answering would
+        // mean choosing which half of the request to believe.
+        return Err(PkinitError::Malformed(
+            "a request with the anonymous option carries a signature: anonymous PKINIT is \
+             the unsigned form (RFC 8062 §4.1), and the two do not combine"
+                .into(),
+        ));
+    }
+    let pack = request.auth_pack()?;
+    super::check_body(&pack, body_der)?;
+
+    let value = pack.client_public_value.as_deref().ok_or_else(|| {
+        PkinitError::Unsupported(
+            "anonymous PKINIT needs a Diffie-Hellman public value: the client has no key \
+             pair, so key transport has nothing to encrypt to (RFC 8062 §4.1)"
+                .into(),
+        )
+    })?;
+    let (group, peer) = parse_client_public_value(value)?;
+
+    let ours = super::dh::KeyPair::generate(group, rng)?;
+    let z = ours.agree(&peer)?;
+
+    let kdf = match pack.supported_kdfs.is_empty() {
+        true => None,
+        false => Some(choose_kdf(&pack.supported_kdfs).ok_or_else(|| {
+            PkinitError::Unsupported(format!(
+                "the client offers KDFs this KDC does not implement: {:?}",
+                pack.supported_kdfs
+            ))
+        })?),
+    };
+
+    let info = kdcdh_key_info(&ours.public_bytes(), pack.pk_authenticator.nonce);
+    // Signed by the KDC even though the request was not signed by anybody: the client has to
+    // be able to tell a real KDC from a relay, and this signature is the only thing that says
+    // so. §4.1 allows an unsigned reply from a KDC with no key pair; this one has one and
+    // uses it.
+    let signed = state
+        .identity
+        .signed_data(super::ID_PKINIT_DH_KEY_DATA, &info)?;
+    let pa_pk_as_rep = dh_rep_info(signed.clone());
+
+    let key_bytes = reply_key(&z, kdf, client, server, enctype, as_req_der, &pa_pk_as_rep)?;
+    let reply_key = crate::crypto::Key::new(enctype, key_bytes)
+        .map_err(|e| PkinitError::Malformed(format!("the reply key: {e}")))?;
+
+    // §7: the KDC's contribution is a fresh key, sent encrypted in the reply key, and the
+    // session key is `cf2(contribution, "PKINIT", reply key, "KEYEXCHANGE")`. A KDC that
+    // chose the session key by itself would make "anonymous" also mean "trusts the KDC to
+    // have chosen well" — and a relay that substituted its own reply could do the same.
+    let cipher = crate::crypto::OwnCipher;
+    use crate::crypto::Cipher;
+    let contribution = cipher
+        .random(enctype)
+        .map_err(|e| PkinitError::Malformed(format!("the KDC's contribution: {e}")))?;
+    let session = crate::crypto::kdf::cf2(
+        contribution.bytes(),
+        "PKINIT",
+        reply_key.enctype(),
+        reply_key.bytes(),
+        "KEYEXCHANGE",
+    )
+    .map_err(|e| PkinitError::Malformed(format!("the anonymous session key: {e}")))?;
+    let session_key = crate::crypto::Key::new(enctype, session)
+        .map_err(|e| PkinitError::Malformed(format!("the session key: {e}")))?;
+
+    let pa_pkinit_kx = crate::msg::EncryptedData::seal(
+        &cipher,
+        &reply_key,
+        super::KU_PA_PKINIT_KX,
+        None,
+        &crate::msg::encode_key(&contribution),
+    )
+    .map_err(|e| PkinitError::Malformed(format!("PA-PKINIT-KX: {e}")))?
+    .encode();
+
+    Ok(Answer {
+        reply_key,
+        pa_pk_as_rep,
+        client_group_bits: group.bits(),
+        pa_pkinit_kx: Some(pa_pkinit_kx),
+        session_key: Some(session_key),
     })
 }
 

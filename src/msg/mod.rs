@@ -82,6 +82,10 @@ pub mod tkt_flags {
     pub const TRANSITED_POLICY_CHECKED: u32 = 0x0008_0000;
     /// `ok-as-delegate`.
     pub const OK_AS_DELEGATE: u32 = 0x0004_0000;
+    /// `anonymous` (RFC 8062 §3, bit 16): this ticket names nobody on purpose.
+    ///
+    /// Bit 16 in `KerberosFlags` numbering is `1 << (31 - 16)`.
+    pub const ANONYMOUS: u32 = 0x0000_8000;
 }
 
 /// `KDCOptions` masks (RFC 4120 §5.4.1), in DER bit order.
@@ -107,6 +111,8 @@ pub mod kdc_options {
     pub const RENEW: u32 = 0x0000_0002;
     /// `validate` (bit 31): clear a postdated ticket's `INVALID` flag.
     pub const VALIDATE: u32 = 0x0000_0001;
+    /// `anonymous` (RFC 8062 §3, bit 16): ask for a ticket that names nobody.
+    pub const ANONYMOUS: u32 = 0x0000_8000;
     /// `canonicalize` (RFC 6806 §3).
     pub const CANONICALIZE: u32 = 0x0000_0020;
 }

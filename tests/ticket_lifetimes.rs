@@ -299,3 +299,160 @@ fn an_as_request_with_a_till_of_zero_gets_the_configured_lifetime() {
     let rep = as_rep_part(&reply, &key);
     assert_eq!(rep.endtime, NOW + max_life());
 }
+#[test]
+fn a_service_ticket_inherits_its_flags_from_the_tgt_not_from_the_request() {
+    // RFC 4120 §3.3.3: a client cannot grant itself a forwardable ticket from a TGT that is not
+    // forwardable. The mirror rule matters as much — a client that asks for nothing still gets
+    // `forwardable` when its TGT has it, because every real client relies on that and a KDC
+    // that ignored the TGT would issue tickets nobody can delegate.
+    //
+    // Four cases, because the guard has two conditions on each flag: one side alone must not be
+    // enough, and both sides together must be.
+    let cipher = OwnCipher;
+    for (tgt_forwardable, asked_forwardable, expect) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+    ] {
+        let (kdc, krbtgt_key, _) = kdc(NOW + 7200);
+        let (ticket, session) = tgt_with_flags(
+            &krbtgt_key,
+            NOW + 7200,
+            if tgt_forwardable {
+                tkt_flags::FORWARDABLE
+            } else {
+                0
+            },
+        );
+        let options = if asked_forwardable {
+            kdc_options::FORWARDABLE
+        } else {
+            0
+        };
+        let reply = kdc.handle(
+            &tgs_req_with_options(&ticket, &session, NOW + 3600, options),
+            NOW,
+        );
+        assert!(
+            msg::KrbError::decode(&reply).is_err(),
+            "tgt={tgt_forwardable} asked={asked_forwardable}: {:?}",
+            msg::KrbError::decode(&reply)
+        );
+        let rep = rep_part(&reply, &session);
+        assert_eq!(
+            rep.flags & tkt_flags::FORWARDABLE != 0,
+            expect,
+            "tgt={tgt_forwardable} asked={asked_forwardable}: the TGT decides, and both must \
+             agree before the flag is granted: {:#010x}",
+            rep.flags
+        );
+        let _ = cipher;
+    }
+}
+
+#[test]
+fn pre_authentication_carries_over_from_the_tgt() {
+    // `pre-authent` on a service ticket says the user proved something to the KDC. A ticket
+    // without it is one a service may refuse; a ticket with it that the TGT did not earn would
+    // be a lie about how the user authenticated.
+    let (kdc, krbtgt_key, _) = kdc(NOW + 7200);
+
+    let (ticket, session) = tgt_with_flags(&krbtgt_key, NOW + 7200, tkt_flags::PRE_AUTHENT);
+    let reply = kdc.handle(&tgs_req(&ticket, &session, NOW + 3600), NOW);
+    assert!(msg::KrbError::decode(&reply).is_err());
+    assert!(
+        rep_part(&reply, &session).flags & tkt_flags::PRE_AUTHENT != 0,
+        "a ticket from a pre-authenticated TGT is pre-authenticated"
+    );
+
+    let (ticket, session) = tgt_with_flags(&krbtgt_key, NOW + 7200, 0);
+    let reply = kdc.handle(&tgs_req(&ticket, &session, NOW + 3600), NOW);
+    assert!(msg::KrbError::decode(&reply).is_err());
+    assert_eq!(
+        rep_part(&reply, &session).flags & tkt_flags::PRE_AUTHENT,
+        0,
+        "and one from a TGT that never proved anything is not"
+    );
+}
+
+/// A TGT for `alice` carrying exactly `extra` on top of `INITIAL`.
+fn tgt_with_flags(krbtgt_key: &Key, endtime: i64, extra: u32) -> (Vec<u8>, Key) {
+    let cipher = OwnCipher;
+    let session_key = cipher.random(Enctype::Aes256Sha1).unwrap();
+    let part = EncTicketPart {
+        flags: tkt_flags::INITIAL | extra,
+        session_key: session_key.clone(),
+        crealm: REALM.into(),
+        cname: alice(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: NOW - 60,
+        starttime: None,
+        endtime,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let ticket = Ticket {
+        realm: REALM.into(),
+        sname: Principal::krbtgt(REALM),
+        enc: EncryptedData::seal(
+            &cipher,
+            krbtgt_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
+    };
+    (ticket.encode(), session_key)
+}
+
+/// A `TGS-REQ` asking for `options`, with a real `till`.
+fn tgs_req_with_options(ticket: &[u8], session_key: &Key, till: i64, options: u32) -> Vec<u8> {
+    let cipher = OwnCipher;
+    let body = der::seq(&[
+        der::field(0, der::flags32(options)),
+        der::field(2, der::general_string(REALM)),
+        der::field(3, service().encode_name()),
+        der::field(5, der::time(till)),
+        der::field(7, der::int(0x4242)),
+        der::field(8, der::seq(&[der::int(18)])),
+    ]);
+    let cksum = cipher
+        .checksum(session_key, usage::TGS_REQ_AUTH_CKSUM, &body)
+        .unwrap();
+    let authenticator = Authenticator {
+        crealm: REALM.into(),
+        cname: alice(),
+        cksum: Some((Enctype::Aes256Sha1.checksum_type(), cksum)),
+        cusec: 0,
+        ctime: NOW,
+        subkey: None,
+        seq_number: None,
+        authorization_data: None,
+    };
+    let ap_req = ApReq {
+        ap_options: 0,
+        ticket: ticket.to_vec(),
+        authenticator: EncryptedData::seal(
+            &cipher,
+            session_key,
+            usage::TGS_REQ_AUTH,
+            None,
+            &authenticator.encode(),
+        )
+        .unwrap(),
+    }
+    .encode();
+    der::cons(
+        der::app(12),
+        &[der::seq(&[
+            der::field(1, der::int(5)),
+            der::field(2, der::int(12)),
+            der::field(3, encode_pa_data(&[(msg::PA_TGS_REQ, ap_req)])),
+            der::field(4, body),
+        ])],
+    )
+}

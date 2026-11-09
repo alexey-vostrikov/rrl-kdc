@@ -19,6 +19,8 @@ use rust_kdc::transport::RunningKdc;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
+/// The service a ticket is asked for, which is what Samba does right after its AS exchange.
+const SERVICE: &str = "cifs/files.example.com";
 
 fn realm() -> Arc<dyn Hdb> {
     let cipher = OwnCipher;
@@ -31,6 +33,14 @@ fn realm() -> Arc<dyn Hdb> {
             .unwrap();
     }
     db.insert(krbtgt).unwrap();
+
+    let mut service = HdbEntry::service(Principal::parse(&format!("{SERVICE}@{REALM}")).unwrap());
+    for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
+        service
+            .add_password_key(&cipher, e, b"service-key", 1)
+            .unwrap();
+    }
+    db.insert(service).unwrap();
 
     let mut alice = HdbEntry::user(Principal::parse(&format!("alice@{REALM}")).unwrap());
     for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
@@ -95,5 +105,38 @@ fn fast_does_not_turn_a_wrong_password_into_a_right_one() {
             .login_with_password(&alice(), "not the password")
             .is_err(),
         "a wrong password was accepted inside FAST"
+    );
+}
+
+#[test]
+fn an_armored_tgs_request_gets_an_armored_reply() {
+    // RRL-2.21. After the AS exchange a service or a joining machine armors its *TGS* request
+    // with the TGT it just received — the implicit armor of RFC 6113 §5.4.2.6, whose key comes
+    // from the `PA-TGS-REQ` subkey. A reply that does not come back inside the armor makes a
+    // third-party client report "FAST fast response is missing FX-FAST" and gives up, which is
+    // what the ad-join stand saw.
+    //
+    // This is the half no unit test can prove: the request and the reply are built and read by
+    // somebody else's code.
+    let stand = start();
+    let plain = krb5::KdcClient::new(REALM, [stand.addr().as_str()]);
+    let tgt = plain
+        .login_with_password(&alice(), PASSWORD)
+        .unwrap_or_else(|e| panic!("the unarmored login failed: {e}"));
+
+    let armored = krb5::KdcClient::new(REALM, [stand.addr().as_str()]).with_fast_armor(tgt.clone());
+    let service = krb5::Principal::parse(&format!("{SERVICE}@{REALM}")).unwrap();
+    let creds = armored
+        .service_ticket(&tgt, &service)
+        .unwrap_or_else(|e| panic!("an armored TGS request was refused: {e}"));
+
+    assert_eq!(
+        creds.server.to_string(),
+        format!("{SERVICE}@{REALM}"),
+        "the ticket must name the service that was asked for"
+    );
+    assert!(
+        !creds.ticket.is_empty(),
+        "and carry an encrypted part the service could open"
     );
 }

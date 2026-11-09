@@ -27,6 +27,7 @@ pub mod config;
 mod as_exchange;
 mod tgs_exchange;
 
+pub mod fast;
 /// The change-password service (RFC 3244): protocol constants, the reply a
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
 pub mod kpasswd;

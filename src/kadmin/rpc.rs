@@ -168,6 +168,16 @@ pub fn denied(xid: u32, auth_stat: u32) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// Whether accepting this fragment would put the record over `MAX_RECORD`.
+///
+/// Two questions, and both matter: one fragment larger than the limit, and the fragments so far
+/// plus this one larger than it. The second is the one a reader forgets — a client is free to
+/// send a hundred thousand small fragments, and a guard that only looks at each fragment in
+/// isolation lets the message grow without bound. `have` is what has been reassembled already.
+fn record_too_large(len: usize, have: usize) -> bool {
+    len > MAX_RECORD || have + len > MAX_RECORD
+}
+
 /// Reads one record, reassembling its fragments.
 pub fn read_record(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut message = Vec::new();
@@ -177,7 +187,7 @@ pub fn read_record(stream: &mut TcpStream) -> Result<Vec<u8>> {
         let word = u32::from_be_bytes(marker);
         let last = word & 0x8000_0000 != 0;
         let len = (word & 0x7fff_ffff) as usize;
-        if len > MAX_RECORD || message.len() + len > MAX_RECORD {
+        if record_too_large(len, message.len()) {
             return Err(Error::Protocol(format!(
                 "RPC: a record of {len} octets is larger than this server accepts"
             )));
@@ -242,8 +252,8 @@ pub fn serve_connection(mut stream: TcpStream, kadmin: &Kadmin, now: i64) {
             continue;
         };
 
-        match credential.procedure {
-            RPCSEC_GSS_INIT => match serve_init(&call, kadmin, now, &handle) {
+        match procedure_of(credential) {
+            Procedure::Init => match serve_init(&call, kadmin, now, &handle) {
                 Ok(InitOutcome::Accepted {
                     actor,
                     accepted: accepted_context,
@@ -261,11 +271,11 @@ pub fn serve_connection(mut stream: TcpStream, kadmin: &Kadmin, now: i64) {
                     let _ = write_record(&mut stream, &denied(call.xid, stat));
                 }
             },
-            RPCSEC_GSS_DESTROY => {
+            Procedure::Destroy => {
                 let _ = write_record(&mut stream, &accepted(call.xid, AUTH_NONE, &[], &[]));
                 context = None;
             }
-            RPCSEC_GSS_DATA => {
+            Procedure::Data => {
                 let served = serve_data(
                     &message,
                     &call,
@@ -284,10 +294,32 @@ pub fn serve_connection(mut stream: TcpStream, kadmin: &Kadmin, now: i64) {
                     }
                 }
             }
-            _ => {
+            Procedure::Unknown => {
                 let _ = write_record(&mut stream, &denied(call.xid, 13));
             }
         }
+    }
+}
+
+/// The procedure of a credential, as a value.
+///
+/// A `match` on the raw number inside the loop makes each arm a place a mutant can delete
+/// unnoticed, because only a live connection reaches those arms. Naming the four cases makes the
+/// mapping testable on its own — including `Unknown`, which is what an unassigned number is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Procedure {
+    Init,
+    Data,
+    Destroy,
+    Unknown,
+}
+
+fn procedure_of(credential: &GssCredential) -> Procedure {
+    match credential.procedure {
+        RPCSEC_GSS_INIT => Procedure::Init,
+        RPCSEC_GSS_DATA => Procedure::Data,
+        RPCSEC_GSS_DESTROY => Procedure::Destroy,
+        _ => Procedure::Unknown,
     }
 }
 
@@ -539,6 +571,58 @@ mod tests {
         let mut r = Reader::new(&body);
         assert_eq!(r.opaque().unwrap(), b"sealed");
         assert!(r.is_empty(), "no padding around the opaque");
+    }
+
+    #[test]
+    fn a_record_is_refused_at_the_limit_and_beyond_it() {
+        // Four cases, because the guard has two conditions and a boundary. A single "very large"
+        // case is true under `||` and `&&` alike, and true under `>` and `>=`, so it proves
+        // nothing: the fragment limit and the cumulative limit have to be told apart.
+        assert!(!record_too_large(MAX_RECORD, 0), "exactly the limit fits");
+        assert!(!record_too_large(MAX_RECORD - 1, 0));
+        assert!(record_too_large(MAX_RECORD + 1, 0), "one over the limit");
+
+        // The cumulative condition: each fragment is small, and together they are not.
+        assert!(
+            !record_too_large(1, MAX_RECORD - 1),
+            "one short of the limit"
+        );
+        assert!(record_too_large(2, MAX_RECORD - 1), "crossing it");
+        assert!(record_too_large(1, MAX_RECORD), "already at the limit");
+    }
+
+    #[test]
+    fn every_assigned_procedure_has_a_name_and_everything_else_is_unknown() {
+        let mut credential = GssCredential {
+            version: RPCSEC_GSS_VERSION,
+            procedure: RPCSEC_GSS_INIT,
+            seq: 0,
+            service: RPCSEC_GSS_SVC_PRIVACY,
+            handle: Vec::new(),
+        };
+        assert_eq!(procedure_of(&credential), Procedure::Init);
+        credential.procedure = RPCSEC_GSS_DATA;
+        assert_eq!(procedure_of(&credential), Procedure::Data);
+        credential.procedure = RPCSEC_GSS_DESTROY;
+        assert_eq!(
+            procedure_of(&credential),
+            Procedure::Destroy,
+            "DESTROY ends the context; reading it as DATA would leave it alive"
+        );
+        // 2 is the one number RFC 2203 leaves unassigned between DATA and DESTROY.
+        credential.procedure = 2;
+        assert_eq!(procedure_of(&credential), Procedure::Unknown);
+        credential.procedure = 99;
+        assert_eq!(procedure_of(&credential), Procedure::Unknown);
+    }
+
+    #[test]
+    fn a_mic_that_does_not_verify_is_an_authentication_error_not_a_context_one() {
+        // 13 is RPCSEC_GSS_CREDPROBLEM, 14 is CTXPROBLEM. A MIC that fails says the sender is
+        // not who the credential claims, so 13: an operator reading the log looks at
+        // credentials, and a client shows "authentication failed" rather than a broken context.
+        let stat = refuse_mic(Error::Protocol("the MIC does not verify".into()));
+        assert_eq!(stat, 13);
     }
 
     #[test]

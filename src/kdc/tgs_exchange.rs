@@ -51,6 +51,61 @@ struct Proven {
     subkey: Option<Key>,
 }
 
+/// The extra ticket flags `forwarded` and `proxy` ask for (RFC 4120 §3.3.3), or a refusal.
+///
+/// Neither is a permission: `forwardable` and `proxiable` in the TGT permit a *future*
+/// delegation, and these two ask for it now. A TGT issued without the flag is how an
+/// operator says "this credential stays where it is", so the absence is refused rather than
+/// worked around.
+///
+/// `passthrough` — the older name Kerberos uses for what a proxy ticket claims — is a
+/// distinct protocol addition and is not set here; a ticket that claims it without the
+/// address restrictions it implies would be read by a service as a delegated credential.
+fn forwarding_plan(body: &KdcReqBody, tgt: &EncTicketPart, sname: &Principal) -> Result<u32> {
+    let forwarded = body.kdc_options & kdc_options::FORWARDED != 0;
+    let proxy = body.kdc_options & kdc_options::PROXY != 0;
+    if !forwarded && !proxy {
+        return Ok(0);
+    }
+    if forwarded && proxy {
+        return Err(badoption(
+            "a ticket cannot be both forwarded and proxied: the first is used by this \
+             client from another address, the second is handed to somebody else, and a \
+             ticket claiming both tells a service nothing about which it received",
+        ));
+    }
+    if forwarded {
+        if tgt.flags & tkt_flags::FORWARDABLE == 0 {
+            return Err(badoption(
+                "the forwarded option needs a forwardable TGT, and this one is not: the \
+                 realm did not permit this credential to be used from another address",
+            ));
+        }
+        return Ok(tkt_flags::FORWARDED);
+    }
+    // The proxy branch.
+    if tgt.flags & tkt_flags::PROXIABLE == 0 {
+        return Err(badoption(
+            "the proxy option needs a proxiable TGT, and this one is not: the realm did not \
+             permit this credential to be delegated",
+        ));
+    }
+    if sname.is_krbtgt() {
+        // §3.3.3: "The PROXY option will not be honored on requests for additional TGTs."
+        return Err(badoption(
+            "a TGT cannot be proxied: a ticket-granting ticket handed to another party is \
+             that party's own access, not a delegation (RFC 4120 §3.3.3)",
+        ));
+    }
+    if body.addresses.as_ref().is_none_or(|a| a.is_empty()) {
+        return Err(badoption(
+            "a proxy ticket must name the address it is to be used from, or ask for any: \
+             without one there is nothing to check when it is presented",
+        ));
+    }
+    Ok(tkt_flags::PROXY)
+}
+
 /// The ticket's own fields, decided once out of three rules: a service ticket,
 /// a renewal, a validation.
 #[derive(Debug)]
@@ -343,6 +398,10 @@ impl Kdc {
             ));
         }
 
+        // RFC 4120 §3.3.3: `forwarded` and `proxy` are operations, and each is gated by a
+        // flag the TGT must already carry. Both take their addresses from the request.
+        let forwarding = forwarding_plan(body, &proven.tgt, &sname)?;
+
         let plan = if validate {
             validate_plan(&proven.tgt, now)?
         } else if renew {
@@ -364,6 +423,7 @@ impl Kdc {
             endtime,
             renew_till,
         } = plan;
+        let flags = flags | forwarding;
 
         let session_key = self.cipher().random(session_enctype)?;
         // A user-to-user ticket is sealed in the session key of the additional

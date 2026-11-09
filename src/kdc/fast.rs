@@ -398,12 +398,20 @@ pub fn unwrap(
     cipher: &dyn Cipher,
 ) -> Result<FastRequest> {
     if armored.armor.is_none() {
-        // Cookie-only armor is a different bootstrap with its own replay rules; see
-        // the module documentation. Refusing is the honest answer.
+        // In an **AS** request armor is not optional: RFC 6113 §5.4.2.1 defines exactly
+        // one armor type, an `AP-REQ` for a ticket the client already holds, and Heimdal
+        // refuses an `AS-REQ` whose armor field is absent ("AS-REQ armor missing"). A
+        // request without one is a client that has no ticket to armor with, and there is
+        // nothing this KDC can derive an armor key from.
+        //
+        // A `PA-FX-COOKIE` is not an armor type, and the earlier text here said it was.
+        // RFC 6113 §5.4.2.3 defines the cookie as **opaque KDC state** that the client
+        // echoes so a stateless KDC can recognise a conversation; it carries no key and
+        // cannot armor anything. Refusing is still right — only the reason was wrong.
         return Err(Error::Kdc {
             code: crate::error::codes::KDC_ERR_PREAUTH_FAILED,
-            text: "PA-FX-FAST without armor: this KDC implements armoring by ticket, \
-                   not the cookie bootstrap of RFC 6113 §5.4.2.3"
+            text: "PA-FX-FAST without an armor AP-REQ: an AS request must be armored \
+                   with a ticket the client already holds (RFC 6113 §5.4.2.1)"
                 .into(),
         });
     }

@@ -694,9 +694,21 @@ mod tests {
         request.armor = None;
         match unwrap(&request, &key(), &outer, &OwnCipher) {
             Err(Error::Kdc { text, .. }) => {
+                // The refusal has to name the field that is missing and the section that
+                // requires it. It used to say "cookie", which sent the reader looking for
+                // an armor type RFC 6113 does not define — a wrong reason is worse than a
+                // vague one, because it is actionable in the wrong direction.
                 assert!(
-                    text.contains("cookie"),
-                    "the refusal must say what is missing: {text}"
+                    text.contains("armor AP-REQ"),
+                    "the refusal must name what is missing: {text}"
+                );
+                assert!(
+                    text.contains("5.4.2.1"),
+                    "and the section that requires it: {text}"
+                );
+                assert!(
+                    !text.contains("cookie"),
+                    "a cookie is KDC state, not armor: {text}"
                 );
             }
             other => panic!("expected a refusal, got {other:?}"),

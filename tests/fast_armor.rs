@@ -125,12 +125,18 @@ fn armor_ticket() -> (Vec<u8>, Key) {
 
 /// An `AP-REQ` presenting that ticket: the armor value.
 fn armor_ap_req(ticket: &[u8], session: &Key) -> Vec<u8> {
+    armor_ap_req_at(ticket, session, NOW, 0)
+}
+
+/// The same at a chosen `ctime`/`cusec`: the pair is what the replay cache keys on, and
+/// what the clock skew is measured against.
+fn armor_ap_req_at(ticket: &[u8], session: &Key, ctime: i64, cusec: u32) -> Vec<u8> {
     let authenticator = Authenticator {
         crealm: REALM.into(),
         cname: alice(),
         cksum: None,
-        cusec: 0,
-        ctime: NOW,
+        cusec,
+        ctime,
         subkey: None,
         seq_number: None,
         authorization_data: None,
@@ -172,6 +178,11 @@ fn armored_as_req(nonce: u32) -> (Vec<u8>, Key) {
 
 /// The same, with `fast-options` bits set — `0x4000_0000` is `hide-client-names`.
 fn armored_as_req_with(nonce: u32, options: u32) -> (Vec<u8>, Key) {
+    armored_as_req_at(nonce, options, NOW, 0)
+}
+
+/// The same, with the armor authenticator dated at `ctime` and `cusec`.
+fn armored_as_req_at(nonce: u32, options: u32, ctime: i64, cusec: u32) -> (Vec<u8>, Key) {
     let cipher = OwnCipher;
     let (ticket, armor_key) = armor_ticket();
     let outer_body = body(nonce);
@@ -207,7 +218,7 @@ fn armored_as_req_with(nonce: u32, options: u32) -> (Vec<u8>, Key) {
     let armored = ArmoredRequest {
         armor: Some(Armor {
             armor_type: 1,
-            armor_value: armor_ap_req(&ticket, &armor_key),
+            armor_value: armor_ap_req_at(&ticket, &armor_key, ctime, cusec),
         }),
         req_checksum: (
             Enctype::Aes256Sha1.checksum_type(),
@@ -631,5 +642,58 @@ fn a_non_critical_fast_option_is_ignored() {
         rust_heimdal_kdc::msg::KrbError::decode(&reply).is_err(),
         "an unknown non-critical option must be ignored: {:?}",
         rust_heimdal_kdc::msg::KrbError::decode(&reply)
+    );
+}
+
+#[test]
+fn the_same_armor_ap_req_can_come_twice() {
+    // Deliberately the opposite of a replay cache, and the live client is the reason:
+    // `krb5` 1.0 builds its armor once per login and re-sends the same `AP-REQ` after
+    // `PREAUTH_REQUIRED`, when it has the challenge to send. A KDC that refused the second
+    // use would fail every login through a real client, and MIT's own KDC accepts it — so
+    // the armor is a key identifier, not a single-use token.
+    let kdc = kdc();
+    let (request, _) = armored_as_req(0x4250);
+    let first = kdc.handle(&request, NOW);
+    assert!(
+        rust_heimdal_kdc::msg::KrbError::decode(&first).is_err(),
+        "the first use must succeed: {:?}",
+        rust_heimdal_kdc::msg::KrbError::decode(&first)
+    );
+    let second = kdc.handle(&request, NOW);
+    assert!(
+        rust_heimdal_kdc::msg::KrbError::decode(&second).is_err(),
+        "re-sending the armor AP-REQ must not be refused as a replay: {:?}",
+        rust_heimdal_kdc::msg::KrbError::decode(&second)
+    );
+}
+
+#[test]
+fn a_request_whose_authenticator_is_stale_is_refused() {
+    // Outside the skew, an authenticator is either a replay from long ago or a client with
+    // a broken clock; both fail before anything is derived from it.
+    let (request, _) = armored_as_req_at(0x4251, 0, NOW - 4000, 0);
+    let reply = kdc().handle(&request, NOW);
+    let err = rust_heimdal_kdc::msg::KrbError::decode(&reply)
+        .expect("a stale authenticator must be refused");
+    assert_eq!(
+        err.code,
+        rust_heimdal_kdc::error::codes::KRB_AP_ERR_SKEW,
+        "{}",
+        err.e_text.clone().unwrap_or_default()
+    );
+}
+
+#[test]
+fn a_different_microsecond_is_not_a_replay() {
+    // The pair that keeps the cache from refusing honest clients: two logins in the same
+    // second are two authenticators, and a client is entitled to make both.
+    let kdc = kdc();
+    let (first_request, _) = armored_as_req_at(0x4252, 0, NOW, 1);
+    let (second_request, _) = armored_as_req_at(0x4253, 0, NOW, 2);
+    assert!(rust_heimdal_kdc::msg::KrbError::decode(&kdc.handle(&first_request, NOW)).is_err());
+    assert!(
+        rust_heimdal_kdc::msg::KrbError::decode(&kdc.handle(&second_request, NOW)).is_err(),
+        "a second login in the same second must not be read as a replay"
     );
 }

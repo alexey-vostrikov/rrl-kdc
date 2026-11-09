@@ -174,11 +174,13 @@ pub mod codes {
     /// The protocol version is not 5.
     pub const KRB_AP_ERR_BADVERSION: i32 = 39;
     /// The message type is wrong for this exchange.
-    pub const KRB_AP_ERR_MSG_TYPE: i32 = 41;
+    pub const KRB_AP_ERR_MSG_TYPE: i32 = 40;
     /// The message could not be decoded or was altered.
-    pub const KRB_AP_ERR_MODIFIED: i32 = 42;
+    pub const KRB_AP_ERR_MODIFIED: i32 = 41;
     /// The authenticator names a different principal than the ticket does.
     pub const KRB_AP_ERR_BADMATCH: i32 = 36;
+    /// RFC 4120 §7.5.3: an authenticator that has been seen before, inside the clock skew.
+    pub const KRB_AP_ERR_REPEAT: i32 = 34;
     /// The ticket is postdated and has not been validated.
     pub const KRB_AP_ERR_TKT_INVALID: i32 = 49;
     /// A checksum that must be present is absent, or is of the wrong type.
@@ -254,5 +256,62 @@ impl Error {
             Error::Config(_) => "bad_request",
             Error::Io(_) => "io",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codes;
+
+    /// Every code on the wire, against the literal RFC 4120 §7.5 quotes.
+    ///
+    /// These were two off by one — `MSG_TYPE` at 41 and `MODIFIED` at 42 — because the
+    /// error list is easy to write from memory and impossible to notice from inside: the
+    /// crate's own tests compare against the same constants, so a shifted pair agrees with
+    /// itself perfectly. A third-party client reading 42 as `KRB_AP_ERR_BADORDER` is the
+    /// only thing that would have said so. The literals stay in the test for the same
+    /// reason they must not appear only in the constants: a test that reads the constant
+    /// proves that the constant equals itself.
+    #[test]
+    fn the_error_codes_are_the_numbers_rfc_4120_quotes() {
+        for (code, want, name) in [
+            (codes::KDC_ERR_POLICY, 12, "KDC_ERR_POLICY"),
+            (codes::KDC_ERR_ETYPE_NOSUPP, 14, "KDC_ERR_ETYPE_NOSUPP"),
+            (codes::KDC_ERR_PREAUTH_FAILED, 24, "KDC_ERR_PREAUTH_FAILED"),
+            (
+                codes::KDC_ERR_PREAUTH_REQUIRED,
+                25,
+                "KDC_ERR_PREAUTH_REQUIRED",
+            ),
+            (codes::KDC_ERR_SERVER_NOMATCH, 26, "KDC_ERR_SERVER_NOMATCH"),
+            (
+                codes::KDC_ERR_RESPONSE_TOO_BIG,
+                52,
+                "KDC_ERR_RESPONSE_TOO_BIG",
+            ),
+            (codes::KDC_ERR_WRONG_REALM, 68, "KDC_ERR_WRONG_REALM"),
+            (
+                codes::KRB_AP_ERR_BAD_INTEGRITY,
+                31,
+                "KRB_AP_ERR_BAD_INTEGRITY",
+            ),
+            (codes::KRB_AP_ERR_TKT_EXPIRED, 32, "KRB_AP_ERR_TKT_EXPIRED"),
+            (codes::KRB_AP_ERR_TKT_NYV, 33, "KRB_AP_ERR_TKT_NYV"),
+            (codes::KRB_AP_ERR_BADMATCH, 36, "KRB_AP_ERR_BADMATCH"),
+            (codes::KRB_AP_ERR_SKEW, 37, "KRB_AP_ERR_SKEW"),
+            (codes::KRB_AP_ERR_BADADDR, 38, "KRB_AP_ERR_BADADDR"),
+            (codes::KRB_AP_ERR_BADVERSION, 39, "KRB_AP_ERR_BADVERSION"),
+            (codes::KRB_AP_ERR_MSG_TYPE, 40, "KRB_AP_ERR_MSG_TYPE"),
+            (codes::KRB_AP_ERR_MODIFIED, 41, "KRB_AP_ERR_MODIFIED"),
+        ] {
+            assert_eq!(code, want, "{name} must be {want}");
+        }
+    }
+
+    #[test]
+    fn the_fast_option_error_is_the_one_rfc_6113_adds() {
+        // RFC 6113 §5.4.4.2: `KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS` is 93, in the KDC
+        // range, next to nothing else this crate uses.
+        assert_eq!(codes::KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS, 93);
     }
 }

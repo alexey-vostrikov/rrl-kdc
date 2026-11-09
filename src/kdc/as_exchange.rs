@@ -281,6 +281,29 @@ impl Kdc {
     /// TGT, and a ticket for anything else would let any service's key open a login it
     /// has nothing to do with.
     pub(super) fn armor_key(&self, armored: &super::fast::ArmoredRequest, now: i64) -> Result<Key> {
+        self.armor_key_inner(armored, now, true)
+    }
+
+    /// The same derivation without the freshness check.
+    ///
+    /// The error path needs the armor key to wrap a refusal, and it runs after the request
+    /// was accepted far enough to be refused. Re-checking the clock there would turn a clear
+    /// refusal into an unreadable one — the error would fail to wrap because the error path
+    /// itself insisted on a condition the request had already failed.
+    pub(super) fn armor_key_for_error(
+        &self,
+        armored: &super::fast::ArmoredRequest,
+        now: i64,
+    ) -> Result<Key> {
+        self.armor_key_inner(armored, now, false)
+    }
+
+    fn armor_key_inner(
+        &self,
+        armored: &super::fast::ArmoredRequest,
+        now: i64,
+        validate: bool,
+    ) -> Result<Key> {
         let armor = armored.armor.as_ref().ok_or_else(|| Error::Kdc {
             code: codes::KDC_ERR_PREAUTH_FAILED,
             text: "PA-FX-FAST without armor".into(),
@@ -340,6 +363,38 @@ impl Kdc {
                         .into(),
                 })?,
         )?;
+        // RFC 4120 §3.2.3: an authenticator outside the clock skew is either a replay from
+        // long ago or a client with a broken clock, and both must fail before anything is
+        // derived from it. Heimdal reaches the same place through `krb5_verify_ap_req2`;
+        // skipping it made this path accept an authenticator of any age.
+        let skew = now.saturating_sub(authenticator.ctime);
+        if validate && skew.abs() > self.config().clockskew() {
+            return Err(Error::Kdc {
+                code: codes::KRB_AP_ERR_SKEW,
+                text: format!(
+                    "PA-FX-FAST: the armor authenticator is {skew} seconds from this KDC's \
+                     clock, and the allowed skew is {}",
+                    self.config().clockskew()
+                ),
+            });
+        }
+        // No replay cache here, on purpose, and the live client is why.
+        //
+        // RFC 4120 §3.2.3 obliges a *server* to refuse an authenticator it has seen, and
+        // the obvious reading is that a KDC is such a server. It is not: the armor AP-REQ
+        // is not the credential — it names a key, and the authentication is the
+        // `PA-ENCRYPTED-CHALLENGE` inside. Recorded evidence: `krb5` 1.0 builds its armor
+        // once per login (`if armored && armor.is_none()`), then re-sends the *same*
+        // `AP-REQ` after `PREAUTH_REQUIRED` to send the challenge — so a cache keyed on
+        // (client, ctime, cusec) refused an honest login with `KRB_AP_ERR_REPEAT`, and that
+        // client is tested against a live MIT KDC, which means MIT's KDC does not
+        // replay-check armor either.
+        //
+        // Replaying an armored request gains an attacker nothing: the reply is sealed in a
+        // reply key strengthened by a random value that travels only inside the armor. The
+        // freshness check above is still worth having — a stale authenticator is a client
+        // fighting the clock — but treating the armor as a single-use token is not.
+
         let Some(subkey) = authenticator.subkey else {
             return Ok(part.session_key);
         };

@@ -285,7 +285,7 @@ impl Kdc {
     fn armor_key_of(&self, req: &KdcReq, now: i64) -> Option<crate::crypto::Key> {
         let bytes = req.padata(fast::PA_FX_FAST)?;
         let armored = fast::ArmoredRequest::decode(bytes).ok()?;
-        self.armor_key(&armored, now).ok()
+        self.armor_key_for_error(&armored, now).ok()
     }
 
     /// Renders `err` as the reply, attaching `METHOD-DATA` where the code needs

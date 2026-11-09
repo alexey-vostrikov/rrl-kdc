@@ -76,6 +76,97 @@ fn hmac_by(kind: Sha2Kind, key: &[u8], msg: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The enctype's PRF (RFC 3961 §3, RFC 8009 §5.1).
+///
+/// **Not** a plain HMAC, and this is the trap: for the SHA1 enctypes the simplified
+/// profile defines
+///
+/// ```text
+/// tmp = SHA-1(message)[..16]
+/// PRF = E(DK(protocol-key, "prf"), tmp)     with the all-zero initial state
+/// ```
+///
+/// — one AES block, keyed by a *derived* key, not the key itself. A plain
+/// `HMAC-SHA1(key, message)` is shorter, cheaper and wrong: RFC 6113's `PRF+` is built
+/// on this function, so the wrong PRF produces a `cf2` output that no other
+/// implementation computes. The published `t_cf2` vectors are what caught it here.
+///
+/// The RFC 8009 enctypes use `KDF-HMAC-SHA2` with the label `"prf"` instead, which is
+/// the same construction that derives their keys.
+pub fn prf(enctype: Enctype, key: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+    match enctype.sha2_kind() {
+        Some(kind) => {
+            let bits = match kind {
+                Sha2Kind::Sha256 => 256,
+                Sha2Kind::Sha384 => 384,
+            };
+            kdf_hmac_sha2(kind, key, b"prf", Some(msg), bits)
+        }
+        None => {
+            if key.len() != enctype.key_len() {
+                return Err(Error::Crypto(format!(
+                    "the PRF of {enctype:?} needs a {}-octet key, got {}",
+                    enctype.key_len(),
+                    key.len()
+                )));
+            }
+            use sha1::Digest;
+            let kp = dk(key, b"prf", enctype.key_len())?;
+            let mut block = [0u8; 16];
+            block.copy_from_slice(&sha1::Sha1::digest(msg)[..16]);
+            crate::crypto::aes_cts::encrypt(&kp, &[0u8; 16], &block)
+        }
+    }
+}
+
+/// RFC 6113 §5.1 `PRF+`: `PRF(k, 1 || seed) || PRF(k, 2 || seed) || …`, truncated.
+///
+/// The counter is **one octet**, not the four that SP800-108 uses. That looks like a
+/// deviation and is not: MIT's `krb5_c_prfplus` and Heimdal both use one octet, and a
+/// four-octet counter produces a key that no other implementation computes. The
+/// vectors in this module's tests come from MIT's `t_cf2`, which is why this is
+/// pinned rather than reasoned about.
+pub fn prf_plus(enctype: Enctype, key: &[u8], seed: &[u8], len: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len + 64);
+    let mut input = Vec::with_capacity(1 + seed.len());
+    for counter in 1u8..=255 {
+        if out.len() >= len {
+            break;
+        }
+        input.clear();
+        input.push(counter);
+        input.extend_from_slice(seed);
+        out.extend_from_slice(&prf(enctype, key, &input)?);
+    }
+    if out.len() < len {
+        return Err(Error::Crypto(format!(
+            "PRF+ cannot produce {len} octets from a {}-octet hash",
+            out.len()
+        )));
+    }
+    out.truncate(len);
+    Ok(out)
+}
+
+/// RFC 6113 §5.1 `KRB-FX-CF2`: `PRF+(k1, pepper1) XOR PRF+(k2, pepper2)`.
+///
+/// The result is a key of `enctype` — `k1`'s — because random-to-key is the identity
+/// for AES. FAST uses it to strengthen a reply key with a per-exchange secret, and
+/// PKINIT to combine the KDC's contribution with the client's; in both the point is
+/// that neither side alone can compute the result.
+pub fn cf2(
+    k1: &[u8],
+    pepper1: &str,
+    enctype: Enctype,
+    k2: &[u8],
+    pepper2: &str,
+) -> Result<Vec<u8>> {
+    let n = enctype.key_len();
+    let a = prf_plus(enctype, k1, pepper1.as_bytes(), n)?;
+    let b = prf_plus(enctype, k2, pepper2.as_bytes(), n)?;
+    Ok(a.iter().zip(&b).map(|(x, y)| x ^ y).collect())
+}
+
 /// RFC 3961 §5.1 `DR(Key, Constant) = k-truncate(B1 || B2 || ...)`.
 ///
 /// The constant is n-folded — never zero-padded — and each iteration encrypts
@@ -567,5 +658,73 @@ mod tests {
             kdf_hmac_sha2(Sha2Kind::Sha256, &[0u8; 16], b"lbl", None, 100).is_err(),
             "100 bits is not whole octets"
         );
+    }
+
+    /// MIT's `lib/crypto/crypto_tests/t_cf2` vectors: `key1`/`key2` are
+    /// string-to-key with the salt equal to the password, peppers "a" and "b".
+    ///
+    /// These are the vectors that decide whether this crate's FAST and PKINIT can talk
+    /// to anything else: the counter width in `PRF+` is the one detail where a
+    /// plausible reading (SP800-108's four octets) produces keys no other
+    /// implementation computes.
+    #[test]
+    fn cf2_matches_mits_published_vectors() {
+        for (enctype, want) in [
+            (Enctype::Aes128Sha1, "97df97e4b798b29eb31ed7280287a92a"),
+            (
+                Enctype::Aes256Sha1,
+                "4d6ca4e629785c1f01baf55e2e548566b9617ae3a96868c337cb93b5e72b1c7b",
+            ),
+            (Enctype::Aes128Sha256, "edd02a39d2dbde31611c16e610be062c"),
+            (
+                Enctype::Aes256Sha384,
+                "67f6ea530aea85a37dcbb23349ea52dcc61ca8493ff557252327fd8304341584",
+            ),
+        ] {
+            let k1 = s2k(enctype, b"key1", b"key1", None).unwrap();
+            let k2 = s2k(enctype, b"key2", b"key2", None).unwrap();
+            let got = cf2(&k1, "a", enctype, &k2, "b").unwrap();
+            assert_eq!(
+                got.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                want,
+                "{enctype:?}"
+            );
+            assert_eq!(got.len(), enctype.key_len());
+        }
+    }
+
+    #[test]
+    fn cf2_depends_on_both_keys_and_both_peppers() {
+        // Neither side alone may compute the result: that is why FAST can strengthen a
+        // reply key with a value only the armor key can deliver.
+        let k1 = s2k(Enctype::Aes256Sha1, b"key1", b"key1", None).unwrap();
+        let k2 = s2k(Enctype::Aes256Sha1, b"key2", b"key2", None).unwrap();
+        let base = cf2(&k1, "a", Enctype::Aes256Sha1, &k2, "b").unwrap();
+        assert_ne!(base, cf2(&k2, "a", Enctype::Aes256Sha1, &k1, "b").unwrap());
+        assert_ne!(base, cf2(&k1, "b", Enctype::Aes256Sha1, &k2, "a").unwrap());
+        assert_ne!(base, cf2(&k1, "a", Enctype::Aes256Sha1, &k1, "b").unwrap());
+    }
+
+    #[test]
+    fn prf_plus_concatenates_the_counted_blocks() {
+        let key = [0x11u8; 32];
+        let one = prf_plus(Enctype::Aes256Sha1, &key, b"seed", 20).unwrap();
+        let two = prf_plus(Enctype::Aes256Sha1, &key, b"seed", 40).unwrap();
+        assert_eq!(
+            &two[..20],
+            &one[..],
+            "a longer output extends the shorter one"
+        );
+        assert_eq!(one.len(), 20);
+    }
+
+    #[test]
+    fn the_prf_refuses_a_key_of_the_wrong_length() {
+        // The simplified-profile PRF derives its AES key with `DK`, which needs the
+        // enctype's own key size; a 16-octet key under AES-256 is not a shorter key,
+        // it is the wrong one.
+        assert!(prf(Enctype::Aes256Sha1, &[0u8; 16], b"x").is_err());
+        assert!(prf(Enctype::Aes128Sha1, &[0u8; 32], b"x").is_err());
+        assert!(prf(Enctype::Aes128Sha1, &[0u8; 16], b"x").is_ok());
     }
 }

@@ -276,6 +276,17 @@ impl Kdc {
         }
     }
 
+    /// The armor key of an armored request, or `None` when its armor cannot be opened.
+    ///
+    /// Errors are swallowed here on purpose: this runs on the error path, and an error
+    /// whose armor will not open must still reach the client as a plain error rather
+    /// than be replaced by a second failure explaining the first.
+    fn armor_key_of(&self, req: &KdcReq, now: i64) -> Option<crate::crypto::Key> {
+        let bytes = req.padata(fast::PA_FX_FAST)?;
+        let armored = fast::ArmoredRequest::decode(bytes).ok()?;
+        self.armor_key(&armored, now).ok()
+    }
+
     /// Renders `err` as the reply, attaching `METHOD-DATA` where the code needs
     /// it.
     fn error(&self, req: Option<&KdcReq>, err: &Error, now: i64) -> Vec<u8> {
@@ -303,6 +314,53 @@ impl Kdc {
                 None,
             ),
         };
+        // RFC 6113 §5.4.2.5: an error caused by an armored request has to come back
+        // inside the armor. A client that armored looks for `PA-FX-ERROR` in the armored
+        // container and, finding none, falls back to the *outer* error — which carries
+        // no pre-authentication types by design — and concludes the KDC offered it
+        // nothing. The reported error is then "no usable key", not the one that was
+        // actually sent, which is how a missing wrapper turns into a mystery.
+        //
+        // The container goes in `e-data`, as `METHOD-DATA`, rather than in the error's
+        // `padata`: MIT's client reads an error's PA-DATA from `e-data` only, and a
+        // reply it cannot open is indistinguishable from no reply at all.
+        let armored = req.and_then(|r| {
+            r.padata(fast::PA_FX_FAST)?;
+            let key = self.armor_key_of(r, now)?;
+            let inner = crate::msg::KrbError {
+                ctime: None,
+                cusec: None,
+                stime: now,
+                susec: 0,
+                code,
+                crealm: crealm.clone(),
+                cname: cname.clone(),
+                realm: realm.clone(),
+                sname: sname.clone(),
+                e_text: text.clone(),
+                e_data: method_data.clone(),
+                padata: Vec::new(),
+            }
+            .encode();
+            // The methods also appear beside `PA-FX-ERROR` inside the container: MIT
+            // reads them from there, not out of the error it just unwrapped.
+            let mut container = method_data
+                .as_deref()
+                .and_then(|m| {
+                    let mut rd = crate::der::Reader::new(m);
+                    let seq = rd.next("METHOD-DATA").ok()?;
+                    crate::msg::decode_pa_data("METHOD-DATA", seq.content).ok()
+                })
+                .unwrap_or_default();
+            container.push((fast::PA_FX_ERROR, inner));
+            let wrapped =
+                fast::wrap_reply(&key, &container, None, None, r.body.nonce, self.cipher()).ok()?;
+            Some(crate::msg::encode_pa_data(&[(
+                fast::PA_FX_FAST_REPLY,
+                wrapped,
+            )]))
+        });
+
         crate::msg::KrbError {
             ctime: None,
             cusec: None,
@@ -314,7 +372,10 @@ impl Kdc {
             realm,
             sname,
             e_text: text,
-            e_data: method_data,
+            // The real `METHOD-DATA` travels inside the armor when there is one; a
+            // second copy in the clear would be unsigned data beside signed data.
+            e_data: armored.or(method_data),
+            padata: Vec::new(),
         }
         .encode()
     }

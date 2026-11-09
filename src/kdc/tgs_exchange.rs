@@ -568,7 +568,11 @@ impl Kdc {
     /// The ticket names its enctype, so that one is tried first: flailing
     /// through every key on a wrong guess turns a clear "this ticket is not
     /// mine" into a slow, indistinguishable failure.
-    fn decrypt_ticket(&self, ticket: &Ticket, entry: &HdbEntry) -> Result<EncTicketPart> {
+    pub(super) fn decrypt_ticket(
+        &self,
+        ticket: &Ticket,
+        entry: &HdbEntry,
+    ) -> Result<EncTicketPart> {
         let mut candidates = vec![ticket.enc.etype];
         candidates.extend(
             entry

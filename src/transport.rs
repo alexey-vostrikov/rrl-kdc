@@ -171,6 +171,7 @@ fn too_big(_reply: &[u8], kdc: &Kdc) -> Vec<u8> {
         sname: crate::name::Principal::krbtgt(kdc.config().realm()),
         e_text: Some("reply too big for UDP; retry over TCP".into()),
         e_data: None,
+        padata: Vec::new(),
     }
     .encode()
 }
@@ -314,6 +315,7 @@ fn serve_kpasswd_stream(mut stream: TcpStream, kdc: &Kdc) {
                 sname: crate::name::Principal::krbtgt(kdc.config().realm()),
                 e_text: err.is_client_facing().then(|| err.to_string()),
                 e_data: None,
+                padata: Vec::new(),
             }
             .encode()
         }

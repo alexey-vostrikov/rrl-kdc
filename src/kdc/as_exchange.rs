@@ -72,6 +72,17 @@ pub fn usable_enctypes(
         .collect()
 }
 
+/// The value of `pa_type` in a `PA-DATA` list.
+///
+/// `KdcReq::padata` does this for a whole request; the AS exchange needs it over a list
+/// that may have come from inside a FAST wrapper instead.
+fn padata_value(padata: &[(i32, Vec<u8>)], pa_type: i32) -> Option<&[u8]> {
+    padata
+        .iter()
+        .find(|(t, _)| *t == pa_type)
+        .map(|(_, v)| v.as_slice())
+}
+
 /// `from`, when the request asks for a postdated ticket and the client is
 /// allowed one. A `from` on a request that did not ask for `postdated` is
 /// ignored, as MIT ignores it.
@@ -175,6 +186,11 @@ pub fn ticket_flags(
 fn method_data(entries: &[EtypeInfo2Entry]) -> Vec<u8> {
     encode_pa_data(&[
         (PA_ENC_TIMESTAMP, Vec::new()),
+        // Advertised unconditionally, as MIT's KDC does: a client that armors replaces
+        // the timestamp with this, a client that does not ignores it. Offering it only
+        // to clients that already armored would be circular — the first armored request
+        // is exactly the one that needs to learn it exists.
+        (super::fast::PA_ENCRYPTED_CHALLENGE, Vec::new()),
         (PA_ETYPE_INFO2, encode_etype_info2(entries)),
     ])
 }
@@ -220,7 +236,119 @@ fn preauth_failed(cname: &Principal, entries: &[EtypeInfo2Entry], why: &str) -> 
 impl Kdc {
     /// Handles an `AS-REQ`.
     pub(super) fn handle_as(&self, req: &KdcReq, now: i64) -> Result<Vec<u8>> {
-        let body = &req.body;
+        // FAST first: if the client armored the exchange, the request that matters is
+        // the one inside the armor, and the reply has to be armored back.
+        let Some(armored_bytes) = req.padata(super::fast::PA_FX_FAST) else {
+            return self.answer_as(&req.body, &req.padata, now, None);
+        };
+        let armored = super::fast::ArmoredRequest::decode(armored_bytes)?;
+        let armor_key = self.armor_key(&armored, now)?;
+        let inner = super::fast::unwrap(&armored, &armor_key, &req.raw_body, self.cipher())?;
+        let mut r = crate::der::Reader::new(&inner.req_body);
+        let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
+        let body = KdcReqBody::decode(content)?;
+        if body.realm != req.body.realm {
+            // The armored body is the one answered, but the outer body is what was
+            // signed; a pair that disagrees about the realm is not a request this KDC
+            // can make sense of.
+            return Err(Error::Protocol(
+                "PA-FX-FAST: the armored body names a different realm than the request".into(),
+            ));
+        }
+        self.answer_as(&body, &inner.padata, now, Some(&armor_key))
+    }
+
+    /// The key an armored request is encrypted under: the session key of the ticket its
+    /// armor presents.
+    ///
+    /// The armor ticket must be a `krbtgt` of this realm — a client armors with its own
+    /// TGT, and a ticket for anything else would let any service's key open a login it
+    /// has nothing to do with.
+    pub(super) fn armor_key(&self, armored: &super::fast::ArmoredRequest, now: i64) -> Result<Key> {
+        let armor = armored.armor.as_ref().ok_or_else(|| Error::Kdc {
+            code: codes::KDC_ERR_PREAUTH_FAILED,
+            text: "PA-FX-FAST without armor".into(),
+        })?;
+        if armor.armor_type != 1 {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_PREAUTH_FAILED,
+                text: format!(
+                    "PA-FX-FAST armor type {}: only 1 (an AP-REQ) is defined",
+                    armor.armor_type
+                ),
+            });
+        }
+        let ap_req = crate::msg::ApReq::decode(&armor.armor_value)?;
+        let ticket = ap_req.ticket()?;
+        let krbtgt = Principal::krbtgt(self.config().realm());
+        if ticket.sname != krbtgt {
+            return Err(Error::Kdc {
+                code: codes::KRB_AP_ERR_MODIFIED,
+                text: format!(
+                    "PA-FX-FAST armor presents a ticket for {}, not {krbtgt}; only a TGT \
+                     of this realm may armor an AS exchange",
+                    ticket.sname
+                ),
+            });
+        }
+        let entry = self
+            .hdb()
+            .fetch(&krbtgt)?
+            .ok_or_else(|| Error::Hdb("the krbtgt entry is missing from the database".into()))?;
+        let part = self.decrypt_ticket(&ticket, &entry)?;
+        if now > part.endtime {
+            return Err(Error::Kdc {
+                code: codes::KRB_AP_ERR_TKT_EXPIRED,
+                text: format!("the armor TGT expired at {}", part.endtime),
+            });
+        }
+
+        // The armor key is **not** the ticket's session key when the client put a subkey
+        // in the authenticator — which every client does, MIT's included, because a
+        // subkey can be discarded afterwards and the TGT's session key cannot. RFC 6113
+        // §5.4.1: `cf2(subkey, "subkeyarmor", session key, "ticketarmor")`. Using the
+        // session key directly here produces a checksum mismatch against every real
+        // client while agreeing perfectly with a client of one's own.
+        let authenticator = crate::msg::Authenticator::decode(
+            &self
+                .cipher()
+                .decrypt(
+                    &part.session_key,
+                    super::fast::usage::AP_REQ_AUTH,
+                    &ap_req.authenticator.cipher,
+                )
+                .map_err(|_| Error::Kdc {
+                    code: codes::KRB_AP_ERR_BAD_INTEGRITY,
+                    text: "PA-FX-FAST: the armor authenticator does not open with the \
+                           ticket's session key"
+                        .into(),
+                })?,
+        )?;
+        let Some(subkey) = authenticator.subkey else {
+            return Ok(part.session_key);
+        };
+        let mixed = crate::crypto::kdf::cf2(
+            subkey.bytes(),
+            "subkeyarmor",
+            part.session_key.enctype(),
+            part.session_key.bytes(),
+            "ticketarmor",
+        )?;
+        Key::new(part.session_key.enctype(), mixed)
+    }
+
+    /// The AS exchange proper, over a request that has already been unwrapped.
+    ///
+    /// `armor` is `Some` when the request arrived inside `PA-FX-FAST`; the reply is then
+    /// sealed in a strengthened key and its `padata` travels inside
+    /// `PA-FX-FAST-REPLY`.
+    fn answer_as(
+        &self,
+        body: &KdcReqBody,
+        padata: &[(i32, Vec<u8>)],
+        now: i64,
+        armor: Option<&Key>,
+    ) -> Result<Vec<u8>> {
         let config = self.config();
         if body.realm != config.realm() {
             return Err(super::wrong_realm(&body.realm, config.realm()));
@@ -277,21 +405,49 @@ impl Kdc {
         let entries = etype_info2(&client, &usable);
 
         // 5. Pre-authentication.
-        let preauthenticated = req.padata(PA_ENC_TIMESTAMP).is_some();
-        let reply_key = match req.padata(PA_ENC_TIMESTAMP) {
-            Some(value) => match self.verify_enc_timestamp(&client, &usable, value, now) {
+        //
+        // Two methods; which one is acceptable depends on the armor, not on the client's
+        // preference. Inside FAST the plain timestamp is refused: a `PA-ENC-TIMESTAMP`
+        // sealed directly in the long-term key is the offline oracle the armor exists to
+        // close, so accepting it there would leave the hole open behind a lock.
+        let timestamp = padata_value(padata, PA_ENC_TIMESTAMP);
+        let challenge = padata_value(padata, super::fast::PA_ENCRYPTED_CHALLENGE);
+        let preauthenticated = timestamp.is_some() || challenge.is_some();
+        let reply_key = if let Some(value) = challenge {
+            // A challenge cannot be answered without the armor: its key is
+            // `cf2(armor, …, long-term, …)`, so a client that sends one unarmored is
+            // asking this KDC to invent a secret it does not have.
+            let Some(armor_key) = armor else {
+                return Err(preauth_failed(
+                    &cname,
+                    &entries,
+                    "PA-ENCRYPTED-CHALLENGE requires FAST armor",
+                ));
+            };
+            match self.verify_enc_challenge(&client, &usable, value, armor_key, now) {
                 Ok(key) => key,
                 Err(err) => return Err(with_salts(err, &cname, &entries)),
-            },
-            None if config.require_preauth() || client.has(entry_flags::REQUIRE_PREAUTH) => {
-                return Err(preauth_required(&cname, &entries));
             }
-            None => client
+        } else if let Some(value) = timestamp {
+            if armor.is_some() {
+                return Err(preauth_failed(
+                    &cname,
+                    &entries,
+                    "PA-ENC-TIMESTAMP is not accepted inside FAST: \
+                     use PA-ENCRYPTED-CHALLENGE",
+                ));
+            }
+            match self.verify_enc_timestamp(&client, &usable, value, now) {
+                Ok(key) => key,
+                Err(err) => return Err(with_salts(err, &cname, &entries)),
+            }
+        } else if config.require_preauth() || client.has(entry_flags::REQUIRE_PREAUTH) {
+            return Err(preauth_required(&cname, &entries));
+        } else {
+            client
                 .key_for(usable[0])
                 .map(|k| k.key.clone())
-                .ok_or_else(|| {
-                    preauth_failed(&cname, &entries, "no key for the session enctype")
-                })?,
+                .ok_or_else(|| preauth_failed(&cname, &entries, "no key for the session enctype"))?
         };
 
         // 6. Flags and times.
@@ -367,6 +523,9 @@ impl Kdc {
                 &ticket_part.encode(),
             )?,
         };
+        // The encoded ticket, before the reply is assembled: `finished` checksums the
+        // ticket as the client will receive it, so it has to be the same octets.
+        let ticket_der = ticket.encode();
 
         let rep_part = EncKdcRepPart {
             session_key,
@@ -385,25 +544,122 @@ impl Kdc {
             sname: server.principal.clone(),
             caddr: body.addresses.clone(),
         };
+        // With FAST the reply key is strengthened by a random secret that only the
+        // armor carries, so a recorded reply cannot be attacked offline. Without FAST
+        // it stays the client's long-term key, which is what every client expects.
+        let (strengthen_key, sealed_with) = match armor {
+            Some(_) => {
+                let (strength, strengthened) = super::fast::strengthen(self.cipher(), &reply_key)?;
+                (Some(strength), strengthened)
+            }
+            None => (None, reply_key.clone()),
+        };
         let enc_part = EncryptedData::seal(
             self.cipher(),
-            &reply_key,
+            &sealed_with,
             usage::AS_REP_ENCPART,
             Some(client.kvno()),
             &rep_part.encode(crate::msg::ENC_AS_REP_PART),
         )?;
 
+        // Heimdal repeats the etype information in the reply, so a client that read the
+        // salt from the error still sees it here. Inside FAST it travels in the armor,
+        // because a salt in the clear is one more thing to attack.
+        let mut padata_out = vec![(PA_ETYPE_INFO2, encode_etype_info2(&entries))];
+        if let Some(key) = armor {
+            // The KDC's own challenge: the client asked for "prove you hold my
+            // long-term key", and a KDC that cannot answer is indistinguishable from an
+            // impostor that relays the armor. The reply key is the long-term one — that
+            // is what was verified — so it is the key this proof is built on.
+            padata_out.push((
+                super::fast::PA_ENCRYPTED_CHALLENGE,
+                super::fast::kdc_challenge(
+                    self.cipher(),
+                    key,
+                    &reply_key,
+                    now,
+                    (now.rem_euclid(1_000_000)) as u32,
+                )?,
+            ));
+            let finish = super::fast::finished(
+                self.cipher(),
+                key,
+                &ticket_der,
+                &client.principal,
+                now,
+                (now.rem_euclid(1_000_000)) as u32,
+            )?;
+            padata_out = vec![(
+                super::fast::PA_FX_FAST_REPLY,
+                super::fast::wrap_reply(
+                    key,
+                    &padata_out,
+                    strengthen_key.as_ref(),
+                    Some(finish),
+                    body.nonce,
+                    self.cipher(),
+                )?,
+            )];
+        }
+
         Ok(KdcRep {
             msg_type: AS_REP,
-            // Heimdal repeats the etype information in the reply, so a client
-            // that read the salt from the error still sees it here.
-            padata: vec![(PA_ETYPE_INFO2, encode_etype_info2(&entries))],
+            padata: padata_out,
             crealm: client.principal.realm.clone(),
             cname: client.principal.clone(),
             ticket,
             enc_part,
         }
         .encode())
+    }
+
+    /// Verifies `PA-ENCRYPTED-CHALLENGE` (RFC 6113 §5.4.6) and returns the long-term
+    /// key it proves.
+    ///
+    /// The challenge opens with
+    /// `cf2(armor, "clientchallengearmor", long-term, "challengelongterm")`, so it proves
+    /// two things at once and neither alone: possession of the armor ticket *and*
+    /// knowledge of the password. That is why the plain timestamp is refused inside FAST
+    /// rather than merely deprecated — accepting it would let anyone holding a TGT
+    /// (a stolen laptop, a compromised host) log in without the password.
+    fn verify_enc_challenge(
+        &self,
+        client: &HdbEntry,
+        usable: &[Enctype],
+        value: &[u8],
+        armor_key: &Key,
+        now: i64,
+    ) -> Result<Key> {
+        let ed = EncryptedData::decode("PA-ENCRYPTED-CHALLENGE", value)?;
+        if !usable.contains(&ed.etype) {
+            return Err(Error::PreauthFailed(format!(
+                "PA-ENCRYPTED-CHALLENGE is {}, which was not offered",
+                ed.etype.name()
+            )));
+        }
+        let long_term = client
+            .key_for(ed.etype)
+            .ok_or_else(|| Error::PreauthFailed(format!("no {} key", ed.etype.name())))?;
+        let key = super::fast::client_challenge_key(armor_key, &long_term.key)?;
+        let plain = self
+            .cipher()
+            .decrypt(&key, super::fast::usage::ENC_CHALLENGE_CLIENT, &ed.cipher)
+            .map_err(|_| {
+                Error::PreauthFailed(
+                    "PA-ENCRYPTED-CHALLENGE did not open: wrong password, or an armor \
+                     this client did not use"
+                        .into(),
+                )
+            })?;
+        let (timestamp, _usec) = decode_enc_ts_enc(&plain)?;
+        let skew = now.saturating_sub(timestamp);
+        if skew.abs() > self.config().clockskew() {
+            return Err(Error::Skew {
+                skew,
+                allowed: self.config().clockskew(),
+            });
+        }
+        Ok(long_term.key.clone())
     }
 
     /// Verifies `PA-ENC-TIMESTAMP` against the entry's keys and returns the key

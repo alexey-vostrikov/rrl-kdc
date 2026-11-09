@@ -567,6 +567,10 @@ pub struct KrbError {
     pub e_text: Option<String>,
     /// `METHOD-DATA` for `PREAUTH_REQUIRED`, else arbitrary.
     pub e_data: Option<Vec<u8>>,
+    /// `padata`, which an error carries only when RFC 6113 put it there: under FAST
+    /// the real error travels as `PA-FX-ERROR` inside `PA-FX-FAST-REPLY`, and a
+    /// `METHOD-DATA` in the clear alongside it would be a second, unsigned copy.
+    pub padata: Vec<(i32, Vec<u8>)>,
 }
 
 impl KrbError {
@@ -599,6 +603,9 @@ impl KrbError {
         if let Some(d) = &self.e_data {
             parts.push(der::field(12, der::octets(d)));
         }
+        if !self.padata.is_empty() {
+            parts.push(der::field(13, encode_pa_data(&self.padata)));
+        }
         der::cons(der::app(KRB_ERROR), &[der::seq(&parts)])
     }
 
@@ -621,6 +628,14 @@ impl KrbError {
         };
         let realm = f.string(9, "KRB-ERROR")?;
         let sname = Principal::decode_field(&f, 10, "sname", &realm)?;
+        let padata = match f.opt(13) {
+            None => Vec::new(),
+            Some(raw) => {
+                let mut r = crate::der::Reader::new(raw);
+                let seq = r.next("KRB-ERROR padata")?;
+                decode_pa_data("KRB-ERROR", seq.content)?
+            }
+        };
         Ok(KrbError {
             ctime,
             cusec,
@@ -633,6 +648,7 @@ impl KrbError {
             sname,
             e_text: f.opt_string(11, "KRB-ERROR")?,
             e_data: f.opt_octets(12, "KRB-ERROR")?.map(<[u8]>::to_vec),
+            padata,
         })
     }
 
@@ -876,6 +892,7 @@ mod tests {
             sname: Principal::krbtgt("R"),
             e_text: Some("NEEDED".into()),
             e_data: Some(method_data),
+            padata: Vec::new(),
         };
         let back = KrbError::decode(&err.encode()).unwrap();
         assert_eq!(back.code, codes::KDC_ERR_PREAUTH_REQUIRED);

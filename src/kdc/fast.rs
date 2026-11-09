@@ -79,9 +79,24 @@ use crate::msg::EncryptedData;
 
 /// `PA-FX-FAST`: the client's armored request.
 pub const PA_FX_FAST: i32 = 136;
+/// The real `KRB-ERROR` inside an armored reply (RFC 6113 §5.4.2.5). Without this
+/// the client sees an empty outer error and cannot learn how to pre-authenticate.
+pub const PA_FX_ERROR: i32 = 137;
 
 /// `PA-FX-FAST-REPLY`: the KDC's armored answer.
-pub const PA_FX_FAST_REPLY: i32 = 137;
+///
+/// **136, the same number as the request.** RFC 6113 gives the request and the reply
+/// one `PA-DATA` type because the direction decides which is meant; 137 is `PA-FX-ERROR`,
+/// the real error *inside* an armored reply. Getting this wrong is invisible to a test
+/// that reuses the constant on both sides — the armor round-trips perfectly and no
+/// client that actually implements FAST will read it. A third-party client found it.
+pub const PA_FX_FAST_REPLY: i32 = 136;
+
+/// `PA-ENCRYPTED-CHALLENGE`: the pre-authentication of an armored exchange
+/// (RFC 6113 §5.4.6). Inside FAST a `PA-ENC-TIMESTAMP` would be sealed in the
+/// long-term key with nothing around it, which is the oracle FAST exists to remove —
+/// so the challenge replaces it rather than accompanying it.
+pub const PA_ENCRYPTED_CHALLENGE: i32 = 138;
 
 /// `PA-FX-COOKIE`: the stateless pre-authentication state a KDC hands back.
 pub const PA_FX_COOKIE: i32 = 133;
@@ -97,6 +112,13 @@ pub mod usage {
     pub const FAST_REP: u32 = 52;
     /// The `finished` verifier's checksum.
     pub const FAST_FINISHED: u32 = 53;
+    /// The AP-REQ authenticator — RFC 4120, not 6113, but the armor path needs it to
+    /// read the subkey out of the armor's own AP-REQ.
+    pub const AP_REQ_AUTH: u32 = 11;
+    /// The client's encrypted challenge (RFC 6113 §7.5.1).
+    pub const ENC_CHALLENGE_CLIENT: u32 = 54;
+    /// The KDC's answer to it.
+    pub const ENC_CHALLENGE_KDC: u32 = 55;
 }
 
 /// `KrbFastArmor`: how the armor key is established.
@@ -348,15 +370,131 @@ pub fn unwrap(
 pub fn wrap_reply(
     armor_key: &Key,
     padata: &[(i32, Vec<u8>)],
+    strengthen_key: Option<&Key>,
+    finished: Option<Vec<u8>>,
     nonce: u32,
     cipher: &dyn Cipher,
 ) -> Result<Vec<u8>> {
-    let response = der::seq(&[
-        der::field(0, crate::msg::encode_pa_data(padata)),
-        der::field(3, der::int(nonce as i64)),
-    ]);
+    let mut parts = vec![der::field(0, crate::msg::encode_pa_data(padata))];
+    if let Some(sk) = strengthen_key {
+        // `[1] EncryptionKey`: the client needs it to reconstruct the reply key, and
+        // it travels only inside the armor, which is what keeps it from an attacker.
+        parts.push(der::field(1, crate::msg::encode_key(sk)));
+    }
+    if let Some(fin) = finished {
+        parts.push(der::field(2, fin));
+    }
+    parts.push(der::field(3, der::int(nonce as i64)));
+    let response = der::seq(&parts);
     let enc = EncryptedData::seal(cipher, armor_key, usage::FAST_REP, None, &response)?;
     Ok(der::cons(0xa0, &[der::seq(&[der::field(0, enc.encode())])]))
+}
+
+/// The key the client sealed its `PA-ENCRYPTED-CHALLENGE` with (RFC 6113 §5.4.6).
+///
+/// `cf2(armor, "clientchallengearmor", long_term, "challengelongterm")`. Two secrets go
+/// in: the armor key, which proves the client holds its TGT, and the long-term key,
+/// which proves it knows the password. Either alone leaves the challenge replayable by
+/// whoever holds that one — and a challenge replayable by the armor alone would make
+/// every TGT a skeleton key.
+pub fn client_challenge_key(armor_key: &Key, long_term: &Key) -> Result<Key> {
+    let mixed = crate::crypto::kdf::cf2(
+        armor_key.bytes(),
+        "clientchallengearmor",
+        long_term.enctype(),
+        long_term.bytes(),
+        "challengelongterm",
+    )?;
+    Key::new(long_term.enctype(), mixed)
+}
+
+/// The key the KDC answers the challenge with: the same construction under
+/// `"kdcchallengearmor"`.
+///
+/// A different pepper, not a different secret: the point is that a client seeing this
+/// decrypt can tell it is talking to a KDC that holds the long-term key, so a server
+/// that merely relays the armor cannot impersonate one.
+pub fn kdc_challenge_key(armor_key: &Key, long_term: &Key) -> Result<Key> {
+    let mixed = crate::crypto::kdf::cf2(
+        armor_key.bytes(),
+        "kdcchallengearmor",
+        long_term.enctype(),
+        long_term.bytes(),
+        "challengelongterm",
+    )?;
+    Key::new(long_term.enctype(), mixed)
+}
+
+/// The KDC's half of the encrypted challenge: a timestamp sealed in the KDC challenge
+/// key, as `PA-ENCRYPTED-CHALLENGE` sends it.
+pub fn kdc_challenge(
+    cipher: &dyn Cipher,
+    armor_key: &Key,
+    long_term: &Key,
+    time: i64,
+    usec: u32,
+) -> Result<Vec<u8>> {
+    let key = kdc_challenge_key(armor_key, long_term)?;
+    let ts = der::seq(&[
+        der::field(0, der::time(time)),
+        der::field(1, der::int(i64::from(usec))),
+    ]);
+    EncryptedData::seal(cipher, &key, usage::ENC_CHALLENGE_KDC, None, &ts).map(|e| e.encode())
+}
+
+/// `KrbFastFinished` (RFC 6113 §5.4.2.4): what makes an armored reply provably the
+/// answer to *this* ticket.
+///
+/// The checksum covers the ticket in usage 53, so a KDC — or anything on the path —
+/// cannot swap the ticket for another and keep the rest of the reply. MIT's client
+/// refuses a reply without it, which is how this got implemented: the property is
+/// "the ticket is the one the KDC issued", and a reply that merely decrypts does not
+/// establish it.
+pub fn finished(
+    cipher: &dyn Cipher,
+    armor_key: &Key,
+    ticket: &[u8],
+    client: &crate::name::Principal,
+    time: i64,
+    usec: u32,
+) -> Result<Vec<u8>> {
+    let checksum = cipher.checksum(armor_key, usage::FAST_FINISHED, ticket)?;
+    Ok(der::seq(&[
+        der::field(0, der::time(time)),
+        der::field(1, der::int(i64::from(usec))),
+        der::field(2, der::general_string(&client.realm)),
+        der::field(3, client.encode_name()),
+        der::field(
+            4,
+            der::seq(&[
+                der::field(0, der::int(i64::from(armor_key.enctype().checksum_type()))),
+                der::field(1, der::octets(&checksum)),
+            ]),
+        ),
+    ]))
+}
+
+/// A `strengthen_key` and the reply key it produces (RFC 6113 §5.4.2.2).
+///
+/// The AS-REP's `enc-part` is sealed in the client's long-term key, and that is an
+/// oracle: an attacker who recorded the exchange can try passwords against it. FAST
+/// closes it by mixing a random per-exchange secret into the reply key —
+/// `cf2(strengthen, "strengthenkey", reply, "replykey")` — and delivering that secret
+/// only inside the armor. A guess cannot be checked without it, so the oracle is gone.
+///
+/// Doing without this would leave the *request* protected and the *reply* attackable,
+/// which is the half-measure this module refuses to be.
+pub fn strengthen(cipher: &dyn Cipher, reply_key: &Key) -> Result<(Key, Key)> {
+    let strength = cipher.random(reply_key.enctype())?;
+    let strengthened = crate::crypto::kdf::cf2(
+        strength.bytes(),
+        "strengthenkey",
+        reply_key.enctype(),
+        reply_key.bytes(),
+        "replykey",
+    )?;
+    let key = Key::new(reply_key.enctype(), strengthened)?;
+    Ok((strength, key))
 }
 
 /// The key an armored request is encrypted under: the session key of the ticket its
@@ -472,6 +610,8 @@ mod tests {
         let wrapped = wrap_reply(
             &key(),
             &[(crate::msg::PA_ETYPE_INFO2, b"salts".to_vec())],
+            None,
+            None,
             0x4242,
             &OwnCipher,
         )

@@ -37,6 +37,20 @@ pub mod pkinit;
 /// S4U2Self (MS-SFU): a service asking for a ticket in somebody else's name.
 pub mod s4u;
 
+/// The `till` a request asks for, with RFC 4120 §5.4.1's zero read as "as long as you allow".
+///
+/// Heimdal's `_kdc_fix_time` (`kdc/kerberos5.c`) does the same, with the comment "fix for old
+/// clients": a literal zero is the epoch, so `min(0, now + max_life)` is a ticket that ends
+/// before it starts. The KDC then refuses it as `KDC_ERR_NEVER_VALID` — telling a client whose
+/// `kinit` just succeeded that its brand-new TGT is expired, which is exactly as useful as it
+/// sounds, and it is what the ad-join stand reported.
+///
+/// `i64::MAX` rather than a computed bound: the caller's `min` with the configured lifetime is
+/// what decides the end, and this function's only job is to stop zero being taken literally.
+pub(super) fn till_of(body: &crate::msg::KdcReqBody) -> i64 {
+    if body.till == 0 { i64::MAX } else { body.till }
+}
+
 pub use kpasswd::{VERSION_CHANGE, VERSION_SET, changepw_entry, result_payload};
 
 use std::sync::Arc;

@@ -168,7 +168,7 @@ pub fn endtime(
     server: &HdbEntry,
     start: i64,
 ) -> i64 {
-    let mut end = body.till.min(start.saturating_add(config.max_life()));
+    let mut end = super::till_of(body).min(start.saturating_add(config.max_life()));
     if let Some(max) = client.max_life {
         end = end.min(start.saturating_add(max));
     }

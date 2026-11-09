@@ -163,7 +163,7 @@ fn service_plan(
     tgt_endtime: i64,
     now: i64,
 ) -> Result<TicketPlan> {
-    let mut endtime = body.till.min(now.saturating_add(config.max_life()));
+    let mut endtime = super::till_of(body).min(now.saturating_add(config.max_life()));
     if let Some(max) = server.max_life {
         endtime = endtime.min(now.saturating_add(max));
     }

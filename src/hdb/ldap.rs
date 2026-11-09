@@ -357,14 +357,14 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
         );
     }
 
-    let kvno_heimdal = attributes.number(attrs::KEY_VERSION_NUMBER, &name)?;
+    let kvno_krb5 = attributes.number(attrs::KEY_VERSION_NUMBER, &name)?;
     let kvno_ad = attributes.number(attrs::AD_KEY_VERSION_NUMBER, &name)?;
     // Agreed first, so a contradiction is reported even when the keys would
     // otherwise pass the check below.
     let declared_kvno = agree(
         &name,
         attrs::KEY_VERSION_NUMBER,
-        kvno_heimdal,
+        kvno_krb5,
         attrs::AD_KEY_VERSION_NUMBER,
         kvno_ad,
     )?;
@@ -408,9 +408,9 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
         }
     }
 
-    let flags_heimdal = attributes.number(attrs::KDC_FLAGS, &name)?;
+    let flags_krb5 = attributes.number(attrs::KDC_FLAGS, &name)?;
     let uac = attributes.number(attrs::AD_USER_ACCOUNT_CONTROL, &name)?;
-    let flags = reconcile_flags(&name, flags_heimdal, uac)?;
+    let flags = reconcile_flags(&name, flags_krb5, uac)?;
 
     let etypes = enctypes(attributes, &name)?;
 
@@ -464,14 +464,14 @@ fn agree<T: PartialEq + std::fmt::Display>(
 /// not, the answer is the bits both agree on and an error for the rest. An
 /// account disabled in the directory and enabled in the realm is a user who
 /// cannot log in and an administrator who cannot see why.
-fn reconcile_flags(principal: &str, heimdal: Option<u32>, uac: Option<u32>) -> Result<u32> {
+fn reconcile_flags(principal: &str, krb5: Option<u32>, uac: Option<u32>) -> Result<u32> {
     let Some(uac) = uac else {
-        return Ok(heimdal.unwrap_or(0));
+        return Ok(krb5.unwrap_or(0));
     };
     let ad_disabled = uac & uac::ACCOUNTDISABLE != 0;
     let ad_locked = uac & uac::LOCKOUT != 0;
 
-    let Some(flags) = heimdal else {
+    let Some(flags) = krb5 else {
         // Only Microsoft's vocabulary: translate it.
         let mut flags = 0;
         if ad_disabled {
@@ -517,7 +517,7 @@ fn reconcile_flags(principal: &str, heimdal: Option<u32>, uac: Option<u32>) -> R
 
 /// The two spellings of the enctype restriction, reconciled.
 fn enctypes(attributes: &Attributes, principal: &str) -> Result<Option<Vec<Enctype>>> {
-    let heimdal = attributes
+    let krb5 = attributes
         .get(attrs::ENCRYPTION_TYPE)
         .iter()
         .map(|value| {
@@ -546,28 +546,28 @@ fn enctypes(attributes: &Attributes, principal: &str) -> Result<Option<Vec<Encty
         .number(attrs::AD_SUPPORTED_ENCRYPTION_TYPES, principal)?
         .map(ad_bits_to_enctypes);
 
-    match (heimdal.is_empty(), ad) {
+    match (krb5.is_empty(), ad) {
         // Neither attribute: no restriction at all, which is not the same as an
         // empty list.
         (true, None) => Ok(None),
-        (false, None) => Ok(Some(heimdal)),
+        (false, None) => Ok(Some(krb5)),
         (true, Some(from_bits)) => Ok(Some(from_bits)),
         (false, Some(from_bits)) => {
-            let mut sorted_heimdal = heimdal.clone();
-            sorted_heimdal.sort_by_key(|e| e.id());
+            let mut sorted_krb5 = krb5.clone();
+            sorted_krb5.sort_by_key(|e| e.id());
             let mut sorted_ad = from_bits.clone();
             sorted_ad.sort_by_key(|e| e.id());
-            if sorted_heimdal != sorted_ad {
+            if sorted_krb5 != sorted_ad {
                 return Err(Error::Hdb(format!(
                     "{principal}: {} lists {:?} and {} lists {:?}; two spellings of one fact that \
                      do not agree",
                     attrs::ENCRYPTION_TYPE,
-                    heimdal.iter().map(|e| e.id()).collect::<Vec<_>>(),
+                    krb5.iter().map(|e| e.id()).collect::<Vec<_>>(),
                     attrs::AD_SUPPORTED_ENCRYPTION_TYPES,
                     from_bits.iter().map(|e| e.id()).collect::<Vec<_>>()
                 )));
             }
-            Ok(Some(heimdal))
+            Ok(Some(krb5))
         }
     }
 }

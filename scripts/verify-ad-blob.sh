@@ -19,7 +19,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # container's own /tmp is not where the host can read the result.
 WORK_REL="${AD_BLOB_WORK:-target/ad-blob}"
 WORK="$ROOT/$WORK_REL"
-VENV="${AD_BLOB_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-heimdal-kdc/ad-blob-venv}"
+VENV="${AD_BLOB_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc/ad-blob-venv}"
 
 echo "== writing blobs"
 "$ROOT/scripts/cargo.sh" run --quiet --example ad-blob --features hdb-ldap -- "$WORK_REL"

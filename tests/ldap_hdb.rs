@@ -14,16 +14,16 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-use rust_heimdal_kdc::error::Error;
-use rust_heimdal_kdc::hdb::ldap::{
+use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::error::Error;
+use rust_kdc::hdb::ldap::{
     Attributes, Directory, LdapHdb, attrs, dn_for, from_attributes, to_attributes, uac,
 };
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, flags};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::kdc::{Purpose, usable_enctypes};
-use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::serve_loopback;
+use rust_kdc::hdb::{Hdb, HdbEntry, flags};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::kdc::{Purpose, usable_enctypes};
+use rust_kdc::name::Principal;
+use rust_kdc::transport::serve_loopback;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";

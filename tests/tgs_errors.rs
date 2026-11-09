@@ -9,16 +9,16 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_heimdal_kdc::der;
-use rust_heimdal_kdc::error::codes;
-use rust_heimdal_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::msg::{
+use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rust_kdc::der;
+use rust_kdc::error::codes;
+use rust_kdc::hdb::{HdbEntry, MemoryHdb};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::msg::{
     self, ApReq, Authenticator, EncKdcRepPart, EncTicketPart, EncryptedData, KdcReq, Ticket,
     encode_pa_data, kdc_options, tkt_flags,
 };
-use rust_heimdal_kdc::name::Principal;
+use rust_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const SERVICE: &str = "host/server.example.com";
@@ -441,9 +441,9 @@ fn a_service_ticket_does_not_outlive_its_tgt() {
 /// Reads the `EncTGSRepPart` out of a `TGS-REP`, decrypting with the TGT's
 /// session key — what a client does.
 fn read_reply(reply: &[u8], session_key: &Key) -> EncKdcRepPart {
-    let f = rust_heimdal_kdc::der::Fields::parse_app("TGS-REP", 13, reply)
+    let f = rust_kdc::der::Fields::parse_app("TGS-REP", 13, reply)
         .expect("a TGS request that should have succeeded was answered with an error");
-    let mut r = rust_heimdal_kdc::der::Reader::new(f.get(6, "TGS-REP").unwrap());
+    let mut r = rust_kdc::der::Reader::new(f.get(6, "TGS-REP").unwrap());
     let content = r.expect("enc-part", der::SEQUENCE).unwrap();
     let enc = EncryptedData::decode_content("enc-part", content).unwrap();
     let plain = OwnCipher

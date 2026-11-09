@@ -10,7 +10,7 @@
 //!
 //! * `fixtures/mit-crypto.json` — MIT krb5's `crypto_tests` known answers
 //!   (taken from the `krb5` crate's `testdata/`, same table MIT ships).
-//! * `fixtures/heimdal.json` — Heimdal's `n-fold-test.c`,
+//! * `fixtures/nfold.json` — Heimdal's `n-fold-test.c`,
 //!   `derived-key-test.c` and `aes-test.c`, transcribed.
 //!
 //! Run twice:
@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, Key, KeyUse, OwnCipher, usage, usage_constant};
+use rust_kdc::crypto::{Cipher, Enctype, Key, KeyUse, OwnCipher, usage, usage_constant};
 
 #[derive(serde::Deserialize)]
 struct MitVectors {
@@ -72,7 +72,7 @@ struct MitS2k {
 }
 
 #[derive(serde::Deserialize)]
-struct HeimdalVectors {
+struct NfoldVectors {
     nfold: Vec<HeimdalNFold>,
     derive: Vec<HeimdalDerive>,
     s2k: Vec<HeimdalS2k>,
@@ -106,8 +106,8 @@ fn mit() -> MitVectors {
     serde_json::from_str(include_str!("fixtures/mit-crypto.json")).expect("mit fixtures parse")
 }
 
-fn heimdal() -> HeimdalVectors {
-    serde_json::from_str(include_str!("fixtures/heimdal.json")).expect("heimdal fixtures parse")
+fn reference() -> NfoldVectors {
+    serde_json::from_str(include_str!("fixtures/nfold.json")).expect("reference fixtures parse")
 }
 
 /// Every backend under test. `rskrb5` joins the list only when its feature is
@@ -116,7 +116,7 @@ fn backends() -> Vec<Arc<dyn Cipher>> {
     #[allow(unused_mut)]
     let mut v: Vec<Arc<dyn Cipher>> = vec![OwnCipher::backend()];
     #[cfg(feature = "crypto-rskrb5")]
-    v.push(rust_heimdal_kdc::crypto::rskrb5_backend::Rskrb5Cipher::backend());
+    v.push(rust_kdc::crypto::rskrb5_backend::Rskrb5Cipher::backend());
     v
 }
 
@@ -221,7 +221,7 @@ fn mit_derive_vectors() {
                 // DERIVE_SP800_108_HMAC names its inputs as label/context/k; the
                 // trait exposes RFC 3961 key derivation, so check the function
                 // directly instead of pretending the shapes match.
-                let got = rust_heimdal_kdc::crypto::kdf_hmac_sha2(
+                let got = rust_kdc::crypto::kdf_hmac_sha2(
                     e.sha2_kind().expect("SP800-108 is SHA-2 only"),
                     &base,
                     &constant,
@@ -289,19 +289,19 @@ fn mit_string_to_key_vectors() {
 }
 
 #[test]
-fn heimdal_nfold_vectors() {
+fn nfold_vectors() {
     // n-fold is a pure function of the module, not of the backend: this pins it
     // before it is used as a DR constant anywhere.
-    for (i, t) in heimdal().nfold.iter().enumerate() {
-        let got = rust_heimdal_kdc::crypto::nfold::n_fold(t.input.as_bytes(), t.octets * 8);
+    for (i, t) in reference().nfold.iter().enumerate() {
+        let got = rust_kdc::crypto::nfold::n_fold(t.input.as_bytes(), t.octets * 8);
         assert_eq!(hex::encode(&got), t.output, "n-fold #{i} of {:?}", t.input);
     }
 }
 
 #[test]
-fn heimdal_derive_vectors() {
+fn derive_vectors() {
     for backend in backends() {
-        for (i, t) in heimdal().derive.iter().enumerate() {
+        for (i, t) in reference().derive.iter().enumerate() {
             let e = enctype(t.enctype);
             let base = hex::decode(&t.key).unwrap();
             let constant = hex::decode(&t.constant).unwrap();
@@ -328,9 +328,9 @@ fn heimdal_derive_vectors() {
 }
 
 #[test]
-fn heimdal_string_to_key_vectors() {
+fn string_to_key_vectors() {
     for backend in backends() {
-        for (i, t) in heimdal().s2k.iter().enumerate() {
+        for (i, t) in reference().s2k.iter().enumerate() {
             let e = enctype(t.enctype);
             let password = hex::decode(&t.password_hex).unwrap();
             let salt = hex::decode(&t.salt).unwrap();

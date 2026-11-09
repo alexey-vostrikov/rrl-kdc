@@ -19,9 +19,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK_REL="${PAC_LIVE_WORK:-target/pac-live}"
 WORK="$ROOT/$WORK_REL"
 PORT="${PAC_LIVE_PORT:-8888}"
-VENV="${PAC_LIVE_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-heimdal-kdc/ad-blob-venv}"
+VENV="${PAC_LIVE_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc/ad-blob-venv}"
 CONTAINER="pac-live-stand-$$"
-CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-heimdal-kdc}"
+CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc}"
 
 cleanup() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true

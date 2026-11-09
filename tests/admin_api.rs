@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::admin::{Admin, Modify, NewPrincipal, Role};
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, MemoryHdb, flags as entry_flags};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::serve_loopback;
+use rust_kdc::admin::{Admin, Modify, NewPrincipal, Role};
+use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb, flags as entry_flags};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::name::Principal;
+use rust_kdc::transport::serve_loopback;
 
 const REALM: &str = "EXAMPLE.COM";
 const NOW: i64 = 1_700_000_000;
@@ -280,7 +280,7 @@ fn the_keytab_carries_every_key_the_entry_holds() {
     );
     // The keytab must survive a round trip through the file format.
     let bytes = keytab.to_bytes();
-    let back = rust_heimdal_kdc::hdb::Keytab::parse(&bytes).unwrap();
+    let back = rust_kdc::hdb::Keytab::parse(&bytes).unwrap();
     assert_eq!(back.entries().len(), keytab.entries().len());
 }
 

@@ -1,13 +1,13 @@
 [package]
-name = "rust-heimdal-kdc"
+name = "rust-kdc"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99.1"
-description = "Kerberos KDC core in Rust with Heimdal-compatible behaviour: sans-io AS/TGS, HDB, RFC 3961/3962/8009 crypto"
+description = "Kerberos KDC core in Rust: sans-io AS/TGS, HDB, RFC 3961/3962/8009 crypto, PAC, FAST and PKINIT"
 license = "MIT"
-repository = "https://gitlab.skala-r.ru/avostrikov/rust-heimdal-kdc"
+repository = "https://github.com/alexey-vostrikov/rust-kdc"
 readme = "README.md"
-keywords = ["kerberos", "kdc", "krb5", "heimdal", "rfc4120"]
+keywords = ["kerberos", "kdc", "krb5", "rfc4120", "authentication"]
 categories = ["authentication", "cryptography", "network-programming"]
 
 [dependencies]

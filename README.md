@@ -1,4 +1,4 @@
-# rust-heimdal-kdc
+# rust-kdc
 
 A Kerberos KDC core in Rust, written from scratch, with **Heimdal's behaviour as
 the specification**.
@@ -138,7 +138,7 @@ Vectors are transcribed from the sources, not invented:
 
 - `tests/fixtures/mit-crypto.json` — MIT krb5's `crypto_tests` known answers
   (decrypt, checksum, derive, string-to-key).
-- `tests/fixtures/heimdal.json` — Heimdal 7.99.1 `n-fold-test.c`,
+- `tests/fixtures/nfold.json` — Heimdal 7.99.1 `n-fold-test.c`,
   `derived-key-test.c`, `aes-test.c`.
 
 Three real bugs were caught by them during step 0 and are worth knowing:

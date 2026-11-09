@@ -26,12 +26,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, keytab::KeytabEntry};
-use rust_heimdal_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::serve_on;
+use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, keytab::KeytabEntry};
+use rust_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::name::Principal;
+use rust_kdc::transport::serve_on;
 
 /// The identities a PAC states, taken from the same table that seeds the database.
 ///
@@ -50,7 +50,7 @@ struct StandIdentities {
 }
 
 impl PacIdentities for StandIdentities {
-    fn identity(&self, principal: &Principal) -> rust_heimdal_kdc::Result<Option<Identity>> {
+    fn identity(&self, principal: &Principal) -> rust_kdc::Result<Option<Identity>> {
         let Some(rid) = self.rids.get(&principal.to_string()) else {
             // Not an error: a principal the directory has not been told about gets a
             // ticket without a PAC, which is what `TASQ-3.4`'s seam promises.
@@ -110,9 +110,9 @@ fn main() {
         principal: machine_principal.clone(),
         keys: Vec::new(),
         kvno: 0,
-        flags: rust_heimdal_kdc::hdb::flags::SERVER
-            | rust_heimdal_kdc::hdb::flags::CLIENT
-            | rust_heimdal_kdc::hdb::flags::REQUIRE_PREAUTH,
+        flags: rust_kdc::hdb::flags::SERVER
+            | rust_kdc::hdb::flags::CLIENT
+            | rust_kdc::hdb::flags::REQUIRE_PREAUTH,
         valid_start: None,
         valid_end: None,
         pw_end: None,
@@ -132,10 +132,10 @@ fn main() {
 
     let mut administrator =
         HdbEntry::user(Principal::parse(&format!("administrator@{realm}")).unwrap());
-    administrator.flags |= rust_heimdal_kdc::hdb::flags::SERVER
-        | rust_heimdal_kdc::hdb::flags::REQUIRE_PREAUTH
-        | rust_heimdal_kdc::hdb::flags::OK_AS_DELEGATE
-        | rust_heimdal_kdc::hdb::flags::TRUSTED_FOR_DELEGATION;
+    administrator.flags |= rust_kdc::hdb::flags::SERVER
+        | rust_kdc::hdb::flags::REQUIRE_PREAUTH
+        | rust_kdc::hdb::flags::OK_AS_DELEGATE
+        | rust_kdc::hdb::flags::TRUSTED_FOR_DELEGATION;
     for enctype in Enctype::ALL {
         administrator
             .add_password_key(&cipher, enctype, admin_password.as_bytes(), 1)

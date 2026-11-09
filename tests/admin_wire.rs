@@ -14,14 +14,14 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::acl::Targets;
-use rust_heimdal_kdc::admin::wire::{
+use rust_kdc::acl::Targets;
+use rust_kdc::admin::wire::{
     AdminRequest, DenyAll, Grants, Operation, Policy, Reply, Right, Rights,
 };
-use rust_heimdal_kdc::admin::{Admin, Modify, Role};
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, flags as entry_flags};
-use rust_heimdal_kdc::name::Principal;
+use rust_kdc::admin::{Admin, Modify, Role};
+use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, flags as entry_flags};
+use rust_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 

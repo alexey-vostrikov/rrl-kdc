@@ -11,9 +11,9 @@
 //!   operator's business, not a client's — and, on a hostile network, it is a hint
 //!   about the host.
 
-use rust_heimdal_kdc::crypto::Enctype;
-use rust_heimdal_kdc::der::DerError;
-use rust_heimdal_kdc::error::{Error, codes};
+use rust_kdc::crypto::Enctype;
+use rust_kdc::der::DerError;
+use rust_kdc::error::{Error, codes};
 
 /// One value of every variant, so the table below cannot silently miss one.
 fn all_variants() -> Vec<Error> {

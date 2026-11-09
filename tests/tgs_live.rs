@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::{RunningKdc, serve_loopback};
+use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::name::Principal;
+use rust_kdc::transport::{RunningKdc, serve_loopback};
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -132,18 +132,15 @@ fn a_tgs_request_without_evidence_is_refused() {
     let (db, _) = realm();
     let kdc = Kdc::new(KdcConfig::new(REALM).unwrap(), db, Arc::new(OwnCipher));
     let reply = kdc.handle(&bare_tgs_request(), 1_700_000_000);
-    let err = rust_heimdal_kdc::msg::KrbError::decode(&reply)
+    let err = rust_kdc::msg::KrbError::decode(&reply)
         .expect("a TGS request without PA-TGS-REQ must be answered with KRB-ERROR");
-    assert_eq!(
-        err.code,
-        rust_heimdal_kdc::error::codes::KRB_AP_ERR_MODIFIED
-    );
+    assert_eq!(err.code, rust_kdc::error::codes::KRB_AP_ERR_MODIFIED);
 }
 
 /// A `TGS-REQ` with no `PA-TGS-REQ` at all: the body is valid, the evidence is
 /// absent.
 fn bare_tgs_request() -> Vec<u8> {
-    use rust_heimdal_kdc::der;
+    use rust_kdc::der;
     let body = der::seq(&[
         der::field(0, der::flags32(0)),
         der::field(2, der::general_string(REALM)),

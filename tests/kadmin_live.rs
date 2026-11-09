@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::admin::wire::{Grants, Policy, Rights};
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, MemoryHdb, flags};
-use rust_heimdal_kdc::kadmin::{Kadmin, admin_entry, serve_kadmin_loopback};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::serve_loopback;
+use rust_kdc::admin::wire::{Grants, Policy, Rights};
+use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb, flags};
+use rust_kdc::kadmin::{Kadmin, admin_entry, serve_kadmin_loopback};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::name::Principal;
+use rust_kdc::transport::serve_loopback;
 
 const REALM: &str = "EXAMPLE.COM";
 const ADMIN_PASSWORD: &str = "the administrators password";
@@ -65,8 +65,8 @@ struct Stand {
     kdc: krb5::KdcClient,
     /// Held, not read: dropping it stops the KDC the client logs in against.
     #[allow(dead_code)]
-    kdc_stand: rust_heimdal_kdc::transport::RunningKdc,
-    kadmin_stand: rust_heimdal_kdc::kadmin::RunningKadmin,
+    kdc_stand: rust_kdc::transport::RunningKdc,
+    kadmin_stand: rust_kdc::kadmin::RunningKadmin,
 }
 
 fn stand_with(policy: Arc<dyn Policy>) -> Stand {

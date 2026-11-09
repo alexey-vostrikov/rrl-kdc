@@ -16,7 +16,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK_REL="${PAC_WORK:-target/pac}"
 WORK="$ROOT/$WORK_REL"
-VENV="${PAC_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-heimdal-kdc/ad-blob-venv}"
+VENV="${PAC_VENV:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc/ad-blob-venv}"
 
 echo "== sealing a PAC"
 mkdir -p "$WORK"

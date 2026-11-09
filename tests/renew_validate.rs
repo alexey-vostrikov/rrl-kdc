@@ -16,12 +16,12 @@
 mod common;
 
 use common::*;
-use rust_heimdal_kdc::crypto::usage;
-use rust_heimdal_kdc::error::codes;
-use rust_heimdal_kdc::msg::tkt_flags;
+use rust_kdc::crypto::usage;
+use rust_kdc::error::codes;
+use rust_kdc::msg::tkt_flags;
 
 /// A renewable TGT with a `renew-till` an hour of renewals away.
-fn renewable(krbtgt_key: &rust_heimdal_kdc::crypto::Key) -> Tgt {
+fn renewable(krbtgt_key: &rust_kdc::crypto::Key) -> Tgt {
     tgt_with(
         krbtgt_key,
         &alice(),
@@ -233,8 +233,8 @@ fn renewal_keeps_the_client_the_tgt_named() {
     let (_, krbtgt_key) = realm();
     let t = renewable(&krbtgt_key);
     let reply = kdc().handle(&tgs_req(&t, Knobs::renew()), NOW);
-    let f = rust_heimdal_kdc::der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
+    let f = rust_kdc::der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
     let crealm = f.string(3, "TGS-REP").unwrap();
-    let cname = rust_heimdal_kdc::name::Principal::decode_field(&f, 4, "cname", &crealm).unwrap();
+    let cname = rust_kdc::name::Principal::decode_field(&f, 4, "cname", &crealm).unwrap();
     assert_eq!(cname, alice(), "a renewal is for the same client");
 }

@@ -15,7 +15,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK_REL="${LOGON_INFO_WORK:-target/logon-info}"
 WORK="$ROOT/$WORK_REL"
-VENV="${LOGON_INFO_VENV:-${XDG_CONFIG_HOME:-$HOME/.cache}/rust-heimdal-kdc/ad-blob-venv}"
+VENV="${LOGON_INFO_VENV:-${XDG_CONFIG_HOME:-$HOME/.cache}/rust-kdc/ad-blob-venv}"
 
 echo "== encoding a logon info"
 mkdir -p "$WORK"

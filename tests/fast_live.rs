@@ -11,11 +11,11 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Enctype, OwnCipher};
-use rust_heimdal_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_heimdal_kdc::kdc::KdcConfig;
-use rust_heimdal_kdc::name::Principal;
-use rust_heimdal_kdc::transport::RunningKdc;
+use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rust_kdc::kdc::KdcConfig;
+use rust_kdc::name::Principal;
+use rust_kdc::transport::RunningKdc;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -45,8 +45,8 @@ fn realm() -> Arc<dyn Hdb> {
 
 fn start() -> RunningKdc {
     let config = KdcConfig::new(REALM).unwrap();
-    let kdc = rust_heimdal_kdc::kdc::Kdc::new(config, realm(), Arc::new(OwnCipher));
-    rust_heimdal_kdc::transport::serve_loopback(kdc)
+    let kdc = rust_kdc::kdc::Kdc::new(config, realm(), Arc::new(OwnCipher));
+    rust_kdc::transport::serve_loopback(kdc)
 }
 
 fn alice() -> krb5::Principal {

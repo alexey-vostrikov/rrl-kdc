@@ -2,11 +2,11 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use rust_heimdal_kdc::crypto::OwnCipher;
-//! use rust_heimdal_kdc::hdb::MemoryHdb;
-//! use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
+//! use rust_kdc::crypto::OwnCipher;
+//! use rust_kdc::hdb::MemoryHdb;
+//! use rust_kdc::kdc::{Kdc, KdcConfig};
 //!
-//! # fn main() -> rust_heimdal_kdc::Result<()> {
+//! # fn main() -> rust_kdc::Result<()> {
 //! let kdc = Kdc::new(
 //!     KdcConfig::new("EXAMPLE.COM")?,
 //!     Arc::new(MemoryHdb::new()),

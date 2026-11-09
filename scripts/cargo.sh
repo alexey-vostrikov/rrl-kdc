@@ -19,7 +19,7 @@ set -eu
 
 IMAGE="${KDC_IMAGE:-rust:1.99.1-bookworm}"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-heimdal-kdc}"
+CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc}"
 
 mkdir -p "$CACHE/cargo" "$CACHE/rustup" "$ROOT/target"
 

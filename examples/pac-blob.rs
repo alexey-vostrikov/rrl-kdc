@@ -5,8 +5,8 @@
 //! script is the acceptance, and it is the only evidence that this crate's PAC is
 //! a PAC somebody else's parser agrees with.
 
-use rust_heimdal_kdc::crypto::{Enctype, Key};
-use rust_heimdal_kdc::kdc::pac::{
+use rust_kdc::crypto::{Enctype, Key};
+use rust_kdc::kdc::pac::{
     Buffer, PAC_LOGON_INFO, PAC_PRIVSVR_CHECKSUM, PAC_SERVER_CHECKSUM, SignatureType, client_info,
     pac, seal,
 };

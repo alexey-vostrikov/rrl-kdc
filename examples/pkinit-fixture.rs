@@ -15,7 +15,7 @@
 
 use std::process::Command;
 
-use rust_heimdal_kdc::der;
+use rust_kdc::der;
 
 /// A `KDC-REQ-BODY` as an AS-REQ carries it: the body the `paChecksum` covers.
 ///

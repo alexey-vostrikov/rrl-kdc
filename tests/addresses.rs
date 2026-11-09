@@ -15,15 +15,15 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, OwnCipher, usage};
-use rust_heimdal_kdc::der;
-use rust_heimdal_kdc::error::codes;
-use rust_heimdal_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::msg::{
+use rust_kdc::crypto::{Cipher, Enctype, OwnCipher, usage};
+use rust_kdc::der;
+use rust_kdc::error::codes;
+use rust_kdc::hdb::{HdbEntry, MemoryHdb};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::msg::{
     self, EncryptedData, KdcReq, encode_enc_ts_enc, encode_etype_info2, encode_pa_data, kdc_options,
 };
-use rust_heimdal_kdc::name::Principal;
+use rust_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const NOW: i64 = 1_700_000_000;
@@ -35,7 +35,7 @@ fn alice() -> Principal {
 /// `HostAddress ::= SEQUENCE { addr-type [0], address [1] }`, and
 /// `HostAddresses ::= SEQUENCE OF HostAddress`.
 mod addr {
-    use rust_heimdal_kdc::der;
+    use rust_kdc::der;
 
     /// `KRB5_ADDRESS_IPV4`.
     pub const IPV4: i32 = 2;

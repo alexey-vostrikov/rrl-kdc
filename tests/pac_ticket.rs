@@ -11,16 +11,16 @@
 
 use std::sync::Arc;
 
-use rust_heimdal_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_heimdal_kdc::der;
-use rust_heimdal_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_heimdal_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
-use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
-use rust_heimdal_kdc::msg::{
+use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rust_kdc::der;
+use rust_kdc::hdb::{HdbEntry, MemoryHdb};
+use rust_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
+use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::msg::{
     self, ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_pa_data, kdc_options,
     tkt_flags,
 };
-use rust_heimdal_kdc::name::Principal;
+use rust_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const SERVICE: &str = "host/server.example.com";
@@ -40,7 +40,7 @@ struct Directory {
 }
 
 impl PacIdentities for Directory {
-    fn identity(&self, principal: &Principal) -> rust_heimdal_kdc::Result<Option<Identity>> {
+    fn identity(&self, principal: &Principal) -> rust_kdc::Result<Option<Identity>> {
         Ok((*principal == alice()).then(|| self.identity.clone()))
     }
 }
@@ -308,11 +308,11 @@ fn both_signatures_are_keyed_by_the_keys_they_name() {
         }
     }
     let recompute = |key: &Key, data: &[u8]| {
-        let kc = rust_heimdal_kdc::crypto::kdf::derive_key(
+        let kc = rust_kdc::crypto::kdf::derive_key(
             key.enctype(),
             key.bytes(),
             17,
-            rust_heimdal_kdc::crypto::kdf::KeyUse::Checksum,
+            rust_kdc::crypto::kdf::KeyUse::Checksum,
         )
         .unwrap();
         use hmac::{Hmac, KeyInit, Mac};
@@ -358,7 +358,7 @@ fn an_account_the_directory_does_not_know_gets_a_ticket_without_a_pac() {
     // deployment state, not an authentication failure.
     struct Empty;
     impl PacIdentities for Empty {
-        fn identity(&self, _: &Principal) -> rust_heimdal_kdc::Result<Option<Identity>> {
+        fn identity(&self, _: &Principal) -> rust_kdc::Result<Option<Identity>> {
             Ok(None)
         }
     }

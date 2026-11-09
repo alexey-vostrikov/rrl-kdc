@@ -1,10 +1,19 @@
 name: ci
 
-# Everything compiles inside `rust:1.99.1-bookworm`, the same image a developer
-# runs locally: the toolchain is the image tag, not a `rustup` download, so what
-# CI builds with is what the repository says it builds with. `act push` runs
-# this file as it is, which is the point — a workflow that only works on GitHub
-# is a workflow nobody has run.
+# Everything compiles inside the toolchain image this repository builds itself
+# (`docker/bullseye.Dockerfile`): Rust 1.99.1 on Debian 11, glibc 2.31.
+#
+# Why CI builds the image instead of naming one: `rust:1.99.1-bullseye` does not exist on
+# Docker Hub — the official project stopped publishing bullseye variants after 1.90 — and the
+# tag that does exist, `rust:1.99.1-bookworm`, links against glibc 2.36. Tests passing there
+# would say nothing about the binary that has to start on a Debian 11 or Astra stand. Naming
+# an image that exists is not the same as testing on the base we ship.
+#
+# The cost is one `docker build` per run, which is why the whole gate set is a single job and
+# why the build layers are cached through the registry-free `docker build` cache on the runner.
+#
+# `scripts/cargo.sh` runs the same image locally, so a developer and CI differ in nothing but
+# who started the container.
 on:
   push:
   pull_request:
@@ -12,108 +21,59 @@ on:
 permissions:
   contents: read
 
+env:
+  IMAGE: rust:1.99.1-bullseye
+
 jobs:
   gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    container:
-      image: rust:1.99.1-bookworm
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
-      # The image ships exactly the channel `rust-toolchain.toml` names; these
-      # point at its own toolchain rather than at a home directory that does not
-      # exist in a fresh container.
-      RUSTUP_HOME: /usr/local/rustup
-      CARGO_HOME: /usr/local/cargo
-    steps:
-      - uses: actions/checkout@v4
-
-      # `act` replaces PATH when it runs a step (its own node goes first), so the
-      # image's PATH is published for the later steps explicitly. On GitHub the
-      # image already has it and the duplicate entry is harmless.
-      - name: Publish the toolchain on PATH
-        run: echo "/usr/local/cargo/bin" >> "$GITHUB_PATH"
-
-      # The pin lives in `rust-toolchain.toml`; the image tag has to agree with
-      # it. A mismatch is a gate failure, not a warning: building with a
-      # different compiler than the one the repository declares is how a
-      # `cargo fmt --check` goes red for a reason nobody can reproduce locally.
-      - name: The toolchain matches rust-toolchain.toml
-        run: |
-          declared=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
-          actual=$(rustc --version | cut -d' ' -f2)
-          echo "declared=$declared actual=$actual"
-          test "$declared" = "$actual"
-
-      - name: rustfmt
-        run: cargo fmt --all --check
-
-      # `-D warnings` rather than a tail of output: a warning nobody reads is a
-      # warning that becomes a defect, and this crate is small enough that
-      # holding the line costs nothing.
-      # Every feature, because a feature that only compiles when somebody
-      # remembers to ask for it is a feature that stops compiling unnoticed. The
-      # backends (redb) and the cross-check (rskrb5) are both in here.
-      - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      # The primary configuration: no optional backend and no second crypto
-      # implementation. This is what a consumer gets by default, so it is what
-      # the gate must prove first.
-      - name: test
-        run: cargo test
-
-      # Everything on: the redb backend, the change-password service, and the
-      # cross-check against `rskrb5`'s crypto.
-      - name: test with every feature
-        run: cargo test --all-features
-
-  # Coverage is a separate job, not another step in `gates`, because a number that
-  # fails the build deserves its own line in the summary. The floor is a regression
-  # alarm: it catches a new module that arrives without tests, which is the failure
-  # mode a review misses and a percentage does not.
-  coverage:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    container:
-      image: rust:1.99.1-bookworm
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTUP_HOME: /usr/local/rustup
-      CARGO_HOME: /usr/local/cargo
       COVERAGE_MIN: "88"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Publish the toolchain on PATH
-        run: echo "/usr/local/cargo/bin" >> "$GITHUB_PATH"
+      # Built from the repository, so a change to the toolchain is a reviewed diff rather than
+      # somebody's laptop.
+      - name: Build the toolchain image
+        run: docker build -t "$IMAGE" -f docker/bullseye.Dockerfile .
 
-      # Both cached between runs: `cargo-llvm-cov` is a compile of its own, and
-      # `llvm-tools-preview` is a toolchain component. Without the cache this job
-      # spends most of its time installing rather than measuring.
-      - name: Cache the coverage tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            /usr/local/cargo/bin/cargo-llvm-cov
-            /usr/local/rustup/toolchains
-          key: coverage-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-
-      - name: Install the coverage tool
+      # The pin lives in `rust-toolchain.toml`; the image has to agree with it. A mismatch is a
+      # gate failure, not a warning: building with a different compiler than the one the
+      # repository declares is how a `cargo fmt --check` goes red for a reason nobody can
+      # reproduce.
+      - name: The toolchain matches rust-toolchain.toml
         run: |
-          command -v cargo-llvm-cov >/dev/null || {
-            rustup component add llvm-tools-preview
-            cargo install cargo-llvm-cov --locked
-          }
+          declared=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          actual=$(docker run --rm "$IMAGE" rustc --version | cut -d' ' -f2)
+          echo "declared=$declared actual=$actual"
+          test "$declared" = "$actual"
 
-      # `--ignore-filename-regex` keeps the integration tests out of the
-      # denominator: what is measured is the library, which is what a consumer
-      # gets, not the harness that proves it.
-      - name: Measure and enforce the floor
-        run: |
-          cargo llvm-cov --all-features --workspace --summary-only \
-            --ignore-filename-regex "(^|/)tests/|(^|/)examples/" | tee /tmp/cov.txt
-          lines=$(grep -E "^TOTAL" /tmp/cov.txt | tail -1 | awk '{print $10}' | tr -d '%')
-          echo "lines covered: ${lines}% (floor ${COVERAGE_MIN}%)"
-          awk -v min="$COVERAGE_MIN" -v got="$lines" "BEGIN { if (got+0 < min+0) exit 1 }"
+      # The base is asserted, not assumed: this whole workflow exists because the glibc of the
+      # image is the glibc of the shipped binary.
+      - name: The base is bullseye
+        run: docker run --rm "$IMAGE" sh -c 'ldd --version | head -1 | grep -q 2\.31'
 
+      - name: rustfmt
+        run: ./scripts/cargo.sh fmt --all --check
+
+      # `-D warnings` rather than a tail of output: a warning nobody reads is a warning that
+      # becomes a defect. Every feature, because a feature that only compiles when somebody
+      # remembers to ask for it is a feature that stops compiling unnoticed.
+      - name: clippy
+        run: ./scripts/cargo.sh clippy --all-targets --all-features -- -D warnings
+
+      # The primary configuration: what a consumer gets by default.
+      - name: test
+        run: ./scripts/cargo.sh test
+
+      # Everything on: the optional backends, the LDAP database, PKINIT, and the cross-check
+      # against `rskrb5`'s crypto.
+      - name: test with every feature
+        run: ./scripts/cargo.sh test --all-features
+
+      # The floor is a regression alarm: it catches a new module that arrives without tests,
+      # which is the failure mode a review misses and a percentage does not.
+      - name: coverage, and the floor
+        run: ./scripts/coverage.sh --check

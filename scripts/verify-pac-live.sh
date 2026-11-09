@@ -46,7 +46,7 @@ docker run -d --name "$CONTAINER" --network host \
     -e KDC_REALM="${PAC_REALM:-AD.EXAMPLE.COM}" \
     -e KDC_HOST="${PAC_KDC_HOST:-samba.ad.example.com}" \
     -e KDC_DOMAIN_SID="${PAC_EXPECT_DOMAIN_SID:-S-1-5-21-100-200-300}" \
-    rust:1.99.1-bookworm \
+    rust:1.99.1-bullseye \
     /w/target/debug/examples/kdc-stand "127.0.0.1:$PORT" "/w/$WORK_REL" >/dev/null
 
 # The stand prints "serving on" once the socket is bound, and a client that arrived a

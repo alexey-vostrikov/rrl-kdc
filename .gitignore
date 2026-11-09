@@ -3,3 +3,6 @@ Cargo.lock
 *.swp
 /.vscode
 /.idea
+
+# cargo-mutants writes its report here
+/mutants.out

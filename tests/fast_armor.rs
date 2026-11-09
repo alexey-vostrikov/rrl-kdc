@@ -167,6 +167,11 @@ fn body(nonce: u32) -> Vec<u8> {
 
 /// An armored `AS-REQ`, built the way a client that holds a TGT builds one.
 fn armored_as_req(nonce: u32) -> (Vec<u8>, Key) {
+    armored_as_req_with(nonce, 0)
+}
+
+/// The same, with `fast-options` bits set — `0x4000_0000` is `hide-client-names`.
+fn armored_as_req_with(nonce: u32, options: u32) -> (Vec<u8>, Key) {
     let cipher = OwnCipher;
     let (ticket, armor_key) = armor_ticket();
     let outer_body = body(nonce);
@@ -184,9 +189,10 @@ fn armored_as_req(nonce: u32) -> (Vec<u8>, Key) {
     )
     .unwrap();
 
+    // `BIT STRING` content: the unused-bit count, then the bits, bit 0 the most
+    // significant — so `hide-client-names`, bit 1, is the high bit of the second octet.
     let inner = FastRequest {
-        // No fast-options: nothing in RFC 6113 §5.4.1's list is requested here.
-        fast_options: vec![0],
+        fast_options: fast::options_bits(options),
         padata: vec![(fast::PA_ENCRYPTED_CHALLENGE, timestamp.encode())],
         req_body: outer_body.clone(),
     };
@@ -541,5 +547,89 @@ fn the_reply_names_the_ticket_it_answers() {
             .verify_checksum(&armor_key, fast::usage::FAST_FINISHED, &ticket, sum)
             .is_ok(),
         "the checksum does not cover the ticket that was sent"
+    );
+}
+
+#[test]
+fn hide_client_names_keeps_the_client_out_of_the_reply() {
+    // RFC 6113 §5.4.4.2. Without this option the outer AS-REP carries the client's name in
+    // cleartext, which is what makes traffic analysis of a Kerberos realm trivial: an
+    // observer on the wire learns who logged in, when, and how often.
+    let (request, _) = armored_as_req_with(0x4246, fast::HIDE_CLIENT_NAMES);
+    let reply = kdc().handle(&request, NOW);
+    assert!(
+        rust_heimdal_kdc::msg::KrbError::decode(&reply).is_err(),
+        "a request with hide-client-names must still be answered: {:?}",
+        rust_heimdal_kdc::msg::KrbError::decode(&reply)
+    );
+
+    let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
+    let crealm = f.string(3, "AS-REP").unwrap();
+    let cname = f
+        .opt(4)
+        .map(|raw| {
+            let mut r = der::Reader::new(raw);
+            let seq = r.next("cname").unwrap();
+            rust_heimdal_kdc::name::Principal::decode("cname", seq.content, &crealm).unwrap()
+        })
+        .expect("the reply names some client");
+    assert_eq!(crealm, "WELLKNOWN:ANONYMOUS");
+    assert_eq!(cname.to_string(), "WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS");
+
+    // And the property behind the name: the octets on the wire do not contain the real
+    // client's name at all. The ticket is sealed with the service key, so the identity
+    // survives only inside it.
+    assert!(
+        !reply.windows(5).any(|w| w == b"alice"),
+        "the reply still carries the client's name in cleartext"
+    );
+}
+
+#[test]
+fn without_the_option_the_reply_names_the_client() {
+    // The pair that makes the test above mean something: a reply that never named the
+    // client would pass it for the wrong reason.
+    let (request, _) = armored_as_req_with(0x4247, 0);
+    let reply = kdc().handle(&request, NOW);
+    let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
+    assert_eq!(f.string(3, "AS-REP").unwrap(), REALM);
+    assert!(
+        reply.windows(5).any(|w| w == b"alice"),
+        "the client's name must be in the clear when the option is not requested"
+    );
+}
+
+#[test]
+fn an_unknown_critical_fast_option_is_refused() {
+    // Bit 2 (0x2000_0000) is in the critical range and is not defined by RFC 6113: the
+    // client asked for behaviour this KDC will not provide, and answering would give it a
+    // reply whose guarantees it misreads.
+    let (request, armor_key) = armored_as_req_with(0x4248, 0x2000_0000);
+    let reply = kdc().handle(&request, NOW);
+    let err = rust_heimdal_kdc::msg::KrbError::decode(&reply)
+        .expect("an unknown critical fast-option must be refused");
+    assert_eq!(
+        err.code,
+        rust_heimdal_kdc::error::codes::KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
+        "{}",
+        err.e_text.clone().unwrap_or_default()
+    );
+    assert!(
+        !err.padata.is_empty() || err.e_data.is_some(),
+        "the error must travel inside the armor, so the client can read it"
+    );
+    let _ = armor_key;
+}
+
+#[test]
+fn a_non_critical_fast_option_is_ignored() {
+    // Bit 16 onwards are non-critical: RFC 6113 requires a conforming KDC to ignore what it
+    // does not implement, so bit 16 must not cost the client its ticket.
+    let (request, _) = armored_as_req_with(0x4249, 0x0000_8000);
+    let reply = kdc().handle(&request, NOW);
+    assert!(
+        rust_heimdal_kdc::msg::KrbError::decode(&reply).is_err(),
+        "an unknown non-critical option must be ignored: {:?}",
+        rust_heimdal_kdc::msg::KrbError::decode(&reply)
     );
 }

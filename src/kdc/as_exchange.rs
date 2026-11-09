@@ -239,7 +239,7 @@ impl Kdc {
         // FAST first: if the client armored the exchange, the request that matters is
         // the one inside the armor, and the reply has to be armored back.
         let Some(armored_bytes) = req.padata(super::fast::PA_FX_FAST) else {
-            return self.answer_as(&req.body, &req.padata, now, None);
+            return self.answer_as(&req.body, &req.padata, now, None, false);
         };
         let armored = super::fast::ArmoredRequest::decode(armored_bytes)?;
         let armor_key = self.armor_key(&armored, now)?;
@@ -247,7 +247,23 @@ impl Kdc {
         let mut r = crate::der::Reader::new(&inner.req_body);
         let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
         let body = KdcReqBody::decode(content)?;
-        if body.realm != req.body.realm {
+
+        // `hide-client-names` decides how much of the outer body means anything: with it
+        // set, RFC 6113 §5.4.4.2 says the client identity in the outer body is to be
+        // **ignored**, so comparing realms would refuse a request that hid its names on
+        // purpose. Without it, the two bodies are one request sent twice and must agree.
+        let options = inner.options();
+        if let Some(bad) = super::fast::unsupported_critical(options) {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
+                text: format!(
+                    "PA-FX-FAST: unsupported critical fast-options {bad:#010x}; this KDC \
+                     implements hide-client-names only"
+                ),
+            });
+        }
+        let hide = options & super::fast::HIDE_CLIENT_NAMES != 0;
+        if !hide && body.realm != req.body.realm {
             // The armored body is the one answered, but the outer body is what was
             // signed; a pair that disagrees about the realm is not a request this KDC
             // can make sense of.
@@ -255,7 +271,7 @@ impl Kdc {
                 "PA-FX-FAST: the armored body names a different realm than the request".into(),
             ));
         }
-        self.answer_as(&body, &inner.padata, now, Some(&armor_key))
+        self.answer_as(&body, &inner.padata, now, Some(&armor_key), hide)
     }
 
     /// The key an armored request is encrypted under: the session key of the ticket its
@@ -342,12 +358,16 @@ impl Kdc {
     /// `armor` is `Some` when the request arrived inside `PA-FX-FAST`; the reply is then
     /// sealed in a strengthened key and its `padata` travels inside
     /// `PA-FX-FAST-REPLY`.
+    /// `hide` is RFC 6113's `hide-client-names`: the reply names
+    /// `WELLKNOWN/ANONYMOUS` instead of the client, and the real name survives only inside
+    /// the ticket, which is sealed with a service key.
     fn answer_as(
         &self,
         body: &KdcReqBody,
         padata: &[(i32, Vec<u8>)],
         now: i64,
         armor: Option<&Key>,
+        hide: bool,
     ) -> Result<Vec<u8>> {
         let config = self.config();
         if body.realm != config.realm() {
@@ -602,11 +622,22 @@ impl Kdc {
             )];
         }
 
+        // `hide-client-names`: the outer reply is the one an observer reads, so under this
+        // option it names the anonymous principal. The ticket keeps the real client —
+        // it is encrypted under the service key, and the client is the only one who needs
+        // to know whom the ticket is about.
+        let (crealm, cname) = if hide {
+            let anonymous = super::fast::anonymous_principal();
+            (anonymous.realm.clone(), anonymous)
+        } else {
+            (client.principal.realm.clone(), client.principal.clone())
+        };
+
         Ok(KdcRep {
             msg_type: AS_REP,
             padata: padata_out,
-            crealm: client.principal.realm.clone(),
-            cname: client.principal.clone(),
+            crealm,
+            cname,
             ticket,
             enc_part,
         }

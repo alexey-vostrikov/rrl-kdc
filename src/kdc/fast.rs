@@ -98,6 +98,61 @@ pub const PA_FX_FAST_REPLY: i32 = 136;
 /// so the challenge replaces it rather than accompanying it.
 pub const PA_ENCRYPTED_CHALLENGE: i32 = 138;
 
+/// `hide-client-names`, RFC 6113 §5.4.4.2: bit 1, which in `KerberosFlags` numbering is
+/// the second-highest bit of the first octet.
+pub const HIDE_CLIENT_NAMES: u32 = 0x4000_0000;
+
+/// Bit 0, reserved for expansion.
+const RESERVED_BIT: u32 = 0x8000_0000;
+
+/// Bits 1 through 15 are the critical options; bit 16 and above are non-critical and must
+/// be ignored by a conforming KDC.
+const CRITICAL_MASK: u32 = 0x7fff_0000;
+
+/// The critical `fast-options` bits this KDC implements: only `hide-client-names`.
+const IMPLEMENTED: u32 = HIDE_CLIENT_NAMES;
+
+/// The critical options in `bits` that this KDC does not implement, if any.
+///
+/// RFC 6113 §5.4.4.2 requires failing such a request with
+/// `KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS`: the client asked for behaviour it will not
+/// get, and answering anyway hands it a reply whose guarantees it will misread.
+pub fn unsupported_critical(bits: u32) -> Option<u32> {
+    let bad = bits & CRITICAL_MASK & !IMPLEMENTED;
+    if bad != 0 {
+        return Some(bad);
+    }
+    // The reserved bit is not in the critical range, and RFC 6113 neither requires failing
+    // nor allows ignoring it explicitly. A client that sets it speaks a later version of
+    // the framework, so the honest answer is a refusal rather than a reply it may not
+    // understand.
+    if bits & RESERVED_BIT != 0 {
+        return Some(RESERVED_BIT);
+    }
+    None
+}
+
+/// A `fast-options` `BIT STRING` *content* for `options`, the inverse of
+/// [`FastRequest::options`].
+///
+/// RFC 4120 declares `KerberosFlags ::= BIT STRING (SIZE (32..))`, so the encoding is
+/// always four value octets with an unused count of zero — never the shortest form. A
+/// client that trims trailing zero octets sends a bit string this KDC reads as a smaller
+/// number, which for `hide-client-names` means "not requested".
+pub fn options_bits(options: u32) -> Vec<u8> {
+    let mut content = vec![0u8];
+    content.extend_from_slice(&options.to_be_bytes());
+    content
+}
+
+/// The principal a reply names under `hide-client-names` (RFC 6113 §5.4.4.2, RFC 6112).
+///
+/// `WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS` — the realm is not the client's, because the
+/// whole point is that the reply no longer says which realm the client belongs to.
+pub fn anonymous_principal() -> crate::name::Principal {
+    crate::name::Principal::new(1, ["WELLKNOWN", "ANONYMOUS"], "WELLKNOWN:ANONYMOUS")
+}
+
 /// `PA-FX-COOKIE`: the stateless pre-authentication state a KDC hands back.
 pub const PA_FX_COOKIE: i32 = 133;
 
@@ -315,18 +370,19 @@ impl FastRequest {
         ])
     }
 
-    /// The fast-options bits, as a number: bit 0 is `request-anonymous`.
+    /// The fast-options bits, as a number, **bit 0 the most significant**.
+    ///
+    /// `KerberosFlags` numbers its bits from the top, so bit 1 — RFC 6113's
+    /// `hide-client-names` — is `0x4000_0000`, not `0x0000_0002`. Reading it the other way
+    /// finds no option set in any real request and looks like "clients do not use this".
     pub fn options(&self) -> u32 {
-        // A `BIT STRING`'s content is a count of unused bits followed by the octets.
-        let mut value = 0u32;
-        for (i, byte) in self.fast_options.iter().skip(1).take(4).enumerate() {
-            for bit in 0..8 {
-                if byte & (0x80 >> bit) != 0 {
-                    value |= 1 << (i * 8 + bit);
-                }
-            }
-        }
-        value
+        // Decoded by the same function the rest of the crate uses for `KerberosFlags`, so
+        // that a bit constant means one thing everywhere. The first version of this looped
+        // over the octets and shifted by the bit's position instead, producing a *logical
+        // bit number* — flag 1 came out as `0x2` while every other flag constant in this
+        // crate spells it `0x4000_0000`. Nothing ever matched, which is why the option was
+        // read, parsed and then silently never applied.
+        crate::der::as_flags32("fast-options", &self.fast_options).unwrap_or(0)
     }
 }
 
@@ -639,20 +695,69 @@ mod tests {
 
     #[test]
     fn the_fast_options_are_read_as_bits() {
-        // `request-anonymous` is bit 0 of the `BIT STRING`.
-        let mut options = request();
-        options.fast_options = vec![0, 0x80];
+        // The bit numbering is `KerberosFlags`': bit 0 is the most significant, so flag 1
+        // is `0x4000_0000` — the same spelling `kdc_options::FORWARDABLE` uses for flag 1
+        // of a different field. A test that pinned "flag 1 is 0x2" is what let the option
+        // be parsed and then never matched against anything.
+        let mut hide = request();
+        hide.fast_options = options_bits(HIDE_CLIENT_NAMES);
+        assert_eq!(hide.options(), 0x4000_0000, "hide-client-names is flag 1");
+
+        let mut none = request();
+        none.fast_options = options_bits(0);
+        assert_eq!(none.options(), 0);
+
+        let mut mixed = request();
+        mixed.fast_options = options_bits(0x4000_8000);
         assert_eq!(
-            options.options(),
-            1,
-            "bit 0 is the high bit of the first octet"
+            mixed.options(),
+            0x4000_8000,
+            "flag 1 plus a non-critical flag 16"
         );
-        let mut both = request();
-        both.fast_options = vec![0, 0x80, 0x40];
+
+        // The reserved bit is flag 0, `0x8000_0000`.
+        let mut reserved = request();
+        reserved.fast_options = options_bits(0x8000_0000);
+        assert_eq!(reserved.options(), 0x8000_0000);
+    }
+
+    #[test]
+    fn the_option_encoding_keeps_the_full_width() {
+        // `KerberosFlags ::= BIT STRING (SIZE (32..))`: four octets and an unused count of
+        // zero. Trimming to the shortest form would make the same option read as a
+        // smaller number on the other side.
+        assert_eq!(options_bits(0), vec![0, 0, 0, 0, 0]);
+        assert_eq!(options_bits(HIDE_CLIENT_NAMES), vec![0, 0x40, 0, 0, 0]);
+    }
+
+    #[test]
+    fn only_the_implemented_critical_options_pass_the_check() {
+        // Bit 1 is implemented; bits 2..=15 are critical and unknown; bit 16 onwards are
+        // non-critical and must be ignored; bit 0 is reserved.
+        assert_eq!(unsupported_critical(0), None);
+        assert_eq!(unsupported_critical(HIDE_CLIENT_NAMES), None);
         assert_eq!(
-            both.options(),
-            0x201,
-            "bit 0 of the first octet and bit 9 of the second"
+            unsupported_critical(0x0000_8000),
+            None,
+            "flag 16 is non-critical"
+        );
+        assert_eq!(
+            unsupported_critical(0x2000_0000),
+            Some(0x2000_0000),
+            "flag 2 is critical and undefined"
+        );
+        // Flag 15 is `1 << (31 - 15)` = `0x0001_0000`, the last critical one; flag 16 is
+        // `0x0000_8000`, the first non-critical. One shift apart, opposite rules.
+        assert_eq!(
+            unsupported_critical(HIDE_CLIENT_NAMES | 0x0001_0000),
+            Some(0x0001_0000),
+            "flag 15 is critical"
+        );
+        assert_eq!(unsupported_critical(0x0000_8000), None, "flag 16 is not");
+        assert_eq!(
+            unsupported_critical(0x8000_0000),
+            Some(0x8000_0000),
+            "the reserved bit is refused rather than ignored"
         );
     }
 

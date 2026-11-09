@@ -157,6 +157,10 @@ pub mod codes {
     pub const KDC_ERR_RESPONSE_TOO_BIG: i32 = 52;
     /// The realm in the request is not one this KDC serves.
     pub const KDC_ERR_WRONG_REALM: i32 = 68;
+    /// RFC 6113 §5.4.4.2: a `fast-options` bit this KDC does not implement, set by the
+    /// client. Bits 1 through 15 are critical, so an unknown one must fail the request
+    /// rather than be ignored — the client asked for something it will not get.
+    pub const KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS: i32 = 93;
     /// A decrypted value failed its integrity check.
     pub const KRB_AP_ERR_BAD_INTEGRITY: i32 = 31;
     /// The ticket has expired.

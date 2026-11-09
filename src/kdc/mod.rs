@@ -85,6 +85,13 @@ pub struct Kdc {
     cipher: Arc<dyn Cipher>,
     policy: Arc<dyn ChangePolicy>,
     identities: Option<Arc<dyn logon_info::PacIdentities>>,
+    /// The realm's certificate and trust anchors, when PKINIT is configured.
+    ///
+    /// `None` means the realm authenticates with passwords only, and a `PA-PK-AS-REQ` is
+    /// refused rather than half-answered: a KDC that accepted a certificate it cannot chain
+    /// would be worse than one that does not offer the feature.
+    #[cfg(feature = "pkinit")]
+    pkinit: Option<Arc<pkinit::reply::State>>,
 }
 
 impl std::fmt::Debug for Kdc {
@@ -93,6 +100,7 @@ impl std::fmt::Debug for Kdc {
             .field("config", &self.config)
             .field("policy", &self.policy)
             .field("issues_pac", &self.identities.is_some())
+            .field("pkinit", &self.offers_pkinit())
             .finish()
     }
 }
@@ -106,7 +114,34 @@ impl Kdc {
             cipher,
             policy: Arc::new(SelfOnly),
             identities: None,
+            #[cfg(feature = "pkinit")]
+            pkinit: None,
         }
+    }
+
+    /// The same KDC answering PKINIT, with the realm's certificate and its trust anchors.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit(mut self, state: Arc<pkinit::reply::State>) -> Self {
+        self.pkinit = Some(state);
+        self
+    }
+
+    /// Whether this realm accepts certificate logins.
+    pub fn offers_pkinit(&self) -> bool {
+        #[cfg(feature = "pkinit")]
+        {
+            self.pkinit.is_some()
+        }
+        #[cfg(not(feature = "pkinit"))]
+        {
+            false
+        }
+    }
+
+    /// The PKINIT state, when the realm has one.
+    #[cfg(feature = "pkinit")]
+    pub(super) fn pkinit(&self) -> Option<&pkinit::reply::State> {
+        self.pkinit.as_deref()
     }
 
     /// The same KDC issuing PACs, with `identities` answering who an account is.
@@ -261,7 +296,9 @@ impl Kdc {
                 if req.msg_type == crate::msg::TGS_REQ {
                     self.handle_tgs(&req, now)
                 } else {
-                    self.handle_as(&req, now)
+                    // The exact octets: PKINIT's KDF binds the AS-REQ the client sent into
+                    // its context, and a re-encoding would produce a different key.
+                    self.handle_as(&req, now, request)
                 }
             }
             Ok(_verdict) => {

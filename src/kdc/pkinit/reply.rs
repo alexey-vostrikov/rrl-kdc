@@ -275,6 +275,178 @@ pub fn choose_kdf(offered: &[String]) -> Option<&'static str> {
         .find(|kdf| offered.iter().any(|o| o == kdf))
 }
 
+/// Everything the reply half needs from the realm's configuration.
+#[cfg(feature = "pkinit")]
+pub struct State {
+    /// The KDC's certificate and signing key.
+    pub identity: Identity,
+    /// The roots a client's certificate may chain to.
+    pub anchors: super::TrustAnchors,
+}
+
+/// What the exchange produced: the key the reply's `enc-part` is sealed in, and the
+/// `PA-PK-AS-REP` that lets the client derive the same key.
+#[cfg(feature = "pkinit")]
+pub struct Answer {
+    /// The AS reply key, from the shared secret.
+    pub reply_key: crate::crypto::Key,
+    /// The `PA-PK-AS-REP` value.
+    pub pa_pk_as_rep: Vec<u8>,
+    /// The client's DH public value, for a log line — not for a decision.
+    pub client_group_bits: u32,
+}
+
+/// Runs the KDC's half of PKINIT over a `PA-PK-AS-REQ`.
+///
+/// The order is the protocol: authenticate the client's signature and certificate first,
+/// because everything after it is a key handed to whoever asked; then bind the signature to
+/// *this* request through `paChecksum`; then read the client's DH value; then agree, sign,
+/// and derive.
+///
+/// `rng` supplies the private exponent. It is a parameter rather than a call to
+/// `getrandom` so that a test can make an exchange reproducible — and so that an embedder
+/// with its own entropy source is not forced through ours.
+#[cfg(feature = "pkinit")]
+#[allow(clippy::too_many_arguments)]
+pub fn answer(
+    state: &State,
+    pa_value: &[u8],
+    body_der: &[u8],
+    as_req_der: &[u8],
+    client: &Principal,
+    server: &Principal,
+    enctype: Enctype,
+    now: i64,
+    rng: &dyn Fn(usize) -> Vec<u8>,
+) -> Result<Answer, PkinitError> {
+    // 1. Who is asking.
+    let request = super::Request::decode(pa_value)?;
+    let identity = super::Identity::authenticate(&request, &state.anchors, now)?;
+    if &identity.principal != client {
+        // The certificate names someone else. Answering would issue a ticket to the
+        // certificate's owner while the request claims to be another — a mix-up nobody
+        // benefits from except an attacker who holds one and asks for the other.
+        return Err(PkinitError::BadPrincipalName(format!(
+            "the certificate names {} but the request asks for {client}",
+            identity.principal
+        )));
+    }
+
+    // 2. That the signature covers this request. `paChecksum` is over the
+    //    `KDC-REQ-BODY` (RFC 4556 §3.2.1) — not over the whole AS-REQ, which is what the
+    //    KDF binds in later and is a different input.
+    let pack = request.auth_pack()?;
+    super::check_body(&pack, body_der)?;
+
+    // 3. The client's public value, and the group it is in.
+    let value = pack.client_public_value.as_deref().ok_or_else(|| {
+        PkinitError::Unsupported(
+            "the request carries no clientPublicValue: RSA key transport is not implemented".into(),
+        )
+    })?;
+    let (group, peer) = parse_client_public_value(value)?;
+
+    // 4. Our own value, and the shared secret.
+    let ours = super::dh::KeyPair::generate(group, rng)?;
+    let z = ours.agree(&peer)?;
+
+    // 5. The reply key. Unknown KDFs are refused, not replaced by the legacy one: a client
+    //    that named a KDF is going to derive with it, and a silent fallback would produce a
+    //    reply it cannot open.
+    let kdf = match pack.supported_kdfs.is_empty() {
+        true => None,
+        false => Some(choose_kdf(&pack.supported_kdfs).ok_or_else(|| {
+            PkinitError::Unsupported(format!(
+                "the client offers KDFs this KDC does not implement: {:?}",
+                pack.supported_kdfs
+            ))
+        })?),
+    };
+
+    // The signature covers the `KDCDHKeyInfo`, so it is built before the reply key: the
+    // KDF binds `pk-as-rep` into its context, and that has to be the octets the client will
+    // see rather than a placeholder.
+    let info = kdcdh_key_info(&ours.public_bytes(), pack.pk_authenticator.nonce);
+    let signed = state
+        .identity
+        .signed_data(super::ID_PKINIT_DH_KEY_DATA, &info)?;
+    let pa_pk_as_rep = dh_rep_info(signed.clone());
+
+    let key_bytes = reply_key(&z, kdf, client, server, enctype, as_req_der, &pa_pk_as_rep)?;
+    let reply_key = crate::crypto::Key::new(enctype, key_bytes)
+        .map_err(|e| PkinitError::Malformed(format!("the reply key: {e}")))?;
+
+    Ok(Answer {
+        reply_key,
+        pa_pk_as_rep,
+        client_group_bits: group.bits(),
+    })
+}
+
+/// The group and the public value out of `clientPublicValue`.
+///
+/// `SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey
+/// BIT STRING }`, where the algorithm is `dhpublicnumber` with the domain parameters as its
+/// parameters, and the bit string holds the DH value big-endian.
+#[cfg(feature = "pkinit")]
+fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>), PkinitError> {
+    let mut r = der::Reader::new(value);
+    let spki = r
+        .next("clientPublicValue")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    if spki.tag != der::SEQUENCE {
+        return Err(PkinitError::Malformed(
+            "clientPublicValue is not a SubjectPublicKeyInfo".into(),
+        ));
+    }
+    let mut sr = der::Reader::new(spki.content);
+    let alg = sr
+        .next("algorithm")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    let bits = sr
+        .next("subjectPublicKey")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    if bits.tag != 0x03 {
+        return Err(PkinitError::Malformed(
+            "subjectPublicKey is not a BIT STRING".into(),
+        ));
+    }
+
+    // The algorithm must be `dhpublicnumber`; an ECDH or RSA key here would be a mode this
+    // KDC does not implement, and guessing would derive a key nobody else computes.
+    let mut ar = der::Reader::new(alg.content);
+    let oid = ar
+        .next("algorithm")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    let name = der::decode_oid("algorithm", oid.content)
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    if name != super::dh::DH_PUBLIC_NUMBER {
+        return Err(PkinitError::Unsupported(format!(
+            "clientPublicValue uses {name}; this KDC implements finite-field DH \
+             (dhpublicnumber) only"
+        )));
+    }
+    let params = ar.next("DomainParameters").map_err(|_| {
+        PkinitError::Malformed(
+            "dhpublicnumber without domain parameters: the group cannot be inferred".into(),
+        )
+    })?;
+    let group = super::dh::Group::from_domain_parameters(&der::tlv(der::SEQUENCE, params.content))?;
+
+    if bits.content.is_empty() {
+        return Err(PkinitError::Malformed("subjectPublicKey is empty".into()));
+    }
+    // The first octet is the unused-bit count, which must be zero for a DH value: a
+    // non-zero count means the client sent something that is not whole octets.
+    if bits.content[0] != 0 {
+        return Err(PkinitError::Malformed(format!(
+            "subjectPublicKey has {} unused bits",
+            bits.content[0]
+        )));
+    }
+    Ok((group, bits.content[1..].to_vec()))
+}
+
 /// An OID's content octets, the inverse of `der::decode_oid`.
 fn encode_oid(text: &str) -> Vec<u8> {
     let parts: Vec<u64> = text.split('.').map(|p| p.parse().unwrap()).collect();

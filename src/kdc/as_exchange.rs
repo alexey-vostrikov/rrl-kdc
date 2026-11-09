@@ -235,11 +235,11 @@ fn preauth_failed(cname: &Principal, entries: &[EtypeInfo2Entry], why: &str) -> 
 
 impl Kdc {
     /// Handles an `AS-REQ`.
-    pub(super) fn handle_as(&self, req: &KdcReq, now: i64) -> Result<Vec<u8>> {
+    pub(super) fn handle_as(&self, req: &KdcReq, now: i64, raw: &[u8]) -> Result<Vec<u8>> {
         // FAST first: if the client armored the exchange, the request that matters is
         // the one inside the armor, and the reply has to be armored back.
         let Some(armored_bytes) = req.padata(super::fast::PA_FX_FAST) else {
-            return self.answer_as(&req.body, &req.padata, now, None, false);
+            return self.answer_as(&req.body, &req.padata, now, None, false, raw, &req.raw_body);
         };
         let armored = super::fast::ArmoredRequest::decode(armored_bytes)?;
         let armor_key = self.armor_key(&armored, now)?;
@@ -271,7 +271,15 @@ impl Kdc {
                 "PA-FX-FAST: the armored body names a different realm than the request".into(),
             ));
         }
-        self.answer_as(&body, &inner.padata, now, Some(&armor_key), hide)
+        self.answer_as(
+            &body,
+            &inner.padata,
+            now,
+            Some(&armor_key),
+            hide,
+            raw,
+            &inner.req_body,
+        )
     }
 
     /// The key an armored request is encrypted under: the session key of the ticket its
@@ -416,6 +424,11 @@ impl Kdc {
     /// `hide` is RFC 6113's `hide-client-names`: the reply names
     /// `WELLKNOWN/ANONYMOUS` instead of the client, and the real name survives only inside
     /// the ticket, which is sealed with a service key.
+    ///
+    /// The argument list is long because each parameter is a distinct protocol input that
+    /// the two callers (armored and plain) supply differently, and grouping them into a
+    /// struct would name the grouping after the call sites rather than after the exchange.
+    #[allow(clippy::too_many_arguments)]
     fn answer_as(
         &self,
         body: &KdcReqBody,
@@ -423,6 +436,8 @@ impl Kdc {
         now: i64,
         armor: Option<&Key>,
         hide: bool,
+        raw: &[u8],
+        body_der: &[u8],
     ) -> Result<Vec<u8>> {
         let config = self.config();
         if body.realm != config.realm() {
@@ -481,14 +496,80 @@ impl Kdc {
 
         // 5. Pre-authentication.
         //
-        // Two methods; which one is acceptable depends on the armor, not on the client's
-        // preference. Inside FAST the plain timestamp is refused: a `PA-ENC-TIMESTAMP`
+        // PKINIT first, when the realm offers it and the client asked for it: the reply key
+        // comes from a Diffie-Hellman exchange rather than from anything in the request, and
+        // the `PA-PK-AS-REP` that lets the client derive it is built here because it has to
+        // travel in the same reply.
+        #[cfg(feature = "pkinit")]
+        let pkinit_answer = match (
+            padata_value(padata, super::pkinit::PA_PK_AS_REQ),
+            self.pkinit(),
+        ) {
+            (Some(value), Some(state)) => {
+                let server_key_enctype = usable[0];
+                // The private exponent comes from the same source as the session keys. A
+                // failure there is a broken RNG and must not degrade into a predictable
+                // key, so it is a refusal rather than a retry.
+                let entropy = self.cipher().random(Enctype::Aes256Sha1)?.bytes().to_vec();
+                let answer = super::pkinit::reply::answer(
+                    state,
+                    value,
+                    body_der,
+                    raw,
+                    &cname,
+                    &Principal::krbtgt(config.realm()),
+                    server_key_enctype,
+                    now,
+                    &|n| {
+                        let mut bytes = entropy.clone();
+                        bytes.resize(n, 0);
+                        bytes.truncate(n);
+                        bytes
+                    },
+                );
+                match answer {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        return Err(Error::Kdc {
+                            code: codes::KDC_ERR_PREAUTH_FAILED,
+                            text: format!("PKINIT: {e}"),
+                        });
+                    }
+                }
+            }
+            (Some(_), None) => {
+                return Err(Error::Kdc {
+                    code: codes::KDC_ERR_PREAUTH_FAILED,
+                    text: "PA-PK-AS-REQ: this realm does not accept certificate logins".into(),
+                });
+            }
+            (None, _) => None,
+        };
+
+        // Two other methods; which one is acceptable depends on the armor, not on the
+        // client's preference. Inside FAST the plain timestamp is refused: a `PA-ENC-TIMESTAMP`
         // sealed directly in the long-term key is the offline oracle the armor exists to
         // close, so accepting it there would leave the hole open behind a lock.
         let timestamp = padata_value(padata, PA_ENC_TIMESTAMP);
         let challenge = padata_value(padata, super::fast::PA_ENCRYPTED_CHALLENGE);
-        let preauthenticated = timestamp.is_some() || challenge.is_some();
-        let reply_key = if let Some(value) = challenge {
+        let preauthenticated = timestamp.is_some() || challenge.is_some() || {
+            #[cfg(feature = "pkinit")]
+            {
+                pkinit_answer.is_some()
+            }
+            #[cfg(not(feature = "pkinit"))]
+            {
+                false
+            }
+        };
+        #[cfg(feature = "pkinit")]
+        let pkinit_key = pkinit_answer.as_ref().map(|a| a.reply_key.clone());
+        #[cfg(not(feature = "pkinit"))]
+        let pkinit_key: Option<Key> = None;
+
+        let reply_key = if let Some(key) = pkinit_key {
+            key
+        } else if let Some(value) = challenge {
             // A challenge cannot be answered without the armor: its key is
             // `cf2(armor, …, long-term, …)`, so a client that sends one unarmored is
             // asking this KDC to invent a secret it does not have.
@@ -619,15 +700,24 @@ impl Kdc {
             sname: server.principal.clone(),
             caddr: body.addresses.clone(),
         };
+        // Under PKINIT the reply key came from a Diffie-Hellman exchange, so there is no
+        // long-term key for an attacker to guess at and nothing to strengthen: the key
+        // exists only on the two machines that took part.
+        #[cfg(feature = "pkinit")]
+        let pkinit_reply = pkinit_answer.is_some();
+        #[cfg(not(feature = "pkinit"))]
+        let pkinit_reply = false;
+
         // With FAST the reply key is strengthened by a random secret that only the
         // armor carries, so a recorded reply cannot be attacked offline. Without FAST
         // it stays the client's long-term key, which is what every client expects.
-        let (strengthen_key, sealed_with) = match armor {
-            Some(_) => {
+        let (strengthen_key, sealed_with) = match (armor, pkinit_reply) {
+            (_, true) => (None, reply_key.clone()),
+            (Some(_), false) => {
                 let (strength, strengthened) = super::fast::strengthen(self.cipher(), &reply_key)?;
                 (Some(strength), strengthened)
             }
-            None => (None, reply_key.clone()),
+            (None, false) => (None, reply_key.clone()),
         };
         let enc_part = EncryptedData::seal(
             self.cipher(),
@@ -641,6 +731,12 @@ impl Kdc {
         // salt from the error still sees it here. Inside FAST it travels in the armor,
         // because a salt in the clear is one more thing to attack.
         let mut padata_out = vec![(PA_ETYPE_INFO2, encode_etype_info2(&entries))];
+        #[cfg(feature = "pkinit")]
+        if let Some(answer) = &pkinit_answer {
+            // The client needs this to derive the reply key; without it the `enc-part` it
+            // receives is unreadable, and the failure looks like a broken KDC.
+            padata_out.push((super::pkinit::PA_PK_AS_REP, answer.pa_pk_as_rep.clone()));
+        }
         if let Some(key) = armor {
             // The KDC's own challenge: the client asked for "prove you hold my
             // long-term key", and a KDC that cannot answer is indistinguishable from an

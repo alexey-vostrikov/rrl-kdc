@@ -88,6 +88,18 @@ pkinit = ["dep:x509-parser", "dep:rsa", "dep:num-bigint", "dep:num-traits", "dep
 name = "ad-blob"
 required-features = ["hdb-ldap"]
 
+# The PKINIT examples use the X.509 stack, the DH arithmetic and the RSA signer, all of
+# which live behind the feature. Without `required-features` a default `cargo test` builds
+# them anyway — it builds every example — and fails on the missing modules, which is exactly
+# the trap the `ad-blob` entry above was added for.
+[[example]]
+name = "pkinit-fixture"
+required-features = ["pkinit"]
+
+[[example]]
+name = "pkinit-reply"
+required-features = ["pkinit"]
+
 [dev-dependencies]
 # The primary client. Written by a third party and tested against a live MIT KDC,
 # it is the half of every acceptance test that matters: it asks this KDC for a

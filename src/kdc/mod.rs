@@ -322,7 +322,21 @@ impl Kdc {
     fn armor_key_of(&self, req: &KdcReq, now: i64) -> Option<crate::crypto::Key> {
         let bytes = req.padata(fast::PA_FX_FAST)?;
         let armored = fast::ArmoredRequest::decode(bytes).ok()?;
-        self.armor_key_for_error(&armored, now).ok()
+        if armored.armor.is_some() {
+            return self.armor_key_for_error(&armored, now).ok();
+        }
+        // Implicit armor, RFC 6113 §5.4.2.6: a `TGS-REQ` carries no `armor` field at all,
+        // because the ticket already travelled in `PA-TGS-REQ` and the key is derived from
+        // that request's subkey and the TGT's session key.
+        //
+        // This branch is what makes a refusal readable. Without it every error of an
+        // armored TGS request went out in the clear — `armor_key_inner` demands an `armor`
+        // field, found none, and the `?` above swallowed the failure — so a client that had
+        // armored looked inside the armor, found no `PA-FX-ERROR`, and reported "the FAST
+        // response is missing FX-FAST" instead of the service the KDC could not find.
+        let shown = self.check_evidence(req, now).ok()?;
+        let subkey = shown.subkey.as_ref()?;
+        fast::implicit_armor_key(subkey, &shown.tgt.session_key).ok()
     }
 
     /// Renders `err` as the reply, attaching `METHOD-DATA` where the code needs

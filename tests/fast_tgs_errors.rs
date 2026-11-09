@@ -118,10 +118,16 @@ fn tgt(krbtgt_key: &Key) -> Tgt {
 
 /// The `KDC-REQ-BODY` of a TGS request for `service`.
 fn body(nonce: u32) -> Vec<u8> {
+    body_for(nonce, service())
+}
+
+/// The same body, asking for another service — for the tests about refusals a real client
+/// meets: a service that is not in the directory.
+fn body_for(nonce: u32, sname: Principal) -> Vec<u8> {
     der::seq(&[
         der::field(0, der::flags32(kdc_options::FORWARDABLE)),
         der::field(2, der::general_string(REALM)),
-        der::field(3, service().encode_name()),
+        der::field(3, sname.encode_name()),
         der::field(5, der::time(NOW + 3600)),
         der::field(7, der::int(i64::from(nonce))),
         der::field(8, der::seq(&[der::int(18)])),
@@ -139,6 +145,8 @@ struct Knobs {
     explicit_armor: bool,
     /// The fast-options bits.
     options: u32,
+    /// Ask for this service instead of the one the fixture holds.
+    sname: Option<Principal>,
 }
 
 impl Default for Knobs {
@@ -148,6 +156,7 @@ impl Default for Knobs {
             no_evidence: false,
             explicit_armor: false,
             options: 0,
+            sname: None,
         }
     }
 }
@@ -158,7 +167,10 @@ impl Default for Knobs {
 fn armored_tgs(tgt: &Tgt, knobs: Knobs) -> (Vec<u8>, Option<Key>) {
     let cipher = OwnCipher;
     let nonce = 0x4242u32;
-    let body = body(nonce);
+    let body = match knobs.sname.clone() {
+        Some(sname) => body_for(nonce, sname),
+        None => body(nonce),
+    };
     let subkey = knobs
         .subkey
         .then(|| cipher.random(Enctype::Aes256Sha1).unwrap());
@@ -476,5 +488,84 @@ fn the_armored_tgs_reply_carries_a_finished_checksum_over_the_ticket() {
             .verify_checksum(&armor_key, fast::usage::FAST_FINISHED, &ticket_der, sum)
             .is_ok(),
         "the finished checksum must cover the ticket that was sent"
+    );
+}
+
+/// The `PA-FX-ERROR` out of an armored KRB-ERROR, or `None` when the error came in the clear.
+///
+/// RFC 6113 §5.4.2.5: a client that armored looks inside the armor for the error, and a KDC
+/// that answers in the clear leaves it reading an outer error that by design carries no
+/// pre-authentication types.
+fn inner_error_of(reply: &[u8], armor_key: &Key) -> Option<msg::KrbError> {
+    let container = error_of(reply).e_data?;
+    let mut r = der::Reader::new(&container);
+    let seq = r.next("METHOD-DATA").ok()?;
+    let padata = msg::decode_pa_data("METHOD-DATA", seq.content).ok()?;
+    let value = padata
+        .iter()
+        .find(|(t, _)| *t == fast::PA_FX_FAST_REPLY)
+        .map(|(_, v)| v.clone())?;
+
+    let mut rr = der::Reader::new(&value);
+    let choice = rr.next("PA-FX-FAST-REPLY").ok()?;
+    let mut inner = der::Reader::new(choice.content);
+    let armored_rep = inner.next("KrbFastArmoredRep").ok()?;
+    let f = der::Fields::parse("KrbFastArmoredRep", armored_rep.content).ok()?;
+    let enc = msg::EncryptedData::decode("enc-fast-rep", f.get(0, "enc-fast-rep").ok()?).ok()?;
+    let plain = OwnCipher
+        .decrypt(armor_key, fast::usage::FAST_REP, &enc.cipher)
+        .ok()?;
+
+    let mut body = der::Reader::new(&plain);
+    let response = body.next("KrbFastResponse").ok()?;
+    let rf = der::Fields::parse("KrbFastResponse", response.content).ok()?;
+    // `der::field` stores the whole TLV, so the SEQUENCE header is still there.
+    let raw = rf.get(0, "padata").ok()?.to_vec();
+    let mut pr = der::Reader::new(&raw);
+    let pseq = pr.next("padata").ok()?;
+    let padata = msg::decode_pa_data("KrbFastResponse", pseq.content).ok()?;
+
+    padata
+        .into_iter()
+        .find(|(t, _)| *t == fast::PA_FX_ERROR)
+        .and_then(|(_, value)| msg::KrbError::decode(&value).ok())
+}
+
+#[test]
+fn an_error_in_an_armored_tgs_request_comes_back_inside_the_armor() {
+    // The symptom that opened TASQ-2.16, in one test: a client armors its TGS-REQ, the KDC
+    // refuses — and answers in the clear. The client, looking for the error inside the
+    // armor, finds nothing and reports "fast response is missing FX-FAST" instead of the
+    // reason, which is the one thing the operator needed.
+    //
+    // The refusal here is a service that does not exist, because that is what a join against
+    // a half-provisioned directory hits first.
+    let (kdc, krbtgt_key) = kdc();
+    let tgt = tgt(&krbtgt_key);
+    let (request, armor_key) = armored_tgs(
+        &tgt,
+        Knobs {
+            sname: Some(Principal::parse(&format!("cifs/nowhere@{REALM}")).unwrap()),
+            ..Default::default()
+        },
+    );
+    let reply = kdc.handle(&request, NOW);
+
+    let outer = error_of(&reply);
+    assert_eq!(
+        outer.code,
+        codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+        "the refusal itself: {}",
+        outer.e_text.clone().unwrap_or_default()
+    );
+    let armor_key = armor_key.expect("an armored request yields an armor key");
+    let inner = inner_error_of(&reply, &armor_key).expect(
+        "the refusal must travel inside the armor: a client that armored cannot read an \
+         outer error, and reports a missing FX-FAST instead of the real code",
+    );
+    assert_eq!(
+        inner.code,
+        codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+        "the inner error is the one that reached the client"
     );
 }

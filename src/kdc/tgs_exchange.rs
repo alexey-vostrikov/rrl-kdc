@@ -15,9 +15,14 @@
 //! 5. the service exists and may be a service;
 //! 6. the ticket is issued, never longer-lived than the TGT it came from.
 //!
-//! What is deliberately absent at this stage: referrals, S4U, PAC, FAST,
-//! `transited` across realms. A request that needs one of them is answered with
-//! a code that says so, not with a ticket that claims to be something it is not.
+//! `PA-FX-FAST` is accepted in the **implicit** form of RFC 6113 §5.4.2.6: the key comes
+//! from the `PA-TGS-REQ` authenticator's subkey and the TGT's session key, the request
+//! checksum covers the `AP-REQ`, and both the reply and any error travel back inside the
+//! armor. An explicit armor ticket is refused by name rather than silently ignored.
+//!
+//! What is deliberately absent at this stage: referrals, S4U, `transited` across realms.
+//! A request that needs one of them is answered with a code that says so, not with a
+//! ticket that claims to be something it is not.
 
 use crate::crypto::{Key, usage};
 use crate::error::{Error, Result, codes};
@@ -35,10 +40,10 @@ use super::{Kdc, wrong_realm};
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
-struct Proven {
+pub(super) struct Proven {
     /// The TGT's own part. A renewal and a validation are defined as edits to
     /// it, so it is carried whole rather than field by field.
-    tgt: EncTicketPart,
+    pub(super) tgt: EncTicketPart,
     /// The key the reply is encrypted in: the authenticator's subkey when it
     /// carried one, otherwise the TGT's session key.
     reply_key: Key,
@@ -48,7 +53,7 @@ struct Proven {
     /// The authenticator's subkey, when it carried one. RFC 6113 §5.4.2.6 builds the
     /// implicit FAST armor key from this and the TGT's session key, so it has to survive
     /// the check rather than being folded into `reply_key`.
-    subkey: Option<Key>,
+    pub(super) subkey: Option<Key>,
 }
 
 /// The extra ticket flags `forwarded` and `proxy` ask for (RFC 4120 §3.3.3), or a refusal.
@@ -615,7 +620,10 @@ impl Kdc {
 
     /// Steps 1–4: decode `PA-TGS-REQ`, decrypt the ticket, then the
     /// authenticator, then check the checksum over the request body.
-    fn check_evidence(&self, req: &KdcReq, now: i64) -> Result<Proven> {
+    /// Visible in `kdc` because the error path of `Kdc::error` needs the same evidence to
+    /// derive an implicit armor key; a refusal that cannot be wrapped is a refusal the
+    /// client cannot read.
+    pub(super) fn check_evidence(&self, req: &KdcReq, now: i64) -> Result<Proven> {
         let config = self.config();
         let ap_req_bytes = req.padata(PA_TGS_REQ).ok_or_else(|| {
             Error::Protocol(

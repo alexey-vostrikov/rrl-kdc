@@ -40,6 +40,8 @@
 //! signs what), RFC 4757 for the RC4-HMAC checksum's salt and key derivation.
 
 use crate::crypto::{Enctype, Key};
+
+use super::logon_info::{FILETIME_TICKS_PER_SECOND, FILETIME_UNIX_EPOCH_SECONDS};
 use crate::error::{Error, Result};
 
 /// `PAC_LOGON_INFO` — `KERB_VALIDATION_INFO`, the buffer that names the account.
@@ -69,16 +71,6 @@ pub const KERB_CHECKSUM_HMAC_MD5: i32 = -138;
 /// not a Kerberos one, which is what a PAC signature is. [MS-KILE] §3.4.5.1.1
 /// names it, and getting it wrong produces a signature that verifies nowhere.
 pub const KERB_NON_KERB_CKSUM_SALT: u32 = 17;
-
-/// Seconds from the `FILETIME` epoch (1601-01-01) to the Unix one (1970-01-01).
-///
-/// `FILETIME` counts 100-nanosecond intervals from 1601, so a Unix timestamp is
-/// multiplied by ten million and shifted by this many seconds — the constant every
-/// implementation of `FILETIME` carries and most of them get slightly wrong.
-const FILETIME_UNIX_EPOCH_SECONDS: i64 = 11_644_473_600;
-
-/// `FILETIME` ticks per second.
-const FILETIME_TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// `PAC_CLIENT_INFO`: the client's name and logon time, unencrypted ([MS-PAC]
 /// §2.7.2).

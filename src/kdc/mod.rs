@@ -30,6 +30,7 @@ mod tgs_exchange;
 /// The change-password service (RFC 3244): protocol constants, the reply a
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
 pub mod kpasswd;
+pub mod logon_info;
 pub mod pac;
 
 pub use kpasswd::{VERSION_CHANGE, VERSION_SET, changepw_entry, result_payload};

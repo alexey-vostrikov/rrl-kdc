@@ -55,10 +55,26 @@ pub fn parse_generalized_time(s: &str) -> Option<i64> {
     let num = |r: std::ops::Range<usize>| -> i64 { s[r].parse().ok().unwrap_or(-1) };
     let (y, mo, d) = (num(0..4), num(4..6) as u32, num(6..8) as u32);
     let (h, mi, se) = (num(8..10), num(10..12), num(12..14));
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || se > 60
+    {
         return None;
     }
     Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se)
+}
+
+/// How many days a month has, leap years included.
+///
+/// Without this, 30 February parses and lands on 2 March: a date that never existed
+/// becomes a date that did, and a certificate's `notAfter` reads as valid for two days
+/// longer than its issuer intended.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +96,36 @@ mod tests {
             let s = format_generalized_time(t);
             assert_eq!(parse_generalized_time(&s), Some(t), "{s}");
         }
+    }
+
+    #[test]
+    fn rejects_dates_that_never_existed() {
+        assert_eq!(
+            parse_generalized_time("20240230000000Z"),
+            None,
+            "30 February"
+        );
+        assert_eq!(
+            parse_generalized_time("20230229000000Z"),
+            None,
+            "29 February, not a leap year"
+        );
+        assert_eq!(parse_generalized_time("20240431000000Z"), None, "31 April");
+        // The leap day that does exist, and the century rule that hides in it.
+        assert_eq!(
+            parse_generalized_time("20240229000000Z"),
+            Some(1_709_164_800)
+        );
+        assert_eq!(
+            parse_generalized_time("19000229000000Z"),
+            None,
+            "1900 is not a leap year"
+        );
+        assert_eq!(
+            parse_generalized_time("20000229000000Z"),
+            Some(951_782_400),
+            "2000 is"
+        );
     }
 
     #[test]

@@ -20,13 +20,14 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc"
-IMAGE="${KDC_IMAGE:-rust:1.99.1-bullseye}"
-TAG=$(printf '%s' "$IMAGE" | sed 's/.*://')
+. "$ROOT/scripts/image.sh"
 
-mkdir -p "$CACHE/cargo-$TAG" "$CACHE/rustup" "$ROOT/target"
+mkdir -p "$CACHE/rustup" "$ROOT/target"
+ensure_cargo_home
+ensure_image
 
 exec docker run --rm -u "$(id -u):$(id -g)" \
-    -v "$ROOT:/w" -v "$CACHE/cargo-$TAG:/cargo" -v "$CACHE/rustup:/rustup" \
+    -v "$ROOT:/w" -v "$CARGO_HOME_SRC:/cargo" -v "$CACHE/rustup:/rustup" \
     -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=always \
     -e CARGO_TARGET_DIR=/w/target/$TAG \
     -w /w "$IMAGE" \

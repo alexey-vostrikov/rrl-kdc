@@ -15,23 +15,23 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc"
-IMAGE="${KDC_IMAGE:-rust:1.99.1-bullseye}"
+. "$ROOT/scripts/image.sh"
 # The floor is a regression alarm, not a target: coverage was 89.8% when this was
 # written, and the number that matters is that it does not fall. Set below the
 # current figure so an unrelated refactor is not blocked, high enough that a new
 # module with no tests is.
 MIN="${COVERAGE_MIN:-88}"
-# The same per-image directory the build uses: coverage of objects compiled against
-# another libc is a number about a binary nobody ships.
-TAG=$(printf '%s' "$IMAGE" | sed 's/.*://')
 
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
 
-mkdir -p "$CACHE/cargo-$TAG" "$CACHE/rustup"
+mkdir -p "$CACHE/rustup"
+ensure_cargo_home
+ensure_image
+
 
 docker run --rm -u "$(id -u):$(id -g)" \
-    -v "$ROOT:/w" -v "$CACHE/cargo-$TAG:/cargo" -v "$CACHE/rustup:/rustup" \
+    -v "$ROOT:/w" -v "$CARGO_HOME_SRC:/cargo" -v "$CACHE/rustup:/rustup" \
     -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=never \
     -e COVERAGE_MIN="$MIN" -e CHECK="$CHECK" -e CARGO_TARGET_DIR=/w/target/$TAG \
     -w /w "$IMAGE" sh -c '
@@ -47,7 +47,7 @@ PATH=/usr/local/cargo/bin:$PATH
 # failure worth seeing at once rather than a silent `cargo install` of a binary the base
 # cannot run.
 command -v cargo-llvm-cov >/dev/null 2>&1 || {
-    echo "cargo-llvm-cov is missing from $IMAGE; it is installed by docker/bullseye.Dockerfile" >&2
+    echo "cargo-llvm-cov is missing from $IMAGE; it is installed by docker/toolchain.Dockerfile" >&2
     exit 1
 }
 

@@ -23,22 +23,22 @@
 #   two bases unable to see each other's work.
 set -eu
 
-IMAGE="${KDC_IMAGE:-rust:1.99.1-bullseye}"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc}"
-# `rust:1.99.1-bullseye` -> `bullseye`
-TAG=$(printf '%s' "$IMAGE" | sed 's/.*://')
+. "$ROOT/scripts/image.sh"
 
 # `CARGO_HOME` per image tag as well as `CARGO_TARGET_DIR`. A shared home mixes
 # `$CARGO_HOME/bin` between bases, and cargo resolves a subcommand through that directory
 # first: a `cargo-llvm-cov` installed on bookworm shadows the image's own and dies on bullseye
 # with "version `GLIBC_2.34' not found". The registry cache costs a second download once.
-mkdir -p "$CACHE/cargo-$TAG" "$CACHE/rustup" "$ROOT/target"
+mkdir -p "$CACHE/rustup" "$ROOT/target"
+ensure_cargo_home
+ensure_image
 
 exec docker run --rm \
   -u "$(id -u):$(id -g)" \
   -v "$ROOT:/w" \
-  -v "$CACHE/cargo-$TAG:/cargo" \
+  -v "$CARGO_HOME_SRC:/cargo" \
   -v "$CACHE/rustup:/rustup" \
   -e CARGO_HOME=/cargo \
   -e CARGO_TARGET_DIR=/w/target/$TAG \

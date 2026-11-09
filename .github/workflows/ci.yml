@@ -1,7 +1,7 @@
 name: ci
 
 # Everything compiles inside the toolchain image this repository builds itself
-# (`docker/bullseye.Dockerfile`): Rust 1.99.1 on Debian 11, glibc 2.31.
+# (`docker/toolchain.Dockerfile`): Rust 1.99.1 on Debian 11, glibc 2.31.
 #
 # Why CI builds the image instead of naming one: `rust:1.99.1-bullseye` does not exist on
 # Docker Hub — the official project stopped publishing bullseye variants after 1.90 — and the
@@ -37,7 +37,7 @@ jobs:
       # Built from the repository, so a change to the toolchain is a reviewed diff rather than
       # somebody's laptop.
       - name: Build the toolchain image
-        run: docker build -t "$IMAGE" -f docker/bullseye.Dockerfile .
+        run: docker build -t "$IMAGE" -f docker/toolchain.Dockerfile .
 
       # The pin lives in `rust-toolchain.toml`; the image has to agree with it. A mismatch is a
       # gate failure, not a warning: building with a different compiler than the one the

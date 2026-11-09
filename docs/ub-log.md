@@ -910,7 +910,7 @@ ASN.1 PKINIT — `DEFINITIONS EXPLICIT TAGS`, CMS — неявные; `der::Fiel
 где 2.31. Тесты, зелёные на bookworm, не говорят ничего о бинарнике, который там
 не запустится.
 
-**Как собирается.** `docker/bullseye.Dockerfile`: база `rust:1.90-bullseye`, из
+**Как собирается.** `docker/toolchain.Dockerfile`: база `rust:1.90-bullseye`, из
 `rust:1.99.1-slim-bookworm` копируются деревья `/usr/local/rustup` и
 `/usr/local/cargo` (официальные сборки Rust линкуются с glibc 2.17, поэтому
 тулчейн с bookworm работает на bullseye, а libc готового бинарника берётся из

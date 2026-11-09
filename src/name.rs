@@ -26,6 +26,12 @@ pub const NT_PRINCIPAL: i32 = 1;
 pub const NT_SRV_INST: i32 = 2;
 /// `KRB5_NT_SRV_HST` — a service named by host.
 pub const NT_SRV_HST: i32 = 3;
+/// `KRB5_NT_ENTERPRISE` (RFC 6806 §6): one component, `user@realm`.
+///
+/// A client that knows only a UPN sends this form, and resolving it means answering with a
+/// name the client did not send — which is why it is only legal together with the
+/// `canonicalize` KDC option.
+pub const NT_ENTERPRISE: i32 = 10;
 
 /// A principal: components, a realm, and the name type it was learnt with.
 #[derive(Clone, Debug)]

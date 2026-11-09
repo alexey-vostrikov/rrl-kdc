@@ -72,6 +72,59 @@ pub fn usable_enctypes(
         .collect()
 }
 
+/// Resolves an `NT-ENTERPRISE` client name to the principal it names (RFC 6806 §6).
+///
+/// A name that is not enterprise passes through untouched — the option permits a rename, it
+/// does not perform one. An enterprise name is one component of the form `user@realm`, and
+/// the result is the `NT-PRINCIPAL` name in that realm.
+///
+/// Refusing without the option is the point of the whole mechanism: resolving it would make
+/// the reply name a principal the client never sent, and a client that did not ask for
+/// `canonicalize` is entitled to reject exactly that.
+fn canonical_client_name(cname: &Principal, options: u32, realm: &str) -> Result<Principal> {
+    if cname.name_type != crate::name::NT_ENTERPRISE {
+        return Ok(cname.clone());
+    }
+    let refuse = |text: String| Error::Kdc {
+        code: codes::KDC_ERR_C_PRINCIPAL_UNKNOWN,
+        text,
+    };
+    if options & kdc_options::CANONICALIZE == 0 {
+        return Err(refuse(format!(
+            "{cname} is an enterprise name (NT-ENTERPRISE) and the request did not set \
+             the canonicalize option: resolving it would answer with a name the client \
+             did not send, which is what that option authorises"
+        )));
+    }
+    // `NT-ENTERPRISE ::= SEQUENCE { name-string }` with exactly one component.
+    let [component] = cname.components.as_slice() else {
+        return Err(refuse(format!(
+            "{cname} is an enterprise name with {} components; the type carries exactly one, \
+             of the form user@realm",
+            cname.components.len()
+        )));
+    };
+    // The realm comes from the name, not from the request: `user@OTHER.REALM` names an
+    // account in another realm, and this KDC serves one.
+    let Some((principal, named_realm)) = component.rsplit_once('@') else {
+        return Err(refuse(format!(
+            "{cname} is an enterprise name without a realm: the component must be \
+             user@realm, and {component:?} has no @"
+        )));
+    };
+    if named_realm != realm {
+        return Err(super::wrong_realm(named_realm, realm));
+    }
+    if principal.is_empty() {
+        return Err(refuse(format!("{cname} names no user before the realm")));
+    }
+    Ok(Principal::new(
+        crate::name::NT_PRINCIPAL,
+        [principal],
+        named_realm,
+    ))
+}
+
 /// The value of `pa_type` in a `PA-DATA` list.
 ///
 /// `KdcReq::padata` does this for a whole request; the AS exchange needs it over a list
@@ -450,6 +503,10 @@ impl Kdc {
             .cname
             .clone()
             .ok_or_else(|| Error::Protocol("AS-REQ without a client name".into()))?;
+        // RFC 6806 §6: an enterprise name is resolved to the principal it names, and the
+        // reply carries that canonical name — which is only legal because the client asked
+        // for it with `canonicalize`.
+        let cname = canonical_client_name(&cname, body.kdc_options, config.realm())?;
         let client = self
             .hdb()
             .fetch(&cname)?

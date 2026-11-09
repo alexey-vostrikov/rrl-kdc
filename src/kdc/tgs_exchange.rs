@@ -311,7 +311,14 @@ impl Kdc {
             endtime,
             renew_till,
             caddr: body.addresses.clone(),
-            authorization_data: None,
+            // The PAC is rebuilt for this ticket rather than copied from the TGT: its
+            // service checksum is keyed by *this* service's key, and the KDC signature
+            // is over the whole buffer, so a copied one would not verify.
+            authorization_data: self.pac_authorization_data(
+                &proven.tgt.cname,
+                &ticket_key.0,
+                authtime,
+            )?,
         };
         let ticket = Ticket {
             realm: config.realm().to_owned(),

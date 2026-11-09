@@ -40,8 +40,6 @@
 //! signs what), RFC 4757 for the RC4-HMAC checksum's salt and key derivation.
 
 use crate::crypto::{Enctype, Key};
-
-use super::logon_info::{FILETIME_TICKS_PER_SECOND, FILETIME_UNIX_EPOCH_SECONDS};
 use crate::error::{Error, Result};
 
 /// `PAC_LOGON_INFO` — `KERB_VALIDATION_INFO`, the buffer that names the account.
@@ -71,6 +69,8 @@ pub const KERB_CHECKSUM_HMAC_MD5: i32 = -138;
 /// not a Kerberos one, which is what a PAC signature is. [MS-KILE] §3.4.5.1.1
 /// names it, and getting it wrong produces a signature that verifies nowhere.
 pub const KERB_NON_KERB_CKSUM_SALT: u32 = 17;
+
+use super::logon_info::{FILETIME_TICKS_PER_SECOND, FILETIME_UNIX_EPOCH_SECONDS};
 
 /// `PAC_CLIENT_INFO`: the client's name and logon time, unencrypted ([MS-PAC]
 /// §2.7.2).
@@ -234,21 +234,42 @@ pub enum SignatureType {
     HmacMd5,
     /// `HMAC_SHA1_96_AES128` (15) / `HMAC_SHA1_96_AES256` (16): 12 octets.
     HmacSha1_96Aes(Enctype),
+    /// `HMAC_SHA256_128_AES128` (0x13): 16 octets. A Windows 2016 shape, and
+    /// impacket's checksum table does not carry it — the id and the length come from
+    /// [MS-PAC] §2.8.1, and the unit tests pin them.
+    HmacSha256_128Aes,
+    /// `HMAC_SHA384_192_AES256` (0x14): 24 octets, same caveat.
+    HmacSha384_192Aes,
 }
 
 impl SignatureType {
+    /// The signature type a key of `enctype` signs with.
+    ///
+    /// The PAC signature is keyed by the ticket's service key, so its type follows
+    /// that key: AES-SHA1 keys get the SHA1 checksums, AES-SHA2 keys the newer ones,
+    /// and an RC4 key the HMAC-MD5 one. `None` for an enctype with no PAC signature
+    /// — the caller refuses rather than writing a number no reader knows.
+    pub fn for_enctype(enctype: Enctype) -> Option<Self> {
+        match enctype {
+            Enctype::Aes128Sha1 | Enctype::Aes256Sha1 => {
+                Some(SignatureType::HmacSha1_96Aes(enctype))
+            }
+            // The AES-SHA2 checksums are names of their own rather than a family,
+            // because their numbers are not adjacent and their MAC lengths differ.
+            Enctype::Aes128Sha256 => Some(SignatureType::HmacSha256_128Aes),
+            Enctype::Aes256Sha384 => Some(SignatureType::HmacSha384_192Aes),
+        }
+    }
+
     /// The number the buffer records.
     pub fn id(self) -> i32 {
         match self {
             SignatureType::HmacMd5 => KERB_CHECKSUM_HMAC_MD5,
             SignatureType::HmacSha1_96Aes(Enctype::Aes128Sha1) => 15,
             SignatureType::HmacSha1_96Aes(Enctype::Aes256Sha1) => 16,
-            // The AES-SHA2 checksum numbers exist (0x14, 0x13), but a PAC
-            // signature in them is a Windows 2016+ shape and impacket — the
-            // reader this crate is judged against — does not know them. A number
-            // that no reader understands is refused at `seal` by the enctype
-            // check rather than written here.
             SignatureType::HmacSha1_96Aes(_) => -1,
+            SignatureType::HmacSha256_128Aes => 0x13,
+            SignatureType::HmacSha384_192Aes => 0x14,
         }
     }
 
@@ -260,6 +281,21 @@ impl SignatureType {
         match self {
             SignatureType::HmacMd5 => 16,
             SignatureType::HmacSha1_96Aes(_) => 12,
+            SignatureType::HmacSha256_128Aes => 16,
+            SignatureType::HmacSha384_192Aes => 24,
+        }
+    }
+
+    /// The key enctype this signature is computed with, for the AES checksums.
+    ///
+    /// `None` for HMAC-MD5, whose key is an RC4 key this crate does not implement;
+    /// the caller that reaches it has already decided the key is RC4.
+    pub fn enctype(self) -> Option<Enctype> {
+        match self {
+            SignatureType::HmacSha1_96Aes(enctype) => Some(enctype),
+            SignatureType::HmacSha256_128Aes => Some(Enctype::Aes128Sha256),
+            SignatureType::HmacSha384_192Aes => Some(Enctype::Aes256Sha384),
+            SignatureType::HmacMd5 => None,
         }
     }
 }
@@ -310,10 +346,13 @@ fn sign(pac: &[u8], key: &Key, signature: SignatureType) -> Result<Vec<u8>> {
             let usage = KERB_NON_KERB_CKSUM_SALT.to_le_bytes();
             hmac_md5(key.bytes(), pac, &usage)?
         }
-        SignatureType::HmacSha1_96Aes(enctype) => {
-            if key.enctype() != enctype {
+        SignatureType::HmacSha1_96Aes(_)
+        | SignatureType::HmacSha256_128Aes
+        | SignatureType::HmacSha384_192Aes => {
+            let expected = signature.enctype().expect("an AES signature names its key");
+            if key.enctype() != expected {
                 return Err(Error::Crypto(format!(
-                    "a PAC signed for {enctype:?} was given a {:?} key",
+                    "a PAC signed for {expected:?} was given a {:?} key",
                     key.enctype()
                 )));
             }
@@ -323,8 +362,8 @@ fn sign(pac: &[u8], key: &Key, signature: SignatureType) -> Result<Vec<u8>> {
                 KERB_NON_KERB_CKSUM_SALT,
                 crate::crypto::kdf::KeyUse::Checksum,
             )?;
-            let full = hmac_sha1(&kc, pac)?;
-            full[..12].to_vec()
+            let full = hmac_for(key.enctype(), &kc, pac)?;
+            full[..signature.signature_len()].to_vec()
         }
     };
     if tag.len() != signature.signature_len() {
@@ -415,13 +454,36 @@ fn hmac_md5(key: &[u8], data: &[u8], usage: &[u8; 4]) -> Result<Vec<u8>> {
     Ok(outer.finalize().into_bytes().to_vec())
 }
 
-fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+/// HMAC with the hash the enctype pairs with: SHA-1 for the two SHA1 enctypes,
+/// SHA-256 for `aes128-cts-hmac-sha256-128`, SHA-384 for the 192-bit one.
+///
+/// The PAC signature is the full HMAC truncated to the checksum's MAC length, so the
+/// hash has to match the enctype the key belongs to — an AES-SHA2 key HMACed with
+/// SHA-1 gives a signature that verifies nowhere.
+fn hmac_for(enctype: Enctype, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
-    let mut m = <Hmac<Sha1> as KeyInit>::new_from_slice(key)
-        .map_err(|_| Error::Crypto("HMAC-SHA1 key".into()))?;
-    m.update(data);
-    Ok(m.finalize().into_bytes().to_vec())
+    use sha2::{Sha256, Sha384};
+    Ok(match enctype {
+        Enctype::Aes128Sha1 | Enctype::Aes256Sha1 => {
+            let mut m = <Hmac<Sha1> as KeyInit>::new_from_slice(key)
+                .map_err(|_| Error::Crypto("HMAC-SHA1 key".into()))?;
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+        Enctype::Aes128Sha256 => {
+            let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+                .map_err(|_| Error::Crypto("HMAC-SHA256 key".into()))?;
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+        Enctype::Aes256Sha384 => {
+            let mut m = <Hmac<Sha384> as KeyInit>::new_from_slice(key)
+                .map_err(|_| Error::Crypto("HMAC-SHA384 key".into()))?;
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        }
+    })
 }
 
 /// The `authorization-data` a ticket carries a PAC in.
@@ -624,6 +686,64 @@ mod tests {
                 u8::from_str_radix(s, 16).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn every_enctype_names_the_signature_that_goes_with_it() {
+        // The signature is keyed by the ticket's service key, so its type follows that
+        // key's enctype. The numbers are from [MS-PAC] §2.8.1 and the lengths from the
+        // checksums they name — impacket's table knows only 15 and 16, which is why
+        // this table is pinned here rather than checked by an outside reader.
+        for (enctype, id, len) in [
+            (Enctype::Aes128Sha1, 15, 12),
+            (Enctype::Aes256Sha1, 16, 12),
+            (Enctype::Aes128Sha256, 0x13, 16),
+            (Enctype::Aes256Sha384, 0x14, 24),
+        ] {
+            let signature = SignatureType::for_enctype(enctype).expect("every enctype has one");
+            assert_eq!(signature.id(), id, "{enctype:?}");
+            assert_eq!(signature.signature_len(), len, "{enctype:?}");
+            assert_eq!(signature.enctype(), Some(enctype));
+        }
+        assert_eq!(SignatureType::HmacMd5.id(), KERB_CHECKSUM_HMAC_MD5);
+        assert_eq!(SignatureType::HmacMd5.signature_len(), 16);
+        assert_eq!(
+            SignatureType::HmacMd5.enctype(),
+            None,
+            "an RC4 key is not one of this crate's enctypes"
+        );
+    }
+
+    #[test]
+    fn each_signature_verifies_under_its_own_key_and_not_the_other() {
+        // The four AES cases, because a SHA2 key HMACed with SHA-1 produces a
+        // signature that verifies nowhere and nothing else here would notice.
+        for enctype in Enctype::ALL {
+            let signature = SignatureType::for_enctype(enctype).unwrap();
+            let len = signature.signature_len();
+            let server = Key::new(enctype, vec![0x07u8; enctype.key_len()]).unwrap();
+            let kdc = Key::new(enctype, vec![0x09u8; enctype.key_len()]).unwrap();
+            let mut blob = pac(&[
+                body(PAC_LOGON_INFO, 24),
+                Buffer::new(PAC_SERVER_CHECKSUM, vec![0u8; 4 + len]),
+                Buffer::new(PAC_PRIVSVR_CHECKSUM, vec![0u8; 4 + len]),
+            ]);
+            seal(&mut blob, &server, &kdc, signature).unwrap();
+            let buffers = buffers_of(&blob).unwrap();
+            let signature_of = |kind| {
+                let (_, size, offset) = *buffers.iter().find(|(k, _, _)| *k == kind).unwrap();
+                assert_eq!(size as usize, 4 + len);
+                blob[offset + 4..offset + size as usize].to_vec()
+            };
+            assert_ne!(
+                signature_of(PAC_SERVER_CHECKSUM),
+                signature_of(PAC_PRIVSVR_CHECKSUM)
+            );
+            assert_eq!(
+                i32::from_le_bytes(blob[buffers[1].2..buffers[1].2 + 4].try_into().unwrap()),
+                signature.id()
+            );
+        }
     }
 
     #[test]

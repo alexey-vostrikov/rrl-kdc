@@ -74,14 +74,25 @@ impl ChangePolicy for SelfOnly {
     }
 }
 
-/// The engine: a configuration, a database, a cipher, and who may change whose
-/// password.
-#[derive(Debug)]
+/// The engine: a configuration, a database, a cipher, who may change whose
+/// password, and — when the realm issues PACs — where an account's identity comes
+/// from.
 pub struct Kdc {
     config: KdcConfig,
     hdb: Arc<dyn Hdb>,
     cipher: Arc<dyn Cipher>,
     policy: Arc<dyn ChangePolicy>,
+    identities: Option<Arc<dyn logon_info::PacIdentities>>,
+}
+
+impl std::fmt::Debug for Kdc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kdc")
+            .field("config", &self.config)
+            .field("policy", &self.policy)
+            .field("issues_pac", &self.identities.is_some())
+            .finish()
+    }
 }
 
 impl Kdc {
@@ -92,7 +103,84 @@ impl Kdc {
             hdb,
             cipher,
             policy: Arc::new(SelfOnly),
+            identities: None,
         }
+    }
+
+    /// The same KDC issuing PACs, with `identities` answering who an account is.
+    ///
+    /// A KDC without this issues plain Kerberos tickets, which is correct for a
+    /// realm with no Windows clients: a PAC that states an identity invented here
+    /// would be worse than no PAC at all.
+    pub fn with_pac(mut self, identities: Arc<dyn logon_info::PacIdentities>) -> Self {
+        self.identities = Some(identities);
+        self
+    }
+
+    /// Whether tickets carry a PAC.
+    pub fn issues_pac(&self) -> bool {
+        self.identities.is_some()
+    }
+
+    /// The `AuthorizationData` a ticket for `client` carries, or `None` when this
+    /// realm does not issue PACs or the directory does not know the account.
+    ///
+    /// The signature type follows `server_key`, because a PAC signature is keyed by
+    /// the ticket's service key — and the `krbtgt` key that countersigns it must be
+    /// of the same enctype, so that one signature type describes both checksums.
+    pub(crate) fn pac_authorization_data(
+        &self,
+        client: &Principal,
+        server_key: &crate::crypto::Key,
+        now: i64,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        let Some(identities) = &self.identities else {
+            return Ok(None);
+        };
+        let Some(identity) = identities.identity(client)? else {
+            return Ok(None);
+        };
+        let signature =
+            pac::SignatureType::for_enctype(server_key.enctype()).ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_ETYPE_NOSUPP,
+                text: format!(
+                    "{:?} has no PAC signature type, so a PAC signed with it could not be \
+                     verified by anything",
+                    server_key.enctype()
+                ),
+            })?;
+        let krbtgt = self
+            .hdb()
+            .fetch(&Principal::krbtgt(self.config.realm()))?
+            .ok_or_else(|| Error::Hdb("the realm has no krbtgt entry".into()))?;
+        let kdc_key = krbtgt
+            .key_for(signature.enctype().ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_ETYPE_NOSUPP,
+                text: "the PAC signature names no enctype".into(),
+            })?)
+            .ok_or_else(|| Error::Kdc {
+                code: codes::KDC_ERR_ETYPE_NOSUPP,
+                text: format!(
+                    "the krbtgt entry has no {:?} key for the PAC signature",
+                    signature.enctype()
+                ),
+            })?;
+
+        let logon = identity.logon_info(client.to_string(), now);
+        let mut blob = pac::pac(&[
+            pac::Buffer::new(pac::PAC_LOGON_INFO, logon_info::encode(&logon)?),
+            pac::client_info(&logon.effective_name, now)?,
+            pac::Buffer::new(
+                pac::PAC_SERVER_CHECKSUM,
+                vec![0u8; signature.signature_len() + 4],
+            ),
+            pac::Buffer::new(
+                pac::PAC_PRIVSVR_CHECKSUM,
+                vec![0u8; signature.signature_len() + 4],
+            ),
+        ]);
+        pac::seal(&mut blob, server_key, &kdc_key.key, signature)?;
+        Ok(Some(pac::authorization_data(&blob)))
     }
 
     /// The same KDC with `policy` deciding who may change whose password.

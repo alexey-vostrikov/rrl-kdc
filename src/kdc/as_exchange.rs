@@ -335,7 +335,14 @@ impl Kdc {
             renew_till,
             // Good from where the client said it would be.
             caddr: body.addresses.clone(),
-            authorization_data: None,
+            // A PAC, when this realm issues them: the client's identity from the
+            // directory, signed with this ticket's service key and countersigned with
+            // `krbtgt`'s.
+            authorization_data: self.pac_authorization_data(
+                &client.principal,
+                &server_key.key,
+                now,
+            )?,
         };
         let ticket = Ticket {
             realm: config.realm().to_owned(),

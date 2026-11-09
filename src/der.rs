@@ -335,10 +335,7 @@ impl<'a> Fields<'a> {
 
     /// `[n]` as an `INTEGER`, if present.
     pub fn opt_int(&self, n: u8, context: &'static str) -> Result<Option<i64>> {
-        match self.opt(n) {
-            None => Ok(None),
-            Some(_) => self.int(n, context).map(Some),
-        }
+        self.opt(n).map(|_| self.int(n, context)).transpose()
     }
 
     /// `[n]` as a `UInt32`.
@@ -355,10 +352,7 @@ impl<'a> Fields<'a> {
 
     /// `[n]` as a `GeneralString`, if present.
     pub fn opt_string(&self, n: u8, context: &'static str) -> Result<Option<String>> {
-        match self.opt(n) {
-            None => Ok(None),
-            Some(_) => self.string(n, context).map(Some),
-        }
+        self.opt(n).map(|_| self.string(n, context)).transpose()
     }
 
     /// `[n]` as an `OCTET STRING`'s content.
@@ -369,10 +363,7 @@ impl<'a> Fields<'a> {
 
     /// `[n]` as an `OCTET STRING`'s content, if present.
     pub fn opt_octets(&self, n: u8, context: &'static str) -> Result<Option<&'a [u8]>> {
-        match self.opt(n) {
-            None => Ok(None),
-            Some(_) => self.octets(n, context).map(Some),
-        }
+        self.opt(n).map(|_| self.octets(n, context)).transpose()
     }
 
     /// `[n]` as an `OBJECT IDENTIFIER`, in dotted-decimal form.
@@ -418,10 +409,7 @@ impl<'a> Fields<'a> {
 
     /// `[n]` as `KerberosFlags`, if present.
     pub fn opt_flags32(&self, n: u8, context: &'static str) -> Result<Option<u32>> {
-        match self.opt(n) {
-            None => Ok(None),
-            Some(_) => self.flags32(n, context).map(Some),
-        }
+        self.opt(n).map(|_| self.flags32(n, context)).transpose()
     }
 
     /// The content of the `SEQUENCE` inside `[n]`.
@@ -431,10 +419,7 @@ impl<'a> Fields<'a> {
 
     /// The content of the `SEQUENCE` inside `[n]`, if present.
     pub fn opt_seq(&self, n: u8, context: &'static str) -> Result<Option<&'a [u8]>> {
-        match self.opt(n) {
-            None => Ok(None),
-            Some(_) => self.seq(n, context).map(Some),
-        }
+        self.opt(n).map(|_| self.seq(n, context)).transpose()
     }
 
     /// The content of `[APPLICATION app_tag]` inside `[n]`.

@@ -15,8 +15,8 @@ use rust_heimdal_kdc::error::codes;
 use rust_heimdal_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
 use rust_heimdal_kdc::kdc::{Kdc, KdcConfig};
 use rust_heimdal_kdc::msg::{
-    self, EncryptedData, PA_ENC_TIMESTAMP, encode_enc_ts_enc, encode_etype_info2, encode_pa_data,
-    kdc_options,
+    self, EncryptedData, PA_ENC_TIMESTAMP, Ticket, encode_enc_ts_enc, encode_etype_info2,
+    encode_pa_data, kdc_options,
 };
 use rust_heimdal_kdc::name::Principal;
 
@@ -30,13 +30,23 @@ fn principal(name: &str) -> Principal {
 
 /// A realm with `krbtgt`, `alice` and nothing else.
 fn db() -> MemoryHdb {
+    db_with_krbtgt(&[Enctype::Aes256Sha1])
+}
+
+/// The same realm, with the `krbtgt` entry holding a key in each of `enctypes`.
+///
+/// A test that narrows `allowed_enctypes` needs this: a realm whose `krbtgt` has no
+/// key in the allowed set cannot issue a ticket at all, and the refusal is correct.
+fn db_with_krbtgt(enctypes: &[Enctype]) -> MemoryHdb {
     let cipher = OwnCipher;
     let db = MemoryHdb::new();
 
     let mut krbtgt = HdbEntry::krbtgt(REALM);
-    krbtgt
-        .add_password_key(&cipher, Enctype::Aes256Sha1, b"master", 1)
-        .unwrap();
+    for enctype in enctypes {
+        krbtgt
+            .add_password_key(&cipher, *enctype, b"master", 1)
+            .unwrap();
+    }
     db.insert(krbtgt).unwrap();
 
     let mut alice = HdbEntry::user(principal("alice"));
@@ -408,4 +418,73 @@ fn the_advertised_salt_is_the_one_the_key_was_made_with() {
         Key::new(Enctype::Aes128Sha1, vec![0u8; 16]),
         encode_etype_info2(&[]),
     );
+}
+
+/// A KDC whose `allowed_enctypes` is exactly `names`, over a realm whose `krbtgt`
+/// holds keys in both AES-SHA1 enctypes.
+fn kdc_allowing(names: &str) -> Kdc {
+    let mut config = KdcConfig::new(REALM).unwrap();
+    config.apply("allowed_enctypes", names).unwrap();
+    Kdc::new(
+        config,
+        Arc::new(db_with_krbtgt(&[Enctype::Aes256Sha1, Enctype::Aes128Sha1])),
+        Arc::new(OwnCipher),
+    )
+}
+
+/// The enctype a reply's ticket is sealed in, or `None` when the reply is an error.
+fn ticket_enctype(reply: &[u8]) -> Option<Enctype> {
+    let fields = der::Fields::parse_app("AS-REP", 11, reply).ok()?;
+    let ticket = Ticket::decode(fields.get(5, "AS-REP").ok()?).ok()?;
+    Some(ticket.enc.etype)
+}
+
+#[test]
+fn the_ticket_is_sealed_in_an_enctype_the_kdc_allows() {
+    // `krbtgt` holds keys for all four enctypes and the realm allows only AES-128.
+    // The ticket must be sealed in AES-128: `allowed_enctypes` is a statement about
+    // what this KDC issues, and taking the entry's strongest key instead applied the
+    // restriction to nothing.
+    //
+    // Found by a live client, not by these tests: impacket asked for AES-SHA1 and got
+    // a ticket sealed in AES-SHA384, which it cannot name. Every unit test around this
+    // was green because each of them used a realm with every enctype allowed, where
+    // the strongest key and the allowed key are the same one.
+    let kdc = kdc_allowing("aes128-cts-hmac-sha1-96");
+    let reply = kdc.handle(
+        &as_req(
+            "alice",
+            REALM,
+            &[18, 17],
+            vec![(
+                PA_ENC_TIMESTAMP,
+                enc_timestamp(PASSWORD.as_bytes(), Enctype::Aes128Sha1, NOW),
+            )],
+        ),
+        NOW,
+    );
+    assert_eq!(
+        ticket_enctype(&reply),
+        Some(Enctype::Aes128Sha1),
+        "the ticket must use the enctype this KDC allows"
+    );
+}
+
+#[test]
+fn a_realm_allowing_every_enctype_seals_in_the_clients_first_choice() {
+    // The baseline the test above needs: with everything allowed, the ticket follows
+    // the client's preference order rather than the entry's key order.
+    let reply = kdc().handle(
+        &as_req(
+            "alice",
+            REALM,
+            &[18, 17],
+            vec![(
+                PA_ENC_TIMESTAMP,
+                enc_timestamp(PASSWORD.as_bytes(), Enctype::Aes256Sha1, NOW),
+            )],
+        ),
+        NOW,
+    );
+    assert_eq!(ticket_enctype(&reply), Some(Enctype::Aes256Sha1));
 }

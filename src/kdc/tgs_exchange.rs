@@ -285,13 +285,12 @@ impl Kdc {
         let ticket_key = match self.user_to_user_key(body, &sname)? {
             Some((key, kvno)) => (key, kvno),
             None => {
-                let server_enctype = server
-                    .enctypes()
-                    .first()
-                    .copied()
-                    .unwrap_or(session_enctype);
-                let key = server
-                    .key_for(server_enctype)
+                // Same rule as the AS: the ticket is sealed in an enctype this KDC is
+                // allowed to issue and the service holds a key for, not in whichever
+                // key happens to be strongest.
+                let key = usable
+                    .iter()
+                    .find_map(|e| server.key_for(*e))
                     .ok_or_else(|| Error::Hdb(format!("{sname} has no usable key")))?;
                 (key.key.clone(), Some(key.kvno))
             }

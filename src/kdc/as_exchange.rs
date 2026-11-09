@@ -316,9 +316,21 @@ impl Kdc {
         // 7. One session key, written into both the ticket and the reply: two
         // keys would mean the client holds one the ticket does not accept.
         let session_key = self.cipher().random(usable[0])?;
-        let server_key = server
-            .key_for(server.enctypes().first().copied().unwrap_or(usable[0]))
-            .ok_or_else(|| Error::Hdb("the krbtgt entry has no usable key".into()))?;
+        // The ticket is sealed in a key of an enctype the client asked for and this
+        // KDC allows — not in the strongest key the entry happens to hold.
+        //
+        // `enctypes()` answers "which keys does this entry have", strongest first;
+        // `usable` answers "which may be issued here", and those are different
+        // questions. Picking from the first ignores `allowed_enctypes` completely, so
+        // a realm configured for AES-SHA1 only issued tickets sealed in AES-SHA384 —
+        // the operator's restriction silently not applied. impacket found it: it asked
+        // for AES-SHA1 and got a ticket it could not even name the enctype of.
+        let server_key = usable
+            .iter()
+            .find_map(|e| server.key_for(*e))
+            .ok_or_else(|| {
+                Error::Hdb("the krbtgt entry has no key for any usable enctype".into())
+            })?;
 
         let ticket_part = EncTicketPart {
             flags,

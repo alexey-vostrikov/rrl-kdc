@@ -14,7 +14,11 @@ categories = ["authentication", "cryptography", "network-programming"]
 # The Kerberos crypto: RFC 3961/3962/8009 profile, in its own crate so that the client side shares
 # one implementation instead of keeping a second copy that could disagree. It brings `aes`, `hmac`,
 # `sha1`, `sha2`, `md-5` and `getrandom` with it; nothing else of ours needs them directly.
-rrl-crypto = { path = "../rrl-crypto", features = [] }
+# A git dependency rather than a path one: CI and any other clone of this repository do not have a
+# sibling checkout, and a path that resolves to nothing reads as "no matching package found". With
+# the branch named, `Cargo.lock` pins the exact revision, so a build is reproducible while the two
+# crates can still move together — after a change in `rrl-crypto`, `cargo update -p rrl-crypto`.
+rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
 sha1 = "0.11"
 md-5 = "0.11"
 sha2 = "0.11"

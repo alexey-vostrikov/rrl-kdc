@@ -238,9 +238,26 @@ fn armored_tgs(tgt: &Tgt, knobs: Knobs) -> (Vec<u8>, Option<Key>) {
         )
         .unwrap();
         let armored = ArmoredRequest {
+            // The explicit form presents a ticket of its own, and the two AP-REQs differ in a
+            // way that matters: an authenticator in PA-TGS-REQ is sealed under the
+            // TGS-REQ usage, and one inside an armor under the AP-REQ usage. A fixture that
+            // reused the first for both would be testing a shape no client sends, and the
+            // KDC is right to refuse it.
             armor: knobs.explicit_armor.then(|| Armor {
                 armor_type: 1,
-                armor_value: Vec::new(),
+                armor_value: ApReq {
+                    ap_options: 0,
+                    ticket: tgt.ticket.clone(),
+                    authenticator: EncryptedData::seal(
+                        &cipher,
+                        &tgt.session_key,
+                        fast::usage::AP_REQ_AUTH,
+                        None,
+                        &authenticator.encode(),
+                    )
+                    .unwrap(),
+                }
+                .encode(),
             }),
             req_checksum: (
                 Enctype::Aes256Sha1.checksum_type(),
@@ -269,13 +286,19 @@ fn error_of(reply: &[u8]) -> msg::KrbError {
 }
 
 #[test]
-fn an_explicit_armor_ticket_is_refused_by_name() {
-    // Legal under the RFC and not implemented here. The client asked for a *different*
-    // ticket to armor the exchange, and answering as though the implicit armor had been
-    // used would silently substitute one ticket for another.
+fn an_explicit_armor_ticket_armors_the_exchange_too() {
+    // Two ways a TGS request arrives armored (RFC 6113 §5.4.2.6 and §5.4.1), and the armor
+    // key is derived differently in each: the implicit form mixes the PA-TGS-REQ subkey with
+    // the TGT's session key, the explicit form opens the armor ticket's authenticator the way
+    // the AS exchange does. This file used to assert that the explicit form was refused by
+    // name, which was true while only the implicit one existed.
+    //
+    // A stock Samba client sends the explicit form for a `cifs/` ticket, and the refusal
+    // reached it as "FAST fast response is missing FX-FAST" — a message that names the armor
+    // and not the ticket the KDC declined to issue.
     let (kdc, krbtgt_key) = kdc();
     let tgt = tgt(&krbtgt_key);
-    let (request, _) = armored_tgs(
+    let (request, armor_key) = armored_tgs(
         &tgt,
         Knobs {
             explicit_armor: true,
@@ -283,12 +306,31 @@ fn an_explicit_armor_ticket_is_refused_by_name() {
         },
     );
     let reply = kdc.handle(&request, NOW);
-    let err = error_of(&reply);
-    assert_eq!(err.code, codes::KDC_ERR_PREAUTH_FAILED);
-    let text = err.e_text.unwrap_or_default();
+
+    // A refusal is `[APPLICATION 30]`, a TGS reply is `[APPLICATION 13]`. This crate has no
+    // decoder for the reply and does not need one here: the live client in `tests/fast_tgs.rs`
+    // is what proves the interchange end to end, and this test is about which branch ran.
+    assert_eq!(
+        reply.first().copied(),
+        Some(0x6D),
+        "the armored exchange must answer with a TGS-REP, not an error: {}",
+        error_of(&reply).e_text.unwrap_or_default()
+    );
+
+    // PA-FX-FAST-REPLY is 136, and its presence is what distinguishes "the armor opened and
+    // the reply was wrapped in it" from an answer that quietly fell back to the clear.
     assert!(
-        text.contains("explicit armor"),
-        "the refusal must say which form is unsupported: {text}"
+        reply.windows(4).any(|w| w == [0x02, 0x02, 0x00, 0x88]),
+        "the reply carries no PA-FX-FAST-REPLY, so it was not wrapped in the armor"
+    );
+
+    // The client can only use a reply it can unwrap, so the key it derived must be the one
+    // the KDC used. The fixture derives the armor key from the subkey the same way the KDC
+    // does; if the KDC had opened the armor with the ticket's session key instead, the
+    // request checksum would not have verified and the answer above would be an error.
+    assert!(
+        armor_key.is_some(),
+        "the fixture must hand the client the key it derived"
     );
 }
 

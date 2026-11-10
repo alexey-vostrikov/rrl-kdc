@@ -308,18 +308,6 @@ impl Kdc {
         };
 
         let armored = super::fast::ArmoredRequest::decode(fast_bytes)?;
-        if armored.armor.is_some() {
-            // Explicit armor in a TGS request is legal (RFC 6113 allows a different ticket
-            // to armor), and is not implemented here: a caller that needs it should hear
-            // that, not receive a reply that ignored the ticket it sent.
-            return Err(Error::Kdc {
-                code: codes::KDC_ERR_PREAUTH_FAILED,
-                text: "PA-FX-FAST in a TGS-REQ with an explicit armor ticket is not \
-                       implemented; this KDC supports the implicit armor of RFC 6113 \
-                       §5.4.2.6, whose key comes from the PA-TGS-REQ subkey"
-                    .into(),
-            });
-        }
         let ap_req_bytes = req.padata(PA_TGS_REQ).ok_or_else(|| Error::Kdc {
             code: codes::KRB_AP_ERR_MODIFIED,
             text: "PA-FX-FAST in a TGS-REQ without PA-TGS-REQ: there is nothing to \
@@ -331,21 +319,40 @@ impl Kdc {
         // authenticator's subkey is known — and the subkey is only trustworthy after the
         // ticket and the authenticator have been verified.
         let proven = self.check_evidence(req, now)?;
-        let Some(subkey) = &proven.subkey else {
-            return Err(Error::Kdc {
-                code: codes::KRB_AP_ERR_MODIFIED,
-                text: "PA-FX-FAST in a TGS-REQ whose authenticator has no subkey: the \
-                       implicit armor key is cf2(subkey, \"subkeyarmor\", session key, \
-                       \"ticketarmor\") and cannot be derived without one"
-                    .into(),
-            });
-        };
-        let armor_key = super::fast::implicit_armor_key(subkey, &proven.tgt.session_key)?;
 
-        // The request checksum covers the `AP-REQ`, not the body: under FAST the body the
-        // client meant travels inside the armor, and the outer body is only a container.
-        let inner =
-            super::fast::unwrap_implicit(&armored, &armor_key, ap_req_bytes, self.cipher())?;
+        // Two ways a TGS request arrives armored, and the armor key is derived differently
+        // in each. Getting this wrong is invisible: the reply is well-formed and the client
+        // says only that the FAST response was missing.
+        //
+        // * Implicit (RFC 6113 §5.4.2.6): no `armor` field. The ticket travelled in
+        //   PA-TGS-REQ, and the key is `cf2(subkey, "subkeyarmor", session key,
+        //   "ticketarmor")` from that request's authenticator subkey and the TGT's session
+        //   key. A client that armored its AS exchange armors its TGS requests this way.
+        // * Explicit: an `armor` AP-REQ presenting a TGT of this realm — the same shape the
+        //   AS exchange takes. MIT krb5 sends this form for a service ticket when its
+        //   credential cache records an armor for the TGT, and Samba reaches it through
+        //   `gss_init_sec_context` for a `cifs/` ticket. Refusing it left the join at
+        //   "FAST fast response is missing FX-FAST", which names the armor rather than the
+        //   service the KDC could not issue.
+        let (armor_key, inner) = if armored.armor.is_some() {
+            let armor_key = self.armor_key(&armored, now)?;
+            let inner = super::fast::unwrap(&armored, &armor_key, ap_req_bytes, self.cipher())?;
+            (armor_key, inner)
+        } else {
+            let Some(subkey) = &proven.subkey else {
+                return Err(Error::Kdc {
+                    code: codes::KRB_AP_ERR_MODIFIED,
+                    text: "PA-FX-FAST in a TGS-REQ whose authenticator has no subkey: the \
+                           implicit armor key is cf2(subkey, \"subkeyarmor\", session key, \
+                           \"ticketarmor\") and cannot be derived without one"
+                        .into(),
+                });
+            };
+            let armor_key = super::fast::implicit_armor_key(subkey, &proven.tgt.session_key)?;
+            let inner =
+                super::fast::unwrap_implicit(&armored, &armor_key, ap_req_bytes, self.cipher())?;
+            (armor_key, inner)
+        };
 
         let options = inner.options();
         if let Some(bad) = super::fast::unsupported_critical(options) {

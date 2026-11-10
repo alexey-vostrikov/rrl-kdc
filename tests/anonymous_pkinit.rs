@@ -22,14 +22,14 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
-use rust_kdc::kdc::pkinit::{self, reply};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{self, kdc_options, tkt_flags};
-use rust_kdc::name::{self, Principal};
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
+use rrl_kdc::kdc::pkinit::{self, reply};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{self, kdc_options, tkt_flags};
+use rrl_kdc::name::{self, Principal};
 
 const REALM: &str = "EXAMPLE.COM";
 const ANON_REALM: &str = "WELLKNOWN:ANONYMOUS";
@@ -425,7 +425,7 @@ fn the_reply_proves_the_session_key_was_contributed_to_by_both_sides() {
     let mut kxr = der::Reader::new(&kx_plain);
     let key_seq = kxr.next_tlv("EncryptionKey").expect("a SEQUENCE");
     let contribution = msg::decode_key(key_seq.content).expect("an EncryptionKey");
-    let expected = rust_kdc::crypto::kdf::cf2(
+    let expected = rrl_kdc::crypto::kdf::cf2(
         contribution.bytes(),
         "PKINIT",
         reply_key.enctype(),

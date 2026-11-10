@@ -10,12 +10,12 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::otp::{Otp, Verifier};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::name::Principal;
-use rust_kdc::transport::RunningKdc;
+use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::otp::{Otp, Verifier};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::name::Principal;
+use rrl_kdc::transport::RunningKdc;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -26,12 +26,12 @@ const OTP: &str = "942617";
 struct Fixed;
 
 impl Verifier for Fixed {
-    fn verify(&self, _client: &Principal, value: &str) -> rust_kdc::Result<bool> {
+    fn verify(&self, _client: &Principal, value: &str) -> rrl_kdc::Result<bool> {
         Ok(value == OTP)
     }
 }
 
-fn realm() -> Arc<dyn rust_kdc::hdb::Hdb> {
+fn realm() -> Arc<dyn rrl_kdc::hdb::Hdb> {
     let cipher = OwnCipher;
     let db = MemoryHdb::new();
 
@@ -63,7 +63,7 @@ fn start() -> RunningKdc {
     let kdc = Kdc::new(KdcConfig::new(REALM).unwrap(), realm(), Arc::new(cipher))
         .with_cookie_key(key)
         .with_mechanism(Arc::new(Otp::new(Arc::new(Fixed))));
-    rust_kdc::transport::serve_loopback(kdc)
+    rrl_kdc::transport::serve_loopback(kdc)
 }
 
 /// A TGT to armor with: a ticket the user holds before the OTP login, obtained the ordinary way.
@@ -88,7 +88,7 @@ fn a_client_logs_in_with_a_one_time_password() {
     assert_eq!(creds.client.to_string(), format!("alice@{REALM}"));
     assert_eq!(creds.server.to_string(), format!("krbtgt/{REALM}@{REALM}"));
     assert_ne!(
-        creds.flags & rust_kdc::msg::tkt_flags::PRE_AUTHENT,
+        creds.flags & rrl_kdc::msg::tkt_flags::PRE_AUTHENT,
         0,
         "an OTP login is pre-authentication: flags were {:#010x}",
         creds.flags

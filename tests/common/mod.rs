@@ -11,15 +11,15 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{
     self, ApReq, Authenticator, EncKdcRepPart, EncTicketPart, EncryptedData, Ticket,
     encode_pa_data, kdc_options,
 };
-use rust_kdc::name::Principal;
+use rrl_kdc::name::Principal;
 
 pub const REALM: &str = "EXAMPLE.COM";
 pub const SERVICE: &str = "host/server.example.com";
@@ -253,13 +253,13 @@ pub fn code_of(reply: &[u8]) -> i32 {
 /// Reads the `EncTGSRepPart` out of a `TGS-REP`, decrypting with `key` and
 /// `usage` — what a client does.
 pub fn read_reply(reply: &[u8], key: &Key, usage: u32) -> EncKdcRepPart {
-    let f = rust_kdc::der::Fields::parse_app("TGS-REP", 13, reply).unwrap_or_else(|_| {
+    let f = rrl_kdc::der::Fields::parse_app("TGS-REP", 13, reply).unwrap_or_else(|_| {
         panic!(
             "the request was refused: {:?}",
             msg::KrbError::decode(reply).map(|e| (e.code, e.e_text))
         )
     });
-    let mut r = rust_kdc::der::Reader::new(f.bytes(6, "TGS-REP").unwrap());
+    let mut r = rrl_kdc::der::Reader::new(f.bytes(6, "TGS-REP").unwrap());
     let content = r.expect_in("enc-part", der::SEQUENCE).unwrap();
     let enc = EncryptedData::decode_content("enc-part", content).unwrap();
     let plain = OwnCipher

@@ -16,12 +16,12 @@
 use std::sync::Arc;
 
 use num_bigint::BigUint;
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::pkinit::{self, dh, reply};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::pkinit::{self, dh, reply};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const NOW: i64 = 1_800_000_000;
@@ -111,7 +111,7 @@ fn rep_padata(reply: &[u8]) -> Vec<(i32, Vec<u8>)> {
         Some(raw) => {
             let mut r = der::Reader::new(raw);
             let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE");
-            rust_kdc::msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
+            rrl_kdc::msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
         }
     }
 }
@@ -125,9 +125,9 @@ fn a_certificate_login_produces_a_tgt_the_client_can_read() {
 
     let reply = kdc.handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&reply).is_err(),
+        rrl_kdc::msg::KrbError::decode(&reply).is_err(),
         "a valid certificate login must produce a ticket: {:?}",
-        rust_kdc::msg::KrbError::decode(&reply)
+        rrl_kdc::msg::KrbError::decode(&reply)
     );
 
     // The reply must carry `PA-PK-AS-REP`, or the client cannot derive the key at all.
@@ -152,7 +152,7 @@ fn a_certificate_login_produces_a_tgt_the_client_can_read() {
     // `enc-part`'s enctype tells which enctype the client should derive for.
     let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
     let enc_part =
-        rust_kdc::msg::EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
+        rrl_kdc::msg::EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
             .expect("an EncryptedData");
 
     // Derive as the client does. The KDF is the one this KDC prefers among those the request
@@ -254,9 +254,9 @@ fn a_realm_without_pkinit_refuses_a_certificate_login() {
 
     let (request, _) = pkinit_as_req();
     let reply = plain.handle(&request, NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply)
+    let err = rrl_kdc::msg::KrbError::decode(&reply)
         .expect("a realm without PKINIT must refuse, not fall through");
-    assert_eq!(err.code, rust_kdc::error::codes::KDC_ERR_PREAUTH_FAILED);
+    assert_eq!(err.code, rrl_kdc::error::codes::KDC_ERR_PREAUTH_FAILED);
     assert!(
         err.e_text
             .unwrap_or_default()

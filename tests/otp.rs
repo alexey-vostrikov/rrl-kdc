@@ -12,13 +12,13 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::kdc::otp::{KU_PA_OTP_REQUEST, Otp, PA_OTP_REQUEST, Verifier};
-use rust_kdc::kdc::preauth::{Mechanism, Request, Step};
-use rust_kdc::msg::EncryptedData;
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::kdc::otp::{KU_PA_OTP_REQUEST, Otp, PA_OTP_REQUEST, Verifier};
+use rrl_kdc::kdc::preauth::{Mechanism, Request, Step};
+use rrl_kdc::msg::EncryptedData;
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const OTP: &str = "942617";
@@ -31,9 +31,9 @@ struct Judge {
 }
 
 impl Verifier for Judge {
-    fn verify(&self, _client: &Principal, value: &str) -> rust_kdc::Result<bool> {
+    fn verify(&self, _client: &Principal, value: &str) -> rrl_kdc::Result<bool> {
         if self.broken {
-            return Err(rust_kdc::Error::Kdc {
+            return Err(rrl_kdc::Error::Kdc {
                 code: codes::KDC_ERR_SVC_UNAVAILABLE,
                 text: "the RADIUS server did not answer".into(),
             });
@@ -303,7 +303,7 @@ fn a_request_outside_the_armor_is_refused_even_with_a_valid_nonce() {
 fn the_mechanism_is_offered_as_the_challenge_type_and_answered_as_the_request_type() {
     let otp = otp();
     assert_eq!(otp.pa_type(), PA_OTP_REQUEST);
-    assert_eq!(otp.announce_type(), rust_kdc::kdc::otp::PA_OTP_CHALLENGE);
+    assert_eq!(otp.announce_type(), rrl_kdc::kdc::otp::PA_OTP_CHALLENGE);
     assert_ne!(
         otp.pa_type(),
         otp.announce_type(),

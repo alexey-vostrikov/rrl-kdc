@@ -11,9 +11,9 @@
 //! the value taking effect, one of names that must be refused *by name*, and the
 //! unit suffixes Heimdal allows.
 
-use rust_kdc::crypto::Enctype;
-use rust_kdc::error::Error;
-use rust_kdc::kdc::config::KdcConfig;
+use rrl_kdc::crypto::Enctype;
+use rrl_kdc::error::Error;
+use rrl_kdc::kdc::config::KdcConfig;
 
 const REALM: &str = "EXAMPLE.COM";
 

@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use rust_kdc::acl::{AclStore, StoredAclPolicy, Targets};
-use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_kdc::hdb::{Hdb, HdbEntry, RedbHdb};
-use rust_kdc::kdc::{ChangePolicy, Kdc, KdcConfig, changepw_entry, kpasswd};
-use rust_kdc::name::Principal;
+use rrl_kdc::acl::{AclStore, StoredAclPolicy, Targets};
+use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rrl_kdc::hdb::{Hdb, HdbEntry, RedbHdb};
+use rrl_kdc::kdc::{ChangePolicy, Kdc, KdcConfig, changepw_entry, kpasswd};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const NOW: i64 = 1_700_000_000;
@@ -204,10 +204,10 @@ fn exchange(
     kdc: &Kdc,
     actor: &str,
     new_password: &str,
-) -> (kpasswd::ChangeReply, rust_kdc::crypto::Key) {
-    use rust_kdc::crypto::usage;
-    use rust_kdc::msg::kpasswd::{ChangePasswdData, seal_krb_priv};
-    use rust_kdc::msg::{ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, tkt_flags};
+) -> (kpasswd::ChangeReply, rrl_kdc::crypto::Key) {
+    use rrl_kdc::crypto::usage;
+    use rrl_kdc::msg::kpasswd::{ChangePasswdData, seal_krb_priv};
+    use rrl_kdc::msg::{ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, tkt_flags};
 
     let cipher = OwnCipher;
     let session = cipher.random(Enctype::Aes256Sha1).unwrap();
@@ -279,9 +279,9 @@ fn exchange(
     (reply, subkey)
 }
 
-fn status_of(reply: &kpasswd::ChangeReply, subkey: &rust_kdc::crypto::Key) -> u16 {
+fn status_of(reply: &kpasswd::ChangeReply, subkey: &rrl_kdc::crypto::Key) -> u16 {
     let (payload, _) =
-        rust_kdc::msg::kpasswd::open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
+        rrl_kdc::msg::kpasswd::open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
             .expect("the reply must decrypt in the client's subkey");
     u16::from_be_bytes([payload[0], payload[1]])
 }

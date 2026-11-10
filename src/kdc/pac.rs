@@ -1,4 +1,4 @@
-//! MS-PAC, in the `rrl-krb` crate.
+//! MS-PAC, in the `rrl-krb-common` crate.
 //!
 //! Shared with the acceptor: the envelope, the two signatures and `PAC_CLIENT_INFO` are built here
 //! and parsed there, and a PAC is only useful if the verifier reads the octets the signer wrote.
@@ -8,4 +8,4 @@
 //! Re-exported rather than wrapped so that `pac::Buffer`, `pac::SignatureType` and the type codes
 //! keep resolving here and are the same items on both sides.
 
-pub use rrl_krb::pac::*;
+pub use rrl_krb_common::pac::*;

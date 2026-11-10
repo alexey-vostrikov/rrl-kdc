@@ -14,21 +14,21 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::error::Error;
-use rust_kdc::hdb::ldap::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::error::Error;
+use rrl_kdc::hdb::ldap::{
     Attributes, Directory, LdapHdb, attrs, dn_for, from_attributes, to_attributes, uac,
 };
-use rust_kdc::hdb::{Hdb, HdbEntry, flags};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::kdc::{Purpose, usable_enctypes};
-use rust_kdc::msg::{
+use rrl_kdc::hdb::{Hdb, HdbEntry, flags};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::kdc::{Purpose, usable_enctypes};
+use rrl_kdc::msg::{
     self, ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_pa_data, kdc_options,
     tkt_flags,
 };
-use rust_kdc::name::Principal;
-use rust_kdc::transport::serve_loopback;
+use rrl_kdc::name::Principal;
+use rrl_kdc::transport::serve_loopback;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -934,7 +934,7 @@ fn the_same_request_is_refused_when_the_directory_lists_nobody() {
     );
     let reply = kdc.handle(&request, NOW);
     let err = msg::KrbError::decode(&reply).expect("a refusal");
-    assert_eq!(err.code, rust_kdc::error::codes::KDC_ERR_BADOPTION);
+    assert_eq!(err.code, rrl_kdc::error::codes::KDC_ERR_BADOPTION);
     assert!(
         err.e_text.unwrap_or_default().contains("may not delegate"),
         "the refusal names the rule"

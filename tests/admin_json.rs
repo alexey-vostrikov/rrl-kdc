@@ -18,11 +18,11 @@
 
 use std::sync::Arc;
 
-use rust_kdc::admin::wire::{AdminRequest, Grants, Operation, Rights};
-use rust_kdc::admin::{Admin, Modify, Role};
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_kdc::name::Principal;
+use rrl_kdc::admin::wire::{AdminRequest, Grants, Operation, Rights};
+use rrl_kdc::admin::{Admin, Modify, Role};
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 
@@ -122,7 +122,7 @@ fn a_reply_survives_json_and_carries_the_shape_the_transport_needs() {
 
 #[test]
 fn a_keytab_comes_back_as_base64_and_parses_back_into_a_keytab() {
-    use rust_kdc::hdb::Keytab;
+    use rrl_kdc::hdb::Keytab;
     let admin = realm();
     admin
         .handle(AdminRequest {
@@ -410,7 +410,7 @@ fn a_field_the_operation_does_not_have_is_refused() {
 
 #[test]
 fn every_reply_serializes_with_its_own_tag_and_payload() {
-    use rust_kdc::admin::wire::{EntryView, Reply};
+    use rrl_kdc::admin::wire::{EntryView, Reply};
 
     let view = EntryView {
         principal: p("alice"),

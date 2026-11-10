@@ -8,15 +8,15 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_kdc::kdc::kpasswd::{
+use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::kpasswd::{
     ChangeReply, STATUS_ACCESSDENIED, STATUS_MALFORMED, STATUS_SUCCESS, VERSION_CHANGE, VERSION_SET,
 };
-use rust_kdc::kdc::{Kdc, KdcConfig, changepw_entry};
-use rust_kdc::msg::kpasswd::ChangePasswdData;
-use rust_kdc::name::Principal;
-use rust_kdc::transport::{RunningKpasswd, serve_kpasswd_loopback, serve_loopback};
+use rrl_kdc::kdc::{Kdc, KdcConfig, changepw_entry};
+use rrl_kdc::msg::kpasswd::ChangePasswdData;
+use rrl_kdc::name::Principal;
+use rrl_kdc::transport::{RunningKpasswd, serve_kpasswd_loopback, serve_loopback};
 
 const REALM: &str = "EXAMPLE.COM";
 const OLD: &str = "the old password";
@@ -55,7 +55,7 @@ struct Stand {
     kdc_addr: String,
     kpasswd_addr: String,
     db: Arc<MemoryHdb>,
-    _kdc: rust_kdc::transport::RunningKdc,
+    _kdc: rrl_kdc::transport::RunningKdc,
     _kpasswd: RunningKpasswd,
 }
 
@@ -191,9 +191,9 @@ const CHANGEPW_KEY: &[u8] = b"the-changepw-service-key";
 
 /// A change-password ticket and the session key it carries, built the way the AS
 /// builds one.
-fn changepw_ticket(cname: &str) -> (Vec<u8>, rust_kdc::crypto::Key) {
-    use rust_kdc::crypto::usage;
-    use rust_kdc::msg::{EncTicketPart, EncryptedData, Ticket, tkt_flags};
+fn changepw_ticket(cname: &str) -> (Vec<u8>, rrl_kdc::crypto::Key) {
+    use rrl_kdc::crypto::usage;
+    use rrl_kdc::msg::{EncTicketPart, EncryptedData, Ticket, tkt_flags};
 
     let cipher = OwnCipher;
     let session = cipher.random(Enctype::Aes256Sha1).unwrap();
@@ -245,11 +245,11 @@ fn exchange(
     client: &str,
     version: u16,
     user_data: &[u8],
-) -> (ChangeReply, rust_kdc::crypto::Key) {
-    use rust_kdc::crypto::usage;
-    use rust_kdc::msg::apreq::ApReq;
-    use rust_kdc::msg::kpasswd::seal_krb_priv;
-    use rust_kdc::msg::{Authenticator, EncryptedData};
+) -> (ChangeReply, rrl_kdc::crypto::Key) {
+    use rrl_kdc::crypto::usage;
+    use rrl_kdc::msg::apreq::ApReq;
+    use rrl_kdc::msg::kpasswd::seal_krb_priv;
+    use rrl_kdc::msg::{Authenticator, EncryptedData};
 
     let cipher = OwnCipher;
     let (ticket, session) = changepw_ticket(client);
@@ -285,8 +285,8 @@ fn exchange(
 }
 
 /// The status code the server put in the reply.
-fn status(reply: &ChangeReply, subkey: &rust_kdc::crypto::Key) -> u16 {
-    use rust_kdc::msg::kpasswd::open_krb_priv;
+fn status(reply: &ChangeReply, subkey: &rrl_kdc::crypto::Key) -> u16 {
+    use rrl_kdc::msg::kpasswd::open_krb_priv;
     let (payload, _) = open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
         .expect("the reply must decrypt in the subkey the client chose");
     assert!(payload.len() >= 2, "a result is a status and a message");
@@ -401,7 +401,7 @@ fn the_change_password_service_needs_its_own_ticket() {
         .unwrap();
     db.insert(krbtgt).unwrap();
     let mut changepw = changepw_entry(REALM, &cipher, b"svc").unwrap();
-    changepw.flags &= !rust_kdc::hdb::flags::CHANGE_PW;
+    changepw.flags &= !rrl_kdc::hdb::flags::CHANGE_PW;
     db.insert(changepw).unwrap();
     let mut alice_entry = HdbEntry::user(Principal::parse(&format!("alice@{REALM}")).unwrap());
     alice_entry

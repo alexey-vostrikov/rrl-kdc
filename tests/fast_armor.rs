@@ -17,17 +17,17 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, kdf, usage};
-use rust_kdc::der;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::fast::{self, Armor, ArmoredRequest, FastRequest};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg;
-use rust_kdc::msg::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, kdf, usage};
+use rrl_kdc::der;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::fast::{self, Armor, ArmoredRequest, FastRequest};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg;
+use rrl_kdc::msg::{
     ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_enc_ts_enc, encode_pa_data,
     kdc_options, tkt_flags,
 };
-use rust_kdc::name::Principal;
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -250,7 +250,7 @@ fn reply_parts(reply: &[u8]) -> (Vec<(i32, Vec<u8>)>, Vec<u8>) {
         Some(raw) => {
             let mut r = der::Reader::new(raw);
             let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE of PA-DATA");
-            rust_kdc::msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
+            rrl_kdc::msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
         }
     };
     (padata, f.bytes(5, "AS-REP").expect("the ticket").to_vec())
@@ -291,9 +291,9 @@ fn a_password_login_succeeds_inside_the_armor() {
     let (request, _) = armored_as_req(0x4242);
     let reply = kdc().handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&reply).is_err(),
+        rrl_kdc::msg::KrbError::decode(&reply).is_err(),
         "an armored AS-REQ must be answered with a ticket, not an error: {:?}",
-        rust_kdc::msg::KrbError::decode(&reply)
+        rrl_kdc::msg::KrbError::decode(&reply)
     );
 }
 
@@ -329,7 +329,7 @@ fn the_reply_opens_with_the_strengthened_key() {
         .map(|raw| {
             let mut r = der::Reader::new(raw);
             let seq = r.next_tlv("EncryptionKey").unwrap();
-            rust_kdc::msg::decode_key(seq.content).unwrap()
+            rrl_kdc::msg::decode_key(seq.content).unwrap()
         })
         .expect("a FAST reply must carry a strengthen key, or the reply is an oracle");
 
@@ -363,7 +363,7 @@ fn the_salt_is_not_in_the_clear() {
     let (padata, _) = reply_parts(&reply);
     let outer: Vec<i32> = padata.iter().map(|(t, _)| *t).collect();
     assert!(
-        !outer.contains(&rust_kdc::msg::PA_ETYPE_INFO2),
+        !outer.contains(&rrl_kdc::msg::PA_ETYPE_INFO2),
         "the reply carries PA-ETYPE-INFO2 in the clear: {outer:?}"
     );
     assert!(
@@ -431,10 +431,10 @@ fn a_request_whose_armor_is_not_a_tgt_is_refused() {
         ])],
     );
     let reply = kdc().handle(&request, NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply).expect("a refusal");
+    let err = rrl_kdc::msg::KrbError::decode(&reply).expect("a refusal");
     assert_eq!(
         err.code,
-        rust_kdc::error::codes::KRB_AP_ERR_MODIFIED,
+        rrl_kdc::error::codes::KRB_AP_ERR_MODIFIED,
         "{}",
         err.e_text.unwrap_or_default()
     );
@@ -458,7 +458,7 @@ fn a_plain_timestamp_inside_the_armor_is_refused() {
     .unwrap();
     let inner = FastRequest {
         fast_options: vec![0],
-        padata: vec![(rust_kdc::msg::PA_ENC_TIMESTAMP, timestamp.encode())],
+        padata: vec![(rrl_kdc::msg::PA_ENC_TIMESTAMP, timestamp.encode())],
         req_body: outer_body.clone(),
     };
     let armored = ArmoredRequest {
@@ -492,10 +492,10 @@ fn a_plain_timestamp_inside_the_armor_is_refused() {
         ])],
     );
     let reply = kdc().handle(&request, NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply).expect("a refusal");
+    let err = rrl_kdc::msg::KrbError::decode(&reply).expect("a refusal");
     assert_eq!(
         err.code,
-        rust_kdc::error::codes::KDC_ERR_PREAUTH_FAILED,
+        rrl_kdc::error::codes::KDC_ERR_PREAUTH_FAILED,
         "{}",
         err.e_text.unwrap_or_default()
     );
@@ -516,7 +516,7 @@ fn the_kdc_proves_it_holds_the_long_term_key() {
         .map(|raw| {
             let mut r = der::Reader::new(raw);
             let seq = r.next_tlv("PA-DATA").unwrap();
-            rust_kdc::msg::decode_pa_data("PA-DATA", seq.content).unwrap()
+            rrl_kdc::msg::decode_pa_data("PA-DATA", seq.content).unwrap()
         })
         .unwrap_or_default()
         .into_iter()
@@ -570,9 +570,9 @@ fn hide_client_names_keeps_the_client_out_of_the_reply() {
     let (request, _) = armored_as_req_with(0x4246, fast::HIDE_CLIENT_NAMES);
     let reply = kdc().handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&reply).is_err(),
+        rrl_kdc::msg::KrbError::decode(&reply).is_err(),
         "a request with hide-client-names must still be answered: {:?}",
-        rust_kdc::msg::KrbError::decode(&reply)
+        rrl_kdc::msg::KrbError::decode(&reply)
     );
 
     let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
@@ -582,7 +582,7 @@ fn hide_client_names_keeps_the_client_out_of_the_reply() {
         .map(|raw| {
             let mut r = der::Reader::new(raw);
             let seq = r.next_tlv("cname").unwrap();
-            rust_kdc::name::Principal::decode("cname", seq.content, &crealm).unwrap()
+            rrl_kdc::name::Principal::decode("cname", seq.content, &crealm).unwrap()
         })
         .expect("the reply names some client");
     assert_eq!(crealm, "WELLKNOWN:ANONYMOUS");
@@ -618,11 +618,11 @@ fn an_unknown_critical_fast_option_is_refused() {
     // reply whose guarantees it misreads.
     let (request, armor_key) = armored_as_req_with(0x4248, 0x2000_0000);
     let reply = kdc().handle(&request, NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply)
+    let err = rrl_kdc::msg::KrbError::decode(&reply)
         .expect("an unknown critical fast-option must be refused");
     assert_eq!(
         err.code,
-        rust_kdc::error::codes::KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
+        rrl_kdc::error::codes::KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
         "{}",
         err.e_text.clone().unwrap_or_default()
     );
@@ -640,9 +640,9 @@ fn a_non_critical_fast_option_is_ignored() {
     let (request, _) = armored_as_req_with(0x4249, 0x0000_8000);
     let reply = kdc().handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&reply).is_err(),
+        rrl_kdc::msg::KrbError::decode(&reply).is_err(),
         "an unknown non-critical option must be ignored: {:?}",
-        rust_kdc::msg::KrbError::decode(&reply)
+        rrl_kdc::msg::KrbError::decode(&reply)
     );
 }
 
@@ -657,15 +657,15 @@ fn the_same_armor_ap_req_can_come_twice() {
     let (request, _) = armored_as_req(0x4250);
     let first = kdc.handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&first).is_err(),
+        rrl_kdc::msg::KrbError::decode(&first).is_err(),
         "the first use must succeed: {:?}",
-        rust_kdc::msg::KrbError::decode(&first)
+        rrl_kdc::msg::KrbError::decode(&first)
     );
     let second = kdc.handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&second).is_err(),
+        rrl_kdc::msg::KrbError::decode(&second).is_err(),
         "re-sending the armor AP-REQ must not be refused as a replay: {:?}",
-        rust_kdc::msg::KrbError::decode(&second)
+        rrl_kdc::msg::KrbError::decode(&second)
     );
 }
 
@@ -676,10 +676,10 @@ fn a_request_whose_authenticator_is_stale_is_refused() {
     let (request, _) = armored_as_req_at(0x4251, 0, NOW - 4000, 0);
     let reply = kdc().handle(&request, NOW);
     let err =
-        rust_kdc::msg::KrbError::decode(&reply).expect("a stale authenticator must be refused");
+        rrl_kdc::msg::KrbError::decode(&reply).expect("a stale authenticator must be refused");
     assert_eq!(
         err.code,
-        rust_kdc::error::codes::KRB_AP_ERR_SKEW,
+        rrl_kdc::error::codes::KRB_AP_ERR_SKEW,
         "{}",
         err.e_text.clone().unwrap_or_default()
     );
@@ -692,9 +692,9 @@ fn a_different_microsecond_is_not_a_replay() {
     let kdc = kdc();
     let (first_request, _) = armored_as_req_at(0x4252, 0, NOW, 1);
     let (second_request, _) = armored_as_req_at(0x4253, 0, NOW, 2);
-    assert!(rust_kdc::msg::KrbError::decode(&kdc.handle(&first_request, NOW)).is_err());
+    assert!(rrl_kdc::msg::KrbError::decode(&kdc.handle(&first_request, NOW)).is_err());
     assert!(
-        rust_kdc::msg::KrbError::decode(&kdc.handle(&second_request, NOW)).is_err(),
+        rrl_kdc::msg::KrbError::decode(&kdc.handle(&second_request, NOW)).is_err(),
         "a second login in the same second must not be read as a replay"
     );
 }

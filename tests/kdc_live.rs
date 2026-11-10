@@ -12,12 +12,12 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_kdc::kdc::KdcConfig;
-use rust_kdc::msg::tkt_flags;
-use rust_kdc::name::Principal;
-use rust_kdc::transport::RunningKdc;
+use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
+use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::KdcConfig;
+use rrl_kdc::msg::tkt_flags;
+use rrl_kdc::name::Principal;
+use rrl_kdc::transport::RunningKdc;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -51,8 +51,8 @@ fn realm() -> Arc<dyn Hdb> {
 fn start() -> RunningKdc {
     let cipher = OwnCipher;
     let config = KdcConfig::new(REALM).unwrap();
-    let kdc = rust_kdc::kdc::Kdc::new(config, realm(), Arc::new(cipher));
-    rust_kdc::transport::serve_loopback(kdc)
+    let kdc = rrl_kdc::kdc::Kdc::new(config, realm(), Arc::new(cipher));
+    rrl_kdc::transport::serve_loopback(kdc)
 }
 
 /// The same KDC, offering `PA-FX-COOKIE`.
@@ -62,8 +62,8 @@ fn start_with_cookie() -> RunningKdc {
         .s2k(Enctype::Aes256Sha1, b"cookie-secret", b"cookie", None)
         .unwrap();
     let config = KdcConfig::new(REALM).unwrap();
-    let kdc = rust_kdc::kdc::Kdc::new(config, realm(), Arc::new(cipher)).with_cookie_key(key);
-    rust_kdc::transport::serve_loopback(kdc)
+    let kdc = rrl_kdc::kdc::Kdc::new(config, realm(), Arc::new(cipher)).with_cookie_key(key);
+    rrl_kdc::transport::serve_loopback(kdc)
 }
 
 #[test]

@@ -8,10 +8,10 @@
 
 #![cfg(feature = "pkinit")]
 
-use rust_kdc::crypto::Enctype;
-use rust_kdc::der::{self, Reader};
-use rust_kdc::kdc::pkinit::{self, PkinitError, reply};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::Enctype;
+use rrl_kdc::der::{self, Reader};
+use rrl_kdc::kdc::pkinit::{self, PkinitError, reply};
+use rrl_kdc::name::Principal;
 
 const NOW: i64 = 1_800_000_000;
 

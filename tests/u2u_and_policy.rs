@@ -15,16 +15,16 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_kdc::kdc::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::{
     ChangePolicy, Kdc, KdcConfig, SelfOnly, kpasswd::ChangeReply, kpasswd::STATUS_SUCCESS,
     kpasswd::changepw_entry,
 };
-use rust_kdc::msg::{EncTicketPart, EncryptedData, Ticket, kdc_options, tkt_flags};
-use rust_kdc::name::Principal;
+use rrl_kdc::msg::{EncTicketPart, EncryptedData, Ticket, kdc_options, tkt_flags};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -129,7 +129,7 @@ fn u2u_request(tgt: &(Vec<u8>, Key), additional: &[u8], target: &Principal) -> V
     let cksum = cipher
         .checksum(&tgt.1, usage::TGS_REQ_AUTH_CKSUM, &body)
         .unwrap();
-    let auth = rust_kdc::msg::Authenticator {
+    let auth = rrl_kdc::msg::Authenticator {
         crealm: REALM.into(),
         cname: alice(),
         cksum: Some((Enctype::Aes256Sha1.checksum_type(), cksum)),
@@ -139,7 +139,7 @@ fn u2u_request(tgt: &(Vec<u8>, Key), additional: &[u8], target: &Principal) -> V
         seq_number: None,
         authorization_data: None,
     };
-    let ap_req = rust_kdc::msg::ApReq {
+    let ap_req = rrl_kdc::msg::ApReq {
         ap_options: 0,
         ticket: tgt.0.clone(),
         authenticator: EncryptedData::seal(
@@ -158,7 +158,7 @@ fn u2u_request(tgt: &(Vec<u8>, Key), additional: &[u8], target: &Principal) -> V
             der::field(2, der::int(12)),
             der::field(
                 3,
-                rust_kdc::msg::encode_pa_data(&[(rust_kdc::msg::PA_TGS_REQ, ap_req.encode())]),
+                rrl_kdc::msg::encode_pa_data(&[(rrl_kdc::msg::PA_TGS_REQ, ap_req.encode())]),
             ),
             der::field(4, body),
         ])],
@@ -210,7 +210,7 @@ fn a_user_to_user_ticket_is_sealed_in_the_servers_session_key() {
     let request = u2u_request(&client_side, &server_side.0, &service());
     let reply = kdc.handle(&request, NOW);
     assert!(
-        rust_kdc::msg::KrbError::decode(&reply).is_err(),
+        rrl_kdc::msg::KrbError::decode(&reply).is_err(),
         "a user-to-user request must be answered with a ticket"
     );
 
@@ -249,7 +249,7 @@ fn a_user_to_user_ticket_does_not_open_in_the_service_key() {
     let client_side = server_tgt(&krbtgt_key, &alice());
     let request = u2u_request(&client_side, &server_side.0, &service());
     let reply = kdc.handle(&request, NOW);
-    assert!(rust_kdc::msg::KrbError::decode(&reply).is_err());
+    assert!(rrl_kdc::msg::KrbError::decode(&reply).is_err());
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
     let ticket = Ticket::decode(f.bytes(5, "TGS-REP").unwrap()).unwrap();
     assert!(
@@ -271,7 +271,7 @@ fn user_to_user_for_the_wrong_principal_is_refused() {
     let client_side = server_tgt(&krbtgt_key, &alice());
     let request = u2u_request(&client_side, &alices_tgt.0, &service());
     let reply = kdc.handle(&request, NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply)
+    let err = rrl_kdc::msg::KrbError::decode(&reply)
         .expect("a mismatched user-to-user request must be refused");
     assert_eq!(err.code, codes::KDC_ERR_MUST_USE_USER2USER);
 }
@@ -293,7 +293,7 @@ fn user_to_user_without_an_additional_ticket_is_badoption() {
     let cksum = OwnCipher
         .checksum(&client_side.1, usage::TGS_REQ_AUTH_CKSUM, &body)
         .unwrap();
-    let auth = rust_kdc::msg::Authenticator {
+    let auth = rrl_kdc::msg::Authenticator {
         crealm: REALM.into(),
         cname: alice(),
         cksum: Some((Enctype::Aes256Sha1.checksum_type(), cksum)),
@@ -303,7 +303,7 @@ fn user_to_user_without_an_additional_ticket_is_badoption() {
         seq_number: None,
         authorization_data: None,
     };
-    let ap_req = rust_kdc::msg::ApReq {
+    let ap_req = rrl_kdc::msg::ApReq {
         ap_options: 0,
         ticket: client_side.0.clone(),
         authenticator: EncryptedData::seal(
@@ -322,13 +322,13 @@ fn user_to_user_without_an_additional_ticket_is_badoption() {
             der::field(2, der::int(12)),
             der::field(
                 3,
-                rust_kdc::msg::encode_pa_data(&[(rust_kdc::msg::PA_TGS_REQ, ap_req.encode())]),
+                rrl_kdc::msg::encode_pa_data(&[(rrl_kdc::msg::PA_TGS_REQ, ap_req.encode())]),
             ),
             der::field(4, body),
         ])],
     );
     let reply = kdc.handle(&request, NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply)
+    let err = rrl_kdc::msg::KrbError::decode(&reply)
         .expect("a user-to-user request without a ticket must be refused");
     assert_eq!(err.code, codes::KDC_ERR_BADOPTION);
 }
@@ -383,7 +383,7 @@ fn an_administrator_may_change_another_password() {
     let kdc =
         kdc_over(Arc::clone(&db)).with_change_policy(Arc::new(Administrators(vec![admin.clone()])));
 
-    let data = rust_kdc::msg::kpasswd::ChangePasswdData {
+    let data = rrl_kdc::msg::kpasswd::ChangePasswdData {
         new_password: b"a password an admin set".to_vec(),
         target: Some(Principal::parse(&format!("bob@{REALM}")).unwrap()),
     };
@@ -402,14 +402,14 @@ fn a_non_administrator_still_may_not() {
     let db = realm_with_accounts();
     let admin = Principal::parse(&format!("admin@{REALM}")).unwrap();
     let kdc = kdc_over(Arc::clone(&db)).with_change_policy(Arc::new(Administrators(vec![admin])));
-    let data = rust_kdc::msg::kpasswd::ChangePasswdData {
+    let data = rrl_kdc::msg::kpasswd::ChangePasswdData {
         new_password: b"alice tries it".to_vec(),
         target: Some(Principal::parse(&format!("bob@{REALM}")).unwrap()),
     };
     let reply = change_through_wire(&kdc, "alice", 0xff80, &data.encode());
     assert_eq!(
         status_of(&reply.0, &reply.1),
-        rust_kdc::kdc::kpasswd::STATUS_ACCESSDENIED
+        rrl_kdc::kdc::kpasswd::STATUS_ACCESSDENIED
     );
     let bob = db
         .fetch(&Principal::parse(&format!("bob@{REALM}")).unwrap())
@@ -464,7 +464,7 @@ fn change_through_wire(
         .unwrap(),
     };
     let subkey = cipher.random(Enctype::Aes256Sha1).unwrap();
-    let auth = rust_kdc::msg::Authenticator {
+    let auth = rrl_kdc::msg::Authenticator {
         crealm: REALM.into(),
         cname: Principal::parse(&format!("{actor}@{REALM}")).unwrap(),
         cksum: None,
@@ -474,7 +474,7 @@ fn change_through_wire(
         seq_number: Some(1),
         authorization_data: None,
     };
-    let ap_req = rust_kdc::msg::ApReq {
+    let ap_req = rrl_kdc::msg::ApReq {
         ap_options: 0,
         ticket: ticket.encode(),
         authenticator: EncryptedData::seal(
@@ -487,7 +487,7 @@ fn change_through_wire(
         .unwrap(),
     };
     let request =
-        rust_kdc::msg::kpasswd::seal_krb_priv(&cipher, &subkey, user_data, Some(1), NOW).unwrap();
+        rrl_kdc::msg::kpasswd::seal_krb_priv(&cipher, &subkey, user_data, Some(1), NOW).unwrap();
     let reply = kdc
         .handle_kpasswd(&ap_req.encode(), &request, version, NOW)
         .unwrap_or_else(|e| panic!("the exchange must be answered: {e}"));
@@ -497,7 +497,7 @@ fn change_through_wire(
 /// The status in a change-password reply.
 fn status_of(reply: &ChangeReply, subkey: &Key) -> u16 {
     let (payload, _) =
-        rust_kdc::msg::kpasswd::open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
+        rrl_kdc::msg::kpasswd::open_krb_priv(&OwnCipher, subkey, &reply.priv_message)
             .expect("the reply must decrypt in the client's subkey");
     u16::from_be_bytes([payload[0], payload[1]])
 }

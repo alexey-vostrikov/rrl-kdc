@@ -18,16 +18,16 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::cookie::Cookie;
-use rust_kdc::kdc::fast::PA_FX_COOKIE;
-use rust_kdc::kdc::preauth::{Announced, Mechanism, Request, Step};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{self, EncryptedData, encode_pa_data, kdc_options};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::cookie::Cookie;
+use rrl_kdc::kdc::fast::PA_FX_COOKIE;
+use rrl_kdc::kdc::preauth::{Announced, Mechanism, Request, Step};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{self, EncryptedData, encode_pa_data, kdc_options};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -104,7 +104,7 @@ impl Mechanism for Stub {
         "stub"
     }
 
-    fn round(&self, request: &Request<'_>, state: &[u8], padata: &[u8]) -> rust_kdc::Result<Step> {
+    fn round(&self, request: &Request<'_>, state: &[u8], padata: &[u8]) -> rrl_kdc::Result<Step> {
         self.seen
             .lock()
             .unwrap()
@@ -330,7 +330,7 @@ fn the_reply_is_sealed_with_the_key_the_mechanism_produced() {
         .expect("an EncryptedData");
     let opened = OwnCipher.decrypt(
         &stub_reply_key(),
-        rust_kdc::crypto::usage::AS_REP_ENCPART,
+        rrl_kdc::crypto::usage::AS_REP_ENCPART,
         &sealed.cipher,
     );
     assert!(
@@ -422,7 +422,7 @@ fn the_announced_state_reaches_the_client_in_the_cookie() {
         fn name(&self) -> &'static str {
             "challenging"
         }
-        fn announce(&self, _request: &Request<'_>) -> rust_kdc::Result<Option<Announced>> {
+        fn announce(&self, _request: &Request<'_>) -> rrl_kdc::Result<Option<Announced>> {
             Ok(Some(Announced {
                 padata: b"nonce-42".to_vec(),
                 state: b"nonce-42".to_vec(),
@@ -433,7 +433,7 @@ fn the_announced_state_reaches_the_client_in_the_cookie() {
             _request: &Request<'_>,
             _state: &[u8],
             _padata: &[u8],
-        ) -> rust_kdc::Result<Step> {
+        ) -> rrl_kdc::Result<Step> {
             Ok(Step::More {
                 padata: Vec::new(),
                 state: Vec::new(),
@@ -481,7 +481,7 @@ fn a_mechanism_sees_the_request_octets_and_the_long_term_keys() {
             request: &Request<'_>,
             _state: &[u8],
             _padata: &[u8],
-        ) -> rust_kdc::Result<Step> {
+        ) -> rrl_kdc::Result<Step> {
             assert_eq!(request.realm, REALM);
             assert_eq!(request.cname.components, vec!["alice".to_string()]);
             assert_eq!(request.now, NOW);
@@ -558,7 +558,7 @@ fn a_ticket_from_a_finished_mechanism_is_marked_pre_authenticated() {
     let plain = OwnCipher
         .decrypt(
             &krbtgt,
-            rust_kdc::crypto::usage::KDC_REP_TICKET,
+            rrl_kdc::crypto::usage::KDC_REP_TICKET,
             &ticket.enc.cipher,
         )
         .expect("the ticket opens with krbtgt's key");
@@ -590,7 +590,7 @@ fn a_realm_that_requires_preauthentication_is_not_relaxed_by_the_entry() {
         .add_password_key(&cipher, Enctype::Aes256Sha1, PASSWORD.as_bytes(), 1)
         .unwrap();
     // The entry says nothing about pre-authentication; the realm does.
-    alice.flags &= !rust_kdc::hdb::flags::REQUIRE_PREAUTH;
+    alice.flags &= !rrl_kdc::hdb::flags::REQUIRE_PREAUTH;
     db.insert(alice).unwrap();
 
     let kdc = Kdc::new(

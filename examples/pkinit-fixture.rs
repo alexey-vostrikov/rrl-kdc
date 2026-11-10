@@ -15,7 +15,7 @@
 
 use std::process::Command;
 
-use rust_kdc::der;
+use rrl_kdc::der;
 
 /// A `KDC-REQ-BODY` as an AS-REQ carries it: the body the `paChecksum` covers.
 ///
@@ -28,7 +28,7 @@ fn body(nonce: u32) -> Vec<u8> {
         // bare string. A GeneralString here parses as nothing and the KDC refuses the body.
         der::field(
             1,
-            rust_kdc::name::Principal::parse("alice@EXAMPLE.COM")
+            rrl_kdc::name::Principal::parse("alice@EXAMPLE.COM")
                 .expect("a principal")
                 .encode_name(),
         ),
@@ -37,7 +37,7 @@ fn body(nonce: u32) -> Vec<u8> {
         // strings has no name type and does not parse as a principal.
         der::field(
             3,
-            rust_kdc::name::Principal::krbtgt("EXAMPLE.COM").encode_name(),
+            rrl_kdc::name::Principal::krbtgt("EXAMPLE.COM").encode_name(),
         ),
         // `till [5]`: required, and a request without it is not a request.
         der::field(5, der::time(1_800_003_600)),
@@ -225,10 +225,10 @@ struct DhPack {
 fn dh_auth_pack(body: &[u8], nonce: u32) -> DhPack {
     use sha1::Digest;
 
-    let group = rust_kdc::kdc::pkinit::dh::Group::at_least(2048);
+    let group = rrl_kdc::kdc::pkinit::dh::Group::at_least(2048);
     let exponent: num_bigint::BigUint = num_bigint::BigUint::from(0x9e37_79b9_7f4a_7c15u64)
         + (num_bigint::BigUint::from(1u32) << 190);
-    let ours = rust_kdc::kdc::pkinit::dh::KeyPair::from_private(group, exponent.clone());
+    let ours = rrl_kdc::kdc::pkinit::dh::KeyPair::from_private(group, exponent.clone());
 
     let params = der::seq(&[
         der::int_bytes(&group.p().to_bytes_be()),

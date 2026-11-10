@@ -27,7 +27,7 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rrl-kdc"
 . "$ROOT/scripts/image.sh"
 
 mkdir -p "$CACHE/rustup" "$ROOT/target"

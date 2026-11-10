@@ -11,16 +11,16 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::logon_info::{Identity, PacIdentities, Sid};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{
     self, ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_pa_data, kdc_options,
     tkt_flags,
 };
-use rust_kdc::name::Principal;
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const SERVICE: &str = "host/server.example.com";
@@ -43,7 +43,7 @@ impl PacIdentities for Directory {
     fn identity(
         &self,
         principal: &Principal,
-    ) -> rust_kdc::kdc::logon_info::PacResult<Option<Identity>> {
+    ) -> rrl_kdc::kdc::logon_info::PacResult<Option<Identity>> {
         Ok((*principal == alice()).then(|| self.identity.clone()))
     }
 }
@@ -311,11 +311,11 @@ fn both_signatures_are_keyed_by_the_keys_they_name() {
         }
     }
     let recompute = |key: &Key, data: &[u8]| {
-        let kc = rust_kdc::crypto::kdf::derive_key(
+        let kc = rrl_kdc::crypto::kdf::derive_key(
             key.enctype(),
             key.bytes(),
             17,
-            rust_kdc::crypto::kdf::KeyUse::Checksum,
+            rrl_kdc::crypto::kdf::KeyUse::Checksum,
         )
         .unwrap();
         use hmac::{Hmac, KeyInit, Mac};
@@ -361,10 +361,7 @@ fn an_account_the_directory_does_not_know_gets_a_ticket_without_a_pac() {
     // deployment state, not an authentication failure.
     struct Empty;
     impl PacIdentities for Empty {
-        fn identity(
-            &self,
-            _: &Principal,
-        ) -> rust_kdc::kdc::logon_info::PacResult<Option<Identity>> {
+        fn identity(&self, _: &Principal) -> rrl_kdc::kdc::logon_info::PacResult<Option<Identity>> {
             Ok(None)
         }
     }

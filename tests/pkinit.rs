@@ -17,8 +17,8 @@
 
 #![cfg(feature = "pkinit")]
 
-use rust_kdc::kdc::pkinit::{self, PkinitError, Request, TrustAnchors};
-use rust_kdc::name::Principal;
+use rrl_kdc::kdc::pkinit::{self, PkinitError, Request, TrustAnchors};
+use rrl_kdc::name::Principal;
 
 /// The moment the fixtures are valid: their certificates run from 2026 to 2046, and the
 /// expired one covers a single day in 2020.
@@ -169,7 +169,7 @@ fn an_unsigned_request_is_anonymous_pkinit_not_a_login() {
     // `id-pkinit-authData` with no `SignedData` is RFC 8062's anonymous form. Reading it
     // as an authenticated request would log in `WELLKNOWN/ANONYMOUS` as whoever the body
     // named.
-    use rust_kdc::der;
+    use rrl_kdc::der;
     let pack = fixture("authpack.der");
     // ContentInfo { contentType id-pkinit-authData, [0] EXPLICIT OCTET STRING }
     let content_info = der::seq(&[
@@ -225,7 +225,7 @@ fn a_message_without_signed_auth_pack_is_refused() {
     // `PA-PK-AS-REQ ::= SEQUENCE { signedAuthPack [0] }`. A sequence that starts with
     // anything else is not this message, and saying which octet was wrong beats a stack
     // of "unexpected tag" from three levels down.
-    use rust_kdc::der;
+    use rrl_kdc::der;
     let wrong = der::seq(&[der::field(1, der::int(5))]);
     match Request::decode(&wrong) {
         Err(PkinitError::Malformed(m)) => assert!(
@@ -240,7 +240,7 @@ fn a_message_without_signed_auth_pack_is_refused() {
 fn a_content_info_of_an_unknown_type_is_refused_by_name() {
     // PKINIT defines exactly two content types. Anything else is a request this KDC does
     // not understand, and treating it as one it does would be the more dangerous answer.
-    use rust_kdc::der;
+    use rrl_kdc::der;
     let unknown = der::seq(&[
         der::tlv(
             0x06,

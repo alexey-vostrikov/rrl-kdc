@@ -11,15 +11,17 @@
 //!   operator's business, not a client's — and, on a hostile network, it is a hint
 //!   about the host.
 
-use rust_kdc::crypto::Enctype;
-use rust_kdc::der::DerError;
-use rust_kdc::error::{Error, codes};
+use rrl_kdc::crypto::Enctype;
+use rrl_kdc::der::DerError;
+use rrl_kdc::error::{Error, codes};
 
 /// One value of every variant, so the table below cannot silently miss one.
 fn all_variants() -> Vec<Error> {
     vec![
         Error::Der(DerError("TGS-REQ: expected tag 0x1b, got 0x30".into())),
-        Error::Krb(rrl_krb::Error::Protocol("a shared-crate failure".into())),
+        Error::Krb(rrl_krb_common::Error::Protocol(
+            "a shared-crate failure".into(),
+        )),
         Error::UnsupportedEnctype(23),
         Error::KeyLength {
             enctype: Enctype::Aes256Sha1,

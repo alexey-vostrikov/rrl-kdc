@@ -1,4 +1,4 @@
-# rust-kdc
+# rrl-kdc
 
 A Kerberos KDC core in Rust, written from scratch, with **Heimdal's behaviour as
 the specification**.

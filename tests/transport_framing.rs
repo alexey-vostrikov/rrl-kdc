@@ -14,10 +14,10 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::transport::{read_frame, serve_kpasswd_loopback, serve_loopback, write_frame};
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::transport::{read_frame, serve_kpasswd_loopback, serve_loopback, write_frame};
 
 const REALM: &str = "EXAMPLE.COM";
 
@@ -95,11 +95,11 @@ fn a_kpasswd_request_shorter_than_its_header_is_answered_with_something() {
     // KRB-ERROR: a refusal the client can read, not silence it would take for a
     // network fault.
     let reply = read_frame(&mut stream).unwrap();
-    let error = rust_kdc::msg::KrbError::decode(&reply)
+    let error = rrl_kdc::msg::KrbError::decode(&reply)
         .expect("a malformed kpasswd request must be answered with a KRB-ERROR");
     assert_eq!(
         error.code,
-        rust_kdc::error::Error::Protocol(String::new()).kdc_code(),
+        rrl_kdc::error::Error::Protocol(String::new()).kdc_code(),
         "the code must be the one this crate maps a framing failure to"
     );
 }

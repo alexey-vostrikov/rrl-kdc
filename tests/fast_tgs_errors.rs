@@ -12,17 +12,17 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::fast::{self, Armor, ArmoredRequest, FastRequest};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::fast::{self, Armor, ArmoredRequest, FastRequest};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{
     self, ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_pa_data, kdc_options,
     tkt_flags,
 };
-use rust_kdc::name::Principal;
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const SERVICE: &str = "host/server.example.com";

@@ -9,16 +9,16 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{
     self, EncryptedData, PA_ENC_TIMESTAMP, Ticket, encode_enc_ts_enc, encode_etype_info2,
     encode_pa_data, kdc_options,
 };
-use rust_kdc::name::Principal;
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -348,16 +348,16 @@ fn an_enctype_the_entry_has_no_key_for_is_not_chosen() {
 
 /// The outer `KDC-REP`, decoded from what the engine produced.
 fn read_as_rep(reply: &[u8]) -> AsRepView {
-    let f = rust_kdc::der::Fields::parse_app("KDC-REP", 11, reply).unwrap();
+    let f = rrl_kdc::der::Fields::parse_app("KDC-REP", 11, reply).unwrap();
     // The client and realm are checked by the acceptance test against a real
     // client; here only the encrypted part matters.
     let _crealm = f.string(3, "KDC-REP").unwrap();
-    let mut r = rust_kdc::der::Reader::new(f.bytes(6, "KDC-REP").unwrap());
+    let mut r = rrl_kdc::der::Reader::new(f.bytes(6, "KDC-REP").unwrap());
     let enc_part = EncryptedData::decode(
         "enc-part",
-        &rust_kdc::der::tlv(
-            rust_kdc::der::SEQUENCE,
-            r.expect_in("enc-part", rust_kdc::der::SEQUENCE).unwrap(),
+        &rrl_kdc::der::tlv(
+            rrl_kdc::der::SEQUENCE,
+            r.expect_in("enc-part", rrl_kdc::der::SEQUENCE).unwrap(),
         ),
     )
     .unwrap();

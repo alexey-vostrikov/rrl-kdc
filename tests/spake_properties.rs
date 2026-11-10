@@ -16,12 +16,12 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
-use rust_kdc::der;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::spake::Spake;
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
+use rrl_kdc::der;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::spake::Spake;
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -75,7 +75,7 @@ fn as_req(padata: Vec<(i32, Vec<u8>)>) -> Vec<u8> {
     ]);
     let mut parts = vec![der::field(1, der::int(5)), der::field(2, der::int(10))];
     if !padata.is_empty() {
-        parts.push(der::field(3, rust_kdc::msg::encode_pa_data(&padata)));
+        parts.push(der::field(3, rrl_kdc::msg::encode_pa_data(&padata)));
     }
     parts.push(der::field(4, body));
     der::cons(der::app(10), &[der::seq(&parts)])
@@ -89,7 +89,7 @@ fn support(groups: &[i64]) -> Vec<u8> {
 
 /// The `PA-SPAKE` challenge value from a reply.
 fn challenge_of(reply: &[u8]) -> Vec<u8> {
-    let err = rust_kdc::msg::KrbError::decode(reply).expect("a KRB-ERROR");
+    let err = rrl_kdc::msg::KrbError::decode(reply).expect("a KRB-ERROR");
     let methods = err.method_data().expect("METHOD-DATA");
     methods
         .into_iter()
@@ -164,8 +164,8 @@ fn a_challenge_refuses_a_client_that_names_only_groups_we_do_not_implement() {
     // is what an operator cannot act on.
     let kdc = kdc();
     let reply = kdc.handle(&as_req(vec![(151, support(&[3, 4]))]), NOW);
-    let err = rust_kdc::msg::KrbError::decode(&reply).expect("a KRB-ERROR");
-    assert_eq!(err.code, rust_kdc::error::codes::KDC_ERR_PREAUTH_FAILED);
+    let err = rrl_kdc::msg::KrbError::decode(&reply).expect("a KRB-ERROR");
+    assert_eq!(err.code, rrl_kdc::error::codes::KDC_ERR_PREAUTH_FAILED);
     let text = err.e_text.unwrap_or_default();
     assert!(text.contains("edwards25519"), "{text}");
     assert!(text.contains('3') && text.contains('4'), "{text}");
@@ -177,7 +177,7 @@ fn the_advertised_offer_is_empty_and_the_challenge_is_not() {
     // would be answering a support message it was never sent.
     let kdc = kdc();
     let empty = kdc.handle(&as_req(Vec::new()), NOW);
-    let err = rust_kdc::msg::KrbError::decode(&empty).expect("a KRB-ERROR");
+    let err = rrl_kdc::msg::KrbError::decode(&empty).expect("a KRB-ERROR");
     let offered = err
         .method_data()
         .expect("METHOD-DATA")

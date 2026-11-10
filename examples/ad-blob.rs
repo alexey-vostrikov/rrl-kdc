@@ -22,10 +22,10 @@
 
 use std::path::Path;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::HdbEntry;
-use rust_kdc::hdb::ad_blob::{empty_supplemental_credentials, supplemental_credentials};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::HdbEntry;
+use rrl_kdc::hdb::ad_blob::{empty_supplemental_credentials, supplemental_credentials};
+use rrl_kdc::name::Principal;
 
 fn main() -> std::io::Result<()> {
     let relative = std::env::args()
@@ -100,7 +100,7 @@ fn write_entry(out: &Path, name: &str, entry: &HdbEntry) -> std::io::Result<()> 
 }
 
 /// The keys at one kvno, as a JSON object keyed by enctype.
-fn at_kvno(keys: &[rust_kdc::hdb::HdbKey], kvno: u32) -> String {
+fn at_kvno(keys: &[rrl_kdc::hdb::HdbKey], kvno: u32) -> String {
     let mut out = String::new();
     for key in keys.iter().filter(|k| k.kvno == kvno) {
         if !out.is_empty() {

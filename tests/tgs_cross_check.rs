@@ -15,12 +15,12 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Cipher, Enctype, OwnCipher, usage};
-use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{ApReq, Authenticator, EncryptedData};
-use rust_kdc::name::Principal;
-use rust_kdc::transport::{RunningKdc, serve_loopback};
+use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher, usage};
+use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{ApReq, Authenticator, EncryptedData};
+use rrl_kdc::name::Principal;
+use rrl_kdc::transport::{RunningKdc, serve_loopback};
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -77,7 +77,7 @@ fn a_second_implementation_accepts_the_ticket_this_kdc_issued() {
     // service client does: the authenticator in the ticket's session key,
     // usage 11, carrying a checksum the service could check if it wanted to.
     let cipher = OwnCipher;
-    let session = rust_kdc::crypto::Key::new(
+    let session = rrl_kdc::crypto::Key::new(
         Enctype::from_id(ticket.session_key.enctype()).unwrap(),
         ticket.session_key.bytes().to_vec(),
     )
@@ -119,7 +119,7 @@ fn a_second_implementation_accepts_the_ticket_this_kdc_issued() {
     keytab.entries_mut().push(rskrb5::keytab::Entry {
         principal: rskrb5::keytab::Principal::new(
             REALM,
-            rust_kdc::name::NT_SRV_INST,
+            rrl_kdc::name::NT_SRV_INST,
             ["host", "server.example.com"],
         ),
         timestamp: 1_700_000_000,

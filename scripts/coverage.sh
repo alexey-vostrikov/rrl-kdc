@@ -14,7 +14,7 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rrl-kdc"
 . "$ROOT/scripts/image.sh"
 # The floor is a regression alarm, not a target: coverage was 89.8% when this was
 # written, and the number that matters is that it does not fall. Set below the

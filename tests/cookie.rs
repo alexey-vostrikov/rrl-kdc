@@ -20,15 +20,15 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::usage;
-use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::cookie::Cookie;
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{self, EncryptedData, encode_enc_ts_enc, encode_pa_data, kdc_options};
-use rust_kdc::name::Principal;
+use rrl_kdc::crypto::usage;
+use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::cookie::Cookie;
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{self, EncryptedData, encode_enc_ts_enc, encode_pa_data, kdc_options};
+use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -139,7 +139,7 @@ fn cookie_of(reply: &[u8]) -> Cookie {
     let method = method_data(reply).expect("the reply offers pre-authentication");
     let value = method
         .iter()
-        .find(|(t, _)| *t == rust_kdc::kdc::fast::PA_FX_COOKIE)
+        .find(|(t, _)| *t == rrl_kdc::kdc::fast::PA_FX_COOKIE)
         .map(|(_, v)| v.clone())
         .expect("a PA-FX-COOKIE among the offered methods");
     Cookie::decode(&OwnCipher, &cookie_key(), &value).expect("the realm's own cookie decodes")
@@ -185,7 +185,7 @@ fn adding_a_cookie_does_not_displace_the_other_offers() {
     assert!(
         method
             .iter()
-            .any(|(t, _)| *t == rust_kdc::kdc::fast::PA_FX_COOKIE),
+            .any(|(t, _)| *t == rrl_kdc::kdc::fast::PA_FX_COOKIE),
         "and the cookie is there beside it"
     );
 }
@@ -199,7 +199,7 @@ fn a_client_that_does_not_hold_the_key_cannot_read_the_cookie() {
     let method = method_data(&reply).unwrap();
     let raw = method
         .iter()
-        .find(|(t, _)| *t == rust_kdc::kdc::fast::PA_FX_COOKIE)
+        .find(|(t, _)| *t == rrl_kdc::kdc::fast::PA_FX_COOKIE)
         .map(|(_, v)| v.clone())
         .unwrap();
 
@@ -243,7 +243,7 @@ fn the_state_a_cookie_carries_survives_into_the_next_round() {
             REALM,
             &[18],
             vec![
-                (rust_kdc::kdc::fast::PA_FX_COOKIE, value),
+                (rrl_kdc::kdc::fast::PA_FX_COOKIE, value),
                 (
                     msg::PA_ENC_TIMESTAMP,
                     enc_timestamp(b"wrong password", Enctype::Aes256Sha1, NOW),
@@ -276,7 +276,7 @@ fn a_cookie_issued_to_one_client_is_not_honoured_for_another() {
             "bob",
             REALM,
             &[18],
-            vec![(rust_kdc::kdc::fast::PA_FX_COOKIE, value)],
+            vec![(rrl_kdc::kdc::fast::PA_FX_COOKIE, value)],
         ),
         NOW,
     );
@@ -308,7 +308,7 @@ fn an_expired_cookie_is_ignored_rather_than_honoured() {
             "alice",
             REALM,
             &[18],
-            vec![(rust_kdc::kdc::fast::PA_FX_COOKIE, value)],
+            vec![(rrl_kdc::kdc::fast::PA_FX_COOKIE, value)],
         ),
         NOW,
     );
@@ -333,7 +333,7 @@ fn a_cookie_from_another_realm_is_ignored() {
             "alice",
             REALM,
             &[18],
-            vec![(rust_kdc::kdc::fast::PA_FX_COOKIE, value)],
+            vec![(rrl_kdc::kdc::fast::PA_FX_COOKIE, value)],
         ),
         NOW,
     );
@@ -357,7 +357,7 @@ fn an_altered_cookie_is_ignored_and_the_exchange_continues() {
             "alice",
             REALM,
             &[18],
-            vec![(rust_kdc::kdc::fast::PA_FX_COOKIE, raw)],
+            vec![(rrl_kdc::kdc::fast::PA_FX_COOKIE, raw)],
         ),
         NOW,
     );
@@ -378,7 +378,7 @@ fn a_realm_without_a_cookie_key_offers_no_cookie() {
     assert!(
         !method
             .iter()
-            .any(|(t, _)| *t == rust_kdc::kdc::fast::PA_FX_COOKIE),
+            .any(|(t, _)| *t == rrl_kdc::kdc::fast::PA_FX_COOKIE),
         "no key, no cookie: {method:?}"
     );
 }

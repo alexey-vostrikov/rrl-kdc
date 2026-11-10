@@ -17,7 +17,7 @@
 
 use aes::cipher::{BlockCipherDecrypt, KeyInit};
 
-use rust_kdc::crypto::aes_cts;
+use rrl_kdc::crypto::aes_cts;
 
 /// MIT's ciphertext: the encrypted part is the first 16 octets, the rest is the HMAC.
 const MIT_KEY: &str = "17f275f2954f2ed1f90c377ba7f4d6a369aa0136e0bf0c927ad6133c693759a9";

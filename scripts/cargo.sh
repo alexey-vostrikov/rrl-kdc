@@ -24,7 +24,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rust-kdc}"
+CACHE="${KDC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rrl-kdc}"
 . "$ROOT/scripts/image.sh"
 
 # `CARGO_HOME` per image tag as well as `CARGO_TARGET_DIR`. A shared home mixes

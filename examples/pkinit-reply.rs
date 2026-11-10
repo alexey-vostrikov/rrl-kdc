@@ -18,7 +18,7 @@
 
 #[cfg(feature = "pkinit")]
 fn main() {
-    use rust_kdc::kdc::pkinit::{self, reply};
+    use rrl_kdc::kdc::pkinit::{self, reply};
 
     let dir = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: pkinit-reply <dir>");

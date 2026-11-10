@@ -5,9 +5,9 @@
 //! the code: NDR pointer arithmetic looks right either way, and only a reader that
 //! did not write it can say whether a pointer lands where the structure claims.
 
-use rust_kdc::crypto::{Enctype, Key};
-use rust_kdc::kdc::logon_info::{LogonInfo, Sid, encode};
-use rust_kdc::kdc::pac::{
+use rrl_kdc::crypto::{Enctype, Key};
+use rrl_kdc::kdc::logon_info::{LogonInfo, Sid, encode};
+use rrl_kdc::kdc::pac::{
     Buffer, PAC_LOGON_INFO, PAC_PRIVSVR_CHECKSUM, PAC_SERVER_CHECKSUM, SignatureType, pac, seal,
 };
 

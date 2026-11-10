@@ -111,7 +111,7 @@ impl ForUser {
             KU_APP_DATA_CKSUM,
             &self.checksummed(),
         );
-        if !constant_time_eq(&expected, &self.checksum) {
+        if !crate::crypto::ct_eq(&expected, &self.checksum) {
             return Err(Error::Kdc {
                 code: codes::KRB_AP_ERR_BAD_INTEGRITY,
                 text: "PA-FOR-USER: the checksum does not verify under the TGT's session key; \
@@ -228,41 +228,16 @@ impl X509User {
     }
 }
 
-/// `KERB_CHECKSUM_HMAC_MD5` over `usage || data`, with the signature key.
+/// `KERB_CHECKSUM_HMAC_MD5` over `data` at `usage`, per RFC 4757 §4.
 ///
-/// RFC 4757 §7.1: the key is first run through HMAC-MD5 with `"signaturekey\0"`, then the
-/// checksum is `HMAC-MD5(ksign, LE32(usage) || MD5(data))`. Not RFC 3961's checksum — this is
-/// the RC4-HMAC-era construction, applied here to a key of any enctype because that is what
-/// MS-SFU prescribes.
+/// The construction lives in `rrl-crypto` because the PAC signature needs the same one; it was
+/// written here as a second copy, and the second copy was wrong — it hashed `usage || MD5(data)`
+/// where RFC 4757 §4 says `MD5(usage || data)`. Both the producing and the checking side used
+/// that copy, so every test agreed with itself and every real client would have been refused.
+///
+/// Kept as a named alias so the call sites below read as Kerberos rather than as a crate path.
 pub fn hmac_md5_checksum(key: &[u8], usage: u32, data: &[u8]) -> [u8; 16] {
-    let ksign = hmac_md5(key, b"signaturekey\0");
-    let mut m = usage.to_le_bytes().to_vec();
-    m.extend_from_slice(&md5(data));
-    hmac_md5(&ksign, &m)
-}
-
-fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
-    use hmac::{Hmac, KeyInit, Mac};
-    use md5::Md5;
-    let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
-fn md5(data: &[u8]) -> [u8; 16] {
-    use md5::Digest;
-    md5::Md5::digest(data).into()
-}
-
-/// Compares two byte strings without leaking where they differ.
-///
-/// A checksum comparison that returns early tells an attacker how many leading octets were
-/// right, one query at a time.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    crate::crypto::checksum::kerb_checksum_hmac_md5(key, usage, data)
 }
 
 /// Which key usage the reply checksum takes, given what the client asked for.
@@ -324,6 +299,29 @@ mod tests {
         for_user.user = Principal::parse("alicf@EXAMPLE.COM").unwrap();
         let err = for_user.verify(&key()).unwrap_err().to_string();
         assert!(err.contains("does not verify"), "{err}");
+    }
+
+    /// The construction is RFC 4757 §4's, checked against a value computed outside this crate.
+    ///
+    /// This is the test that was missing. Every other test here builds its expected checksum with
+    /// `hmac_md5_checksum` and verifies it with `hmac_md5_checksum`, so when that function hashed
+    /// `usage || MD5(data)` instead of `MD5(usage || data)` the whole suite stayed green while a
+    /// real client's `PA-FOR-USER` — which it computes per RFC — would have been refused.
+    ///
+    /// `1513dea61516575fc6535e6dc5c5ea32` is `KERB_CHECKSUM_HMAC_MD5(key = 0x07 × 16, T = 17,
+    /// data = "abc")` computed with Python's `hmac`/`hashlib`, and the same value appears in
+    /// `rrl-krb`'s PAC tests as a vector from impacket's implementation — two independent sources
+    /// for the same number.
+    #[test]
+    fn the_checksum_is_rfc_4757_and_not_a_near_miss() {
+        assert_eq!(
+            hmac_md5_checksum(&[0x07u8; 16], 17, b"abc"),
+            [
+                0x15, 0x13, 0xde, 0xa6, 0x15, 0x16, 0x57, 0x5f, 0xc6, 0x53, 0x5e, 0x6d, 0xc5, 0xc5,
+                0xea, 0x32
+            ],
+            "RFC 4757 §4 is HMAC-MD5(Ksign, MD5(T || data)), not HMAC-MD5(Ksign, T || MD5(data))"
+        );
     }
 
     #[test]
@@ -546,16 +544,16 @@ mod tests {
         b[1] ^= 0x01;
         b[3] ^= 0x01;
         assert!(
-            !super::constant_time_eq(&a, &b),
+            !crate::crypto::ct_eq(&a, &b),
             "two cancellations are still a difference"
         );
 
         let mut c = a;
         c[2] ^= 0x80;
-        assert!(!super::constant_time_eq(&a, &c));
-        assert!(super::constant_time_eq(&a, &a));
+        assert!(!crate::crypto::ct_eq(&a, &c));
+        assert!(crate::crypto::ct_eq(&a, &a));
         assert!(
-            !super::constant_time_eq(&a, &a[..2]),
+            !crate::crypto::ct_eq(&a, &a[..2]),
             "a length difference is a difference"
         );
     }

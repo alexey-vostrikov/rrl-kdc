@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::hdb::{Hdb, HdbEntry, RedbHdb};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::name::Principal;
-use rust_kdc::transport::serve_loopback;
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::hdb::{Hdb, HdbEntry, RedbHdb};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::name::Principal;
+use rrl_kdc::transport::serve_loopback;
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";

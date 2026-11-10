@@ -15,13 +15,13 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
-use rust_kdc::der;
-use rust_kdc::error::codes;
-use rust_kdc::hdb::{HdbEntry, MemoryHdb};
-use rust_kdc::kdc::{Kdc, KdcConfig};
-use rust_kdc::msg::{self, kdc_options};
-use rust_kdc::name::{self, Principal};
+use rrl_kdc::crypto::{Enctype, OwnCipher};
+use rrl_kdc::der;
+use rrl_kdc::error::codes;
+use rrl_kdc::hdb::{HdbEntry, MemoryHdb};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+use rrl_kdc::msg::{self, kdc_options};
+use rrl_kdc::name::{self, Principal};
 
 const REALM: &str = "EXAMPLE.COM";
 const PASSWORD: &str = "correct horse battery staple";
@@ -47,7 +47,7 @@ fn kdc() -> Kdc {
     // `HdbEntry::user` demands pre-authentication, which is right in a realm and noise
     // here: this file is about which principal a name resolves to, not about how the client
     // proves it owns the key.
-    user.flags &= !rust_kdc::hdb::flags::REQUIRE_PREAUTH;
+    user.flags &= !rrl_kdc::hdb::flags::REQUIRE_PREAUTH;
     for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
         user.add_password_key(&cipher, e, PASSWORD.as_bytes(), 1)
             .unwrap();

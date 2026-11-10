@@ -1,4 +1,4 @@
-//! RFC 4120 messages, in the `rrl-krb` crate.
+//! RFC 4120 messages, in the `rrl-krb-common` crate.
 //!
 //! Shared with the acceptor: the `Ticket` this module writes is the `Ticket` it parses, and the
 //! `EncTicketPart` it seals is the one the acceptor opens. That is the whole point of the crate —
@@ -9,4 +9,4 @@
 
 pub mod kpasswd;
 
-pub use rrl_krb::msg::*;
+pub use rrl_krb_common::msg::*;

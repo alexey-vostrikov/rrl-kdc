@@ -425,7 +425,12 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
 
     let flags_krb5 = attributes.number(attrs::KDC_FLAGS, &name)?;
     let uac = attributes.number(attrs::AD_USER_ACCOUNT_CONTROL, &name)?;
-    let flags = reconcile_flags(&name, flags_krb5, uac)?;
+    let flags = reconcile_flags(
+        &name,
+        flags_krb5,
+        uac,
+        attributes.has(attrs::AD_SERVICE_PRINCIPAL_NAME),
+    )?;
 
     let etypes = enctypes(attributes, &name)?;
     let constrained_delegation = delegation_acl(attributes, &principal)?;
@@ -485,7 +490,12 @@ fn agree<T: PartialEq + std::fmt::Display>(
 /// not, the answer is the bits both agree on and an error for the rest. An
 /// account disabled in the directory and enabled in the realm is a user who
 /// cannot log in and an administrator who cannot see why.
-fn reconcile_flags(principal: &str, krb5: Option<u32>, uac: Option<u32>) -> Result<u32> {
+fn reconcile_flags(
+    principal: &str,
+    krb5: Option<u32>,
+    uac: Option<u32>,
+    publishes_spn: bool,
+) -> Result<u32> {
     let Some(uac) = uac else {
         return Ok(krb5.unwrap_or(0));
     };
@@ -494,7 +504,17 @@ fn reconcile_flags(principal: &str, krb5: Option<u32>, uac: Option<u32>) -> Resu
 
     let Some(flags) = krb5 else {
         // Only Microsoft's vocabulary: translate it.
-        let mut flags = 0;
+        //
+        // An account is a client, and a machine account is also a server. Neither fact has a bit
+        // in `userAccountControl`, so a translation that set only the negative bits produced an
+        // entry the KDC refused to issue anything for: measured, `kinit` against an account
+        // written in AD's vocabulary answered KDC_ERR_POLICY, because the entry was "not a client
+        // principal". `servicePrincipalName` is what makes an account a server here, the same
+        // attribute a ticket request names.
+        let mut flags = flags::CLIENT;
+        if publishes_spn {
+            flags |= flags::SERVER;
+        }
         if ad_disabled {
             flags |= flags::INVALID;
         }

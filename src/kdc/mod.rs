@@ -34,6 +34,7 @@ pub mod fast;
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
 pub mod kpasswd;
 pub mod logon_info;
+pub mod otp;
 pub mod pac;
 pub mod pkinit;
 /// `PA-REQ-ENC-PA-REP` (RFC 6806 §11): the checksum that ties a reply to its request.

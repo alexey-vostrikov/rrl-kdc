@@ -66,6 +66,9 @@ kadmin = []
 # SPAKE pre-authentication (RFC 9588). Off by default: it adds a curve implementation and a
 # second way to log in, and a realm that has not thought about it should not grow one.
 spake = ["dep:curve25519-dalek"]
+# OTP pre-authentication (RFC 6560). No dependency: the ASN.1 and the nonce check are this
+# crate's, and the one-time value is judged by a `Verifier` the caller supplies.
+otp = []
 # The JSON form of the administrator's vocabulary, for a transport that speaks
 # HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
 # this feature adds the request and reply envelopes and the base64 encoding the

@@ -369,10 +369,11 @@ impl Mechanism for Spake {
         "SPAKE"
     }
 
-    fn announce(&self, _request: &Request<'_>) -> Result<Announced> {
+    fn announce(&self, _request: &Request<'_>) -> Result<Option<Announced>> {
         // RFC 9588 §4.1: the offer is the empty value. Whatever came before in the session is
-        // not a SPAKE state, so nothing is carried.
-        Ok(Announced::default())
+        // not a SPAKE state, so nothing is carried. SPAKE works with or without armor, so there
+        // is no exchange where this mechanism declines to be announced.
+        Ok(Some(Announced::default()))
     }
 
     fn round(&self, request: &Request<'_>, state: &[u8], padata: &[u8]) -> Result<Step> {

@@ -422,11 +422,11 @@ fn the_announced_state_reaches_the_client_in_the_cookie() {
         fn name(&self) -> &'static str {
             "challenging"
         }
-        fn announce(&self, _request: &Request<'_>) -> rust_kdc::Result<Announced> {
-            Ok(Announced {
+        fn announce(&self, _request: &Request<'_>) -> rust_kdc::Result<Option<Announced>> {
+            Ok(Some(Announced {
                 padata: b"nonce-42".to_vec(),
                 state: b"nonce-42".to_vec(),
-            })
+            }))
         }
         fn round(
             &self,

@@ -58,6 +58,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `kdc::cookie` — RFC 6113 §5.4.2.3 `PA-FX-COOKIE` | done: opaque realm state, sealed under a key of its own; an expired, foreign or altered cookie is ignored rather than refused, because refusing would let a rewritten request break a legitimate login |
 | `kdc::preauth` — the multi-round framework | done: `KDC_ERR_MORE_PREAUTH_DATA_REQUIRED` (91), a mechanism trait that returns the reply key itself, and nothing advertised by a realm that configured nothing |
 | `kdc::spake` — RFC 9588 SPAKE (feature `spake`) | done for `edwards25519`: the mask, the transcript, `K'[n]`, and the second factor that proves the password. Checked against the published vectors and accepted by `krb5` |
+| `kdc::otp` — RFC 6560 OTP (feature `otp`) | done for the `must-encrypt-nonce`-clear variant: `PA-OTP-CHALLENGE` → `PA-OTP-REQUEST` inside FAST armor, the nonce carried in a cookie and compared in constant time, and the reply key left as the armor key. Who judges a one-time value is the caller's `Verifier` |
 
 ### Managing a realm without inventing an API
 
@@ -127,9 +128,9 @@ Planned:
 
 * **Cross-realm** — a `krbtgt` of another realm, `transited` fields and referrals
   (`kdc/krb5tgs.c`).
-* **OTP (RFC 6560)** — a pre-authentication that hands a one-time value to a token rather than
-  a password, inside FAST armor. The framework it needs is written: `KDC_ERR_MORE_PREAUTH_DATA_REQUIRED`
-  and the `PA-FX-COOKIE` that carries the state between rounds.
+* **OTP's `must-encrypt-nonce` variant** (RFC 6560 §3.3) — where the one-time value never travels
+  and generates the reply key instead. It needs the KDC to hold every token's current value, which
+  this crate has no store for; the variant that asks a verifier is written.
 * **SPAKE over the NIST groups** (RFC 9588 §12.2.2) — the exchange is written and accepted by
   `krb5`, for `edwards25519` only, which is the group that client asks for.
 * **Audit trail and pre-authentication hooks** (`kdc/kdc-plugin.c`) — one stable record per
@@ -148,7 +149,8 @@ that does not move reads as a claim about the code:
 * **`forwarded` and `proxy`** `kdc-options` — honoured in the TGS, including the refusal of a
   proxied TGT.
 * **Enterprise names** (`NT-ENTERPRISE`, RFC 6806 §6), **anonymous PKINIT** (RFC 8062),
-  **`PA-REQ-ENC-PA-REP`** (RFC 6806 §11) and **SPAKE** (RFC 9588, `edwards25519`).
+  **`PA-REQ-ENC-PA-REP`** (RFC 6806 §11), **SPAKE** (RFC 9588, `edwards25519`) and
+  **OTP** (RFC 6560, FAST OTP).
 
 Outside the intent: the Heimdal CA and its issuance protocols (`kdc/ca.c`, `kx509.c`,
 `bx509.c`, `httpkadmind`), JWT and token validators, `mit_dump`, and `announce`. These serve
@@ -237,7 +239,7 @@ Not implemented in the exchanges either, and refused by name rather than half-do
 | PKINIT RSA key transport (`encKeyPack`) | `Unsupported`; MIT's own client rejects the mode too |
 | PKINIT elliptic-curve ECDH | `Unsupported`, with the offered algorithm named |
 | SPAKE over P-256 / P-384 / P-521 | `KDC_ERR_PREAUTH_FAILED` naming the groups asked for, and the client falls back |
-| OTP pre-authentication | `PA-OTP-*` is not offered at all; a client sees no such method |
+| OTP outside FAST armor | `PA-OTP-CHALLENGE` is not offered at all, and a bare `PA-OTP-REQUEST` is refused by name |
 | cross-realm (a `krbtgt` of another realm) | no ticket |
 
 ## Building

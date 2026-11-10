@@ -139,13 +139,26 @@ pub trait Mechanism: Send + Sync {
     /// The mechanism's name, for the refusals that have to name what is not offered.
     fn name(&self) -> &'static str;
 
-    /// What to announce when the KDC asks the client to pre-authenticate.
+    /// The PA-DATA type of the *announcement*, when it differs from the type of the request.
+    ///
+    /// OTP is why this exists: the KDC says `PA-OTP-CHALLENGE` (141) and the client answers with
+    /// `PA-OTP-REQUEST` (142). A framework with one type per mechanism would have to advertise
+    /// 142, which no client treats as a challenge, and the mechanism would never run.
+    fn announce_type(&self) -> i32 {
+        self.pa_type()
+    }
+
+    /// What to announce when the KDC asks the client to pre-authenticate, or `None` when this
+    /// exchange is one the mechanism cannot serve.
     ///
     /// The default is the empty PA-DATA of RFC 9588 §4.1: a value whose presence says the
-    /// mechanism exists and nothing more.
-    fn announce(&self, request: &Request<'_>) -> Result<Announced> {
+    /// mechanism exists and nothing more. `None` exists for a mechanism that depends on the
+    /// transport of the request — OTP works only inside FAST armor (RFC 6560 §3.2 puts the
+    /// challenge inside `enc-fast-rep`), so announcing it to an unarmored request would offer a
+    /// method that cannot be completed.
+    fn announce(&self, request: &Request<'_>) -> Result<Option<Announced>> {
         let _ = request;
-        Ok(Announced::default())
+        Ok(Some(Announced::default()))
     }
 
     /// One round: `state` is what the previous round left in the cookie (empty for the
@@ -221,8 +234,10 @@ impl Registry {
         let mut items = Vec::with_capacity(self.mechanisms.len());
         let mut state = Vec::new();
         for mechanism in &self.mechanisms {
-            let announced = mechanism.announce(request)?;
-            items.push((mechanism.pa_type(), announced.padata));
+            let Some(announced) = mechanism.announce(request)? else {
+                continue;
+            };
+            items.push((mechanism.announce_type(), announced.padata));
             // A mechanism that produces state is telling the KDC to remember it. Two
             // mechanisms at once is a configuration nobody has asked for yet, and
             // concatenating their states would be a protocol of our own invention — so
@@ -357,7 +372,10 @@ mod tests {
             now: 1,
             cipher: &cipher,
         };
-        let announced = plain.announce(&context).unwrap();
+        let announced = plain
+            .announce(&context)
+            .unwrap()
+            .expect("the default is to say something");
         assert!(announced.padata.is_empty());
         assert!(announced.state.is_empty());
     }

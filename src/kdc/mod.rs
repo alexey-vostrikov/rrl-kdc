@@ -376,7 +376,15 @@ impl Kdc {
     /// whose armor will not open must still reach the client as a plain error rather
     /// than be replaced by a second failure explaining the first.
     fn armor_key_of(&self, req: &KdcReq, now: i64) -> Option<crate::crypto::Key> {
-        let bytes = req.padata(fast::PA_FX_FAST)?;
+        let bytes = match req.padata(fast::PA_FX_FAST) {
+            Some(bytes) => bytes,
+            None => {
+                if std::env::var_os("KDC_ARMOR_DIAG").is_some() {
+                    eprintln!("armor-diag: no PA-FX-FAST on the error path");
+                }
+                return None;
+            }
+        };
         let armored = fast::ArmoredRequest::decode(bytes).ok()?;
         if armored.armor.is_some() {
             return self.armor_key_for_error(&armored, now).ok();
@@ -390,8 +398,34 @@ impl Kdc {
         // field, found none, and the `?` above swallowed the failure — so a client that had
         // armored looked inside the armor, found no `PA-FX-ERROR`, and reported "the FAST
         // response is missing FX-FAST" instead of the service the KDC could not find.
-        let shown = self.check_evidence(req, now).ok()?;
-        let subkey = shown.subkey.as_ref()?;
+        // TEMP-DIAG
+        if std::env::var_os("KDC_ARMOR_DIAG").is_some() {
+            let armored_shape = fast::ArmoredRequest::decode(bytes)
+                .map(|a| a.armor.is_some())
+                .unwrap_or(false);
+            eprintln!(
+                "armor-diag: padata={:?} explicit_armor={armored_shape}",
+                req.padata.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+            );
+        }
+        let shown = match self.check_evidence(req, now) {
+            Ok(shown) => shown,
+            Err(err) => {
+                if std::env::var_os("KDC_ARMOR_DIAG").is_some() {
+                    eprintln!("armor-diag: check_evidence failed: {err}");
+                }
+                return None;
+            }
+        };
+        let subkey = match shown.subkey.as_ref() {
+            Some(subkey) => subkey,
+            None => {
+                if std::env::var_os("KDC_ARMOR_DIAG").is_some() {
+                    eprintln!("armor-diag: no subkey in the authenticator");
+                }
+                return None;
+            }
+        };
         fast::implicit_armor_key(subkey, &shown.tgt.session_key).ok()
     }
 

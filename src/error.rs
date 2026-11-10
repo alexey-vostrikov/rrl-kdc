@@ -293,6 +293,44 @@ mod tests {
     use super::codes;
 
     #[test]
+    fn every_failure_has_a_stable_kind_for_a_transport_to_switch_on() {
+        // `kind` is the vocabulary a REST layer switches on — the doc comment says so — and it
+        // had no test, so replacing the whole method with a constant survived everything. A
+        // transport that receives one name for every failure turns every client error into a
+        // 500 or every 500 into a 400, and the reason is invisible from outside.
+        let cases: Vec<(super::Error, &str)> = vec![
+            (super::Error::Protocol("x".into()), "protocol"),
+            (super::Error::UnsupportedEnctype(3), "crypto"),
+            (
+                super::Error::NoUsableEnctype {
+                    principal: crate::name::Principal::parse("a@B").unwrap(),
+                    allowed: Vec::new(),
+                    asked: Vec::new(),
+                },
+                "crypto",
+            ),
+            (super::Error::UnknownPrincipal("a@B".into()), "not_found"),
+            (super::Error::NotFound("a@B".into()), "not_found"),
+            (super::Error::Exists("a@B".into()), "already_exists"),
+            (super::Error::Forbidden("no".into()), "forbidden"),
+            (super::Error::PreauthFailed("no".into()), "preauth"),
+            (
+                super::Error::Kdc {
+                    code: 13,
+                    text: "no".into(),
+                },
+                "policy",
+            ),
+            (super::Error::Hdb("disk".into()), "storage"),
+            (super::Error::Config("bad".into()), "bad_request"),
+            (super::Error::Io(std::io::Error::other("x")), "io"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), expected, "{error} got the wrong kind");
+        }
+    }
+
+    #[test]
     fn every_failure_becomes_the_code_rfc_4120_gives_it() {
         // The mapping the wire depends on, variant by variant. It had no test of its own:
         // integration tests assert codes for the failures they provoke, so a `kdc_code` that

@@ -1,0 +1,90 @@
+diff --git a/src/error.rs b/src/error.rs
+index b27771d..c142f9e 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -292,6 +292,85 @@ impl Error {
+ mod tests {
+     use super::codes;
+ 
++    #[test]
++    fn every_failure_becomes_the_code_rfc_4120_gives_it() {
++        // The mapping the wire depends on, variant by variant. It had no test of its own:
++        // integration tests assert codes for the failures they provoke, so a `kdc_code` that
++        // answered a constant survived everything — and a client reads the number, not our
++        // prose.
++        use crate::crypto::Enctype;
++        let cases: Vec<(super::Error, i32)> = vec![
++            (
++                super::Error::UnsupportedEnctype(3),
++                super::codes::KDC_ERR_ETYPE_NOSUPP,
++            ),
++            (
++                super::Error::NoUsableEnctype {
++                    principal: crate::name::Principal::parse("svc/host@EXAMPLE.COM").unwrap(),
++                    allowed: vec![Enctype::Aes128Sha1],
++                    asked: vec![18],
++                },
++                super::codes::KDC_ERR_ETYPE_NOSUPP,
++            ),
++            (
++                super::Error::UnknownPrincipal("nobody@EXAMPLE.COM".into()),
++                super::codes::KDC_ERR_C_PRINCIPAL_UNKNOWN,
++            ),
++            (
++                super::Error::NotFound("host/x@EXAMPLE.COM".into()),
++                super::codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
++            ),
++            (
++                super::Error::Forbidden("not yours".into()),
++                super::codes::KDC_ERR_POLICY,
++            ),
++            (
++                super::Error::PreauthFailed("no key".into()),
++                super::codes::KDC_ERR_PREAUTH_FAILED,
++            ),
++            (
++                super::Error::Skew {
++                    skew: 600,
++                    allowed: 300,
++                },
++                super::codes::KRB_AP_ERR_SKEW,
++            ),
++            (
++                super::Error::Hdb("the database is on fire".into()),
++                super::codes::KDC_ERR_SVC_UNAVAILABLE,
++            ),
++            (
++                super::Error::Protocol("bad message".into()),
++                super::codes::KRB_AP_ERR_MODIFIED,
++            ),
++            (
++                super::Error::Kdc {
++                    code: super::codes::KDC_ERR_BADOPTION,
++                    text: "no".into(),
++                },
++                super::codes::KDC_ERR_BADOPTION,
++            ),
++        ];
++        for (error, expected) in cases {
++            assert_eq!(
++                error.kdc_code(),
++                expected,
++                "{error} became the wrong code on the wire"
++            );
++        }
++    }
++
++    #[test]
++    fn internal_failures_do_not_put_their_text_in_a_reply() {
++        // The other half of the wire contract: an I/O or storage error is the operator's
++        // business, and a client that receives "connection reset by peer" learns about our
++        // filesystem instead of about its ticket.
++        assert!(!super::Error::Hdb("disk".into()).is_client_facing());
++        assert!(!super::Error::Io(std::io::Error::other("x")).is_client_facing());
++        assert!(super::Error::NotFound("svc@R".into()).is_client_facing());
++        assert!(super::Error::Protocol("bad".into()).is_client_facing());
++    }
++
+     /// Every code on the wire, against the literal RFC 4120 §7.5 quotes.
+     ///
+     /// These were two off by one — `MSG_TYPE` at 41 and `MODIFIED` at 42 — because the

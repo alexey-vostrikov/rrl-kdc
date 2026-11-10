@@ -570,6 +570,16 @@ pub fn decode_pa_data(context: &'static str, content: &[u8]) -> Result<Vec<(i32,
     Ok(out)
 }
 
+/// The `PA-DATA` elements of an encoded `METHOD-DATA` SEQUENCE.
+///
+/// The counterpart of [`encode_pa_data`] for callers that hold the whole SEQUENCE — an error's
+/// `e-data` is exactly that. [`decode_pa_data`] itself takes the content, so that a caller
+/// which has already stripped the tag does not pay for a second parse.
+pub fn method_data_of(der: &[u8]) -> Result<Vec<(i32, Vec<u8>)>> {
+    let mut r = Reader::new(der);
+    decode_pa_data("METHOD-DATA", r.expect("METHOD-DATA", der::SEQUENCE)?)
+}
+
 /// `KRB-ERROR ::= [APPLICATION 30] SEQUENCE { ... }`.
 #[derive(Clone, Debug)]
 pub struct KrbError {

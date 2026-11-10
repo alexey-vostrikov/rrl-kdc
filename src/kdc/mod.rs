@@ -25,6 +25,7 @@
 pub mod config;
 
 mod as_exchange;
+pub mod cookie;
 mod tgs_exchange;
 
 pub mod fast;
@@ -110,6 +111,13 @@ pub struct Kdc {
     /// would be worse than one that does not offer the feature.
     #[cfg(feature = "pkinit")]
     pkinit: Option<Arc<pkinit::reply::State>>,
+    /// The realm key `PA-FX-COOKIE` is sealed under (RFC 6113 §5.4.2.3).
+    ///
+    /// `None` means this realm does not offer the cookie, and then it must not advertise one:
+    /// a client offered a cookie it never receives would wait for a round that never comes.
+    /// The key is deliberately separate from every other realm secret, so that a cookie can
+    /// never be mistaken for a ticket or an armor key.
+    cookie_key: Option<crate::crypto::Key>,
 }
 
 impl std::fmt::Debug for Kdc {
@@ -119,6 +127,7 @@ impl std::fmt::Debug for Kdc {
             .field("policy", &self.policy)
             .field("issues_pac", &self.identities.is_some())
             .field("pkinit", &self.offers_pkinit())
+            .field("cookie", &self.cookie_key.is_some())
             .finish()
     }
 }
@@ -134,7 +143,18 @@ impl Kdc {
             identities: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
+            cookie_key: None,
         }
+    }
+
+    /// The same KDC offering `PA-FX-COOKIE`, sealed under `key`.
+    ///
+    /// Multi-round pre-authentication needs somewhere to keep its state between rounds, and
+    /// the cookie is that place. A realm that has not configured a key does not offer the
+    /// mechanism at all — see [`cookie`].
+    pub fn with_cookie_key(mut self, key: crate::crypto::Key) -> Self {
+        self.cookie_key = Some(key);
+        self
     }
 
     /// The same KDC answering PKINIT, with the realm's certificate and its trust anchors.
@@ -360,7 +380,7 @@ impl Kdc {
     /// Renders `err` as the reply, attaching `METHOD-DATA` where the code needs
     /// it.
     fn error(&self, req: Option<&KdcReq>, err: &Error, now: i64) -> Vec<u8> {
-        let (code, method_data) = match err {
+        let (code, mut method_data) = match err {
             Error::Preauth {
                 code, method_data, ..
             } => (*code, Some(method_data.clone())),
@@ -384,6 +404,34 @@ impl Kdc {
                 None,
             ),
         };
+        // RFC 6113 §5.4.2.3: the cookie rides in the error's METHOD-DATA, and it is what lets a
+        // client that cannot armor by ticket keep a multi-round exchange going. It goes in
+        // before the armor wrapper below, so that an armored client finds it inside the armor
+        // too — the same METHOD-DATA, not a second copy of it.
+        if let Some(cookie) =
+            req.and_then(|r| self.cookie_for(r, code, now, &realm, cname.as_ref()))
+        {
+            // `Error::Preauth` carries METHOD-DATA already encoded, so the cookie is added to the
+            // decoded list and the list is encoded again. Appending octets to the DER would only
+            // work while the length fits in one octet, and that is the kind of limit nobody
+            // notices until the offer grows.
+            // `decode_pa_data` takes the *content* of the SEQUENCE, and the field holds the
+            // whole thing; handing it the SEQUENCE reads zero elements, and a cookie that
+            // replaced the offer instead of joining it is how the third-party client found this.
+            let mut items = method_data
+                .as_deref()
+                .map(crate::msg::method_data_of)
+                .transpose()
+                .ok()
+                .flatten();
+            if let Some(items) = &mut items {
+                items.push(cookie);
+                method_data = Some(crate::msg::encode_pa_data(items));
+            }
+            // A METHOD-DATA that does not parse is not repaired here: dropping the cookie
+            // leaves the reply exactly as it was, which is the failure a client can still use.
+        }
+
         // RFC 6113 §5.4.2.5: an error caused by an armored request has to come back
         // inside the armor. A client that armored looks for `PA-FX-ERROR` in the armored
         // container and, finding none, falls back to the *outer* error — which carries
@@ -448,6 +496,41 @@ impl Kdc {
             padata: Vec::new(),
         }
         .encode()
+    }
+}
+
+impl Kdc {
+    /// The `PA-FX-COOKIE` to put in an error, when this exchange is one that can carry one.
+    ///
+    /// The state comes from the cookie the client sent, when that cookie is ours, unexpired and
+    /// issued to this client; otherwise the exchange starts empty. A cookie that does not pass
+    /// is *dropped silently*: reporting it would let anyone who can rewrite a request make the
+    /// KDC refuse a legitimate login.
+    ///
+    /// Only the two pre-authentication errors carry it — those are the points at which a
+    /// multi-round exchange has something to remember. Every other refusal ends the exchange,
+    /// and a cookie on it would invite a retry that cannot help.
+    fn cookie_for(
+        &self,
+        req: &KdcReq,
+        code: i32,
+        now: i64,
+        realm: &str,
+        cname: Option<&crate::name::Principal>,
+    ) -> Option<(i32, Vec<u8>)> {
+        let key = self.cookie_key.as_ref()?;
+        if code != codes::KDC_ERR_PREAUTH_REQUIRED && code != codes::KDC_ERR_PREAUTH_FAILED {
+            return None;
+        }
+        let state = req
+            .padata(fast::PA_FX_COOKIE)
+            .and_then(|value| cookie::Cookie::decode(&*self.cipher, key, value).ok())
+            .filter(|c| c.accept(now, realm, cname).is_ok())
+            .map(|c| c.state)
+            .unwrap_or_default();
+        let cookie = cookie::Cookie::new(realm, cname.cloned(), state, now);
+        let octets = cookie.encode(&*self.cipher, key).ok()?;
+        Some((fast::PA_FX_COOKIE, octets))
     }
 }
 

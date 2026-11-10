@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::crypto::{Cipher, Enctype, OwnCipher};
 use rust_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
 use rust_kdc::kdc::KdcConfig;
 use rust_kdc::msg::tkt_flags;
@@ -52,6 +52,17 @@ fn start() -> RunningKdc {
     let cipher = OwnCipher;
     let config = KdcConfig::new(REALM).unwrap();
     let kdc = rust_kdc::kdc::Kdc::new(config, realm(), Arc::new(cipher));
+    rust_kdc::transport::serve_loopback(kdc)
+}
+
+/// The same KDC, offering `PA-FX-COOKIE`.
+fn start_with_cookie() -> RunningKdc {
+    let cipher = OwnCipher;
+    let key = cipher
+        .s2k(Enctype::Aes256Sha1, b"cookie-secret", b"cookie", None)
+        .unwrap();
+    let config = KdcConfig::new(REALM).unwrap();
+    let kdc = rust_kdc::kdc::Kdc::new(config, realm(), Arc::new(cipher)).with_cookie_key(key);
     rust_kdc::transport::serve_loopback(kdc)
 }
 
@@ -116,4 +127,19 @@ fn the_same_client_gets_the_same_ticket_twice() {
         b.session_key.bytes(),
         "two tickets must not share a session key"
     );
+}
+
+#[test]
+fn a_client_that_does_not_know_the_cookie_still_logs_in() {
+    // The cookie is PA-DATA 133, and a client is not obliged to understand it: RFC 6113 §5.4.2.3
+    // makes it opaque and the client's only duty is to hand it back if it wants the exchange
+    // continued. A KDC that offers one must not become unloggable for every client that ignores
+    // it — which is every client today, because nothing in this crate produces a second round.
+    let stand = start_with_cookie();
+    let client = krb5::KdcClient::new(REALM, [stand.addr().as_str()]);
+    let alice = krb5::Principal::parse(&format!("alice@{REALM}")).unwrap();
+    let creds = client
+        .login_with_password(&alice, PASSWORD)
+        .unwrap_or_else(|e| panic!("an offered cookie must not block the login: {e}"));
+    assert_eq!(creds.client.to_string(), format!("alice@{REALM}"));
 }

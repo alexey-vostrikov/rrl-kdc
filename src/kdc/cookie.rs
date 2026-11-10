@@ -129,8 +129,7 @@ impl Cookie {
                 // `Principal::decode` takes the content of that SEQUENCE.
                 let mut nr = der::Reader::new(f.bytes(4, "PA-FX-COOKIE")?);
                 let inner = nr.expect_in("PA-FX-COOKIE", der::SEQUENCE)?;
-                Principal::decode("PA-FX-COOKIE", inner, &realm)
-                    .map_err(Error::from)
+                Principal::decode("PA-FX-COOKIE", inner, &realm).map_err(Error::from)
             })
             .transpose()?;
         Ok(Cookie {

@@ -54,8 +54,7 @@ use xdr::{Reader, Writer};
 
 /// The `kadmin/admin` principal of `realm` — the service a client's ticket is for.
 pub fn service_principal(realm: &str) -> Result<Principal> {
-    Principal::parse(&format!("kadmin/admin@{realm}"))
-        .map_err(Error::from)
+    Principal::parse(&format!("kadmin/admin@{realm}")).map_err(Error::from)
 }
 
 /// The `kadmin/admin` entry a realm needs, keyed with `password`.

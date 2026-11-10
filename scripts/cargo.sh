@@ -35,11 +35,21 @@ mkdir -p "$CACHE/rustup" "$ROOT/target"
 ensure_cargo_home
 ensure_image
 
+# A path dependency on a sibling crate has to be mounted at the path cargo computes: the
+# repository is `/w` inside the container, so `../rrl-crypto` is `/rrl-crypto`. Without the extra
+# mount cargo reports "no matching package named `rrl-crypto` found, location searched:
+# /rrl-crypto", which reads like a version problem and is a mount problem.
+SIBLING=
+if [ -d "$ROOT/../rrl-crypto" ]; then
+    SIBLING="-v $ROOT/../rrl-crypto:/rrl-crypto"
+fi
+
 exec docker run --rm \
   -u "$(id -u):$(id -g)" \
   -v "$ROOT:/w" \
   -v "$CARGO_HOME_SRC:/cargo" \
   -v "$CACHE/rustup:/rustup" \
+  $SIBLING \
   -e CARGO_HOME=/cargo \
   -e CARGO_TARGET_DIR=/w/target/$TAG \
   -e RUSTUP_HOME=/rustup \

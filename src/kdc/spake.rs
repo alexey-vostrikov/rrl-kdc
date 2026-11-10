@@ -106,7 +106,12 @@ fn w_bytes(cipher: &dyn Cipher, ikey: &Key, group: i32) -> Result<Vec<u8>> {
     let _ = cipher;
     let mut seed = b"SPAKEsecret".to_vec();
     seed.extend_from_slice(&group.to_be_bytes());
-    crate::crypto::kdf::prf_plus(ikey.enctype(), ikey.bytes(), &seed, 32)
+    Ok(crate::crypto::kdf::prf_plus(
+        ikey.enctype(),
+        ikey.bytes(),
+        &seed,
+        32,
+    )?)
 }
 
 /// `w` reduced modulo the group order, the way both sides use it as a scalar.
@@ -225,7 +230,7 @@ fn derive_key(
     }
     seed.truncate(seed_len);
     let hkey = crate::crypto::kdf::cf2(ikey.bytes(), "SPAKE", enctype, &seed, "keyderiv")?;
-    Key::new(enctype, hkey)
+    Ok(Key::new(enctype, hkey)?)
 }
 
 /// The `SPAKESupport` a client sent: the groups it prefers, in order.

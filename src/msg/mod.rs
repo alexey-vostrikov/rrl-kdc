@@ -196,7 +196,7 @@ pub fn decode_key(content: &[u8]) -> Result<Key> {
     let f = Fields::parse("EncryptionKey", content)?;
     let id = f.int(0, "EncryptionKey")? as i32;
     let etype = Enctype::from_id(id).ok_or(Error::UnsupportedEnctype(id))?;
-    Key::new(etype, f.octets(1, "EncryptionKey")?)
+    Ok(Key::new(etype, f.octets(1, "EncryptionKey")?)?)
 }
 
 /// `Ticket ::= [APPLICATION 1] SEQUENCE { tkt-vno, realm, sname, enc-part }`.

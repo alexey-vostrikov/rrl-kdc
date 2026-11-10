@@ -33,8 +33,8 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | Layer | State |
 |---|---|
 | `der` — strict DER for RFC 4120 | done: minimal lengths, minimal INTEGERs, refuses non-DER |
-| `crypto` — RFC 3961 §5.1/§5.3, RFC 3962, RFC 8009 | done: enctypes 17/18/19/20 |
-| `crypto::nfold` — RFC 3961 §5.1 n-fold | done |
+| `crypto` — RFC 3961 §5.1/§5.3, RFC 3962, RFC 8009 | done: enctypes 17/18/19/20, in the `rrl-crypto` crate, re-exported here so every path keeps working |
+| `crypto::nfold` — RFC 3961 §5.1 n-fold | done, in `rrl-crypto` |
 | `time` — `KerberosTime` | done |
 | `msg` — KDC-REQ decode, KDC-REP / EncASRepPart / EncTGSRepPart encode | done |
 | `hdb` — principal records after Heimdal's `lib/hdb/hdb.asn1` | done: memory and redb backends, keytab read/write |
@@ -187,7 +187,7 @@ this KDC does.
 
 Vectors are transcribed from the sources, not invented:
 
-- `tests/fixtures/mit-crypto.json` — MIT krb5's `crypto_tests` known answers
+- `rrl-crypto/tests/fixtures/mit-crypto.json` — MIT krb5's `crypto_tests` known answers
   (decrypt, checksum, derive, string-to-key).
 - `tests/fixtures/nfold.json` — Heimdal 7.99.1 `n-fold-test.c`,
   `derived-key-test.c`, `aes-test.c`.
@@ -268,7 +268,7 @@ two.
 src/der.rs        strict DER: encode, Reader, Fields, typed accessors
 src/error.rs      one error type and its mapping to KRB-ERROR codes
 src/time.rs       GeneralizedTime without a date dependency
-src/crypto/       enctypes, Key, Cipher trait, OwnCipher
+src/crypto         re-export of the `rrl-crypto` crate: enctypes, Key, Cipher, OwnCipher
   nfold.rs        RFC 3961 §5.1 n-fold
   kdf.rs          DR/DK, KDF-HMAC-SHA2, PBKDF2 string-to-key, usage constants
   aes_cts.rs      AES-CBC-CTS (RFC 3962 §5 / RFC 8009 §1)

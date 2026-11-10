@@ -27,7 +27,12 @@
 #![warn(rust_2018_idioms)]
 
 /// RFC 3961/3962/8009 cryptography: keys, enctypes and the encryption profile.
-pub mod crypto;
+///
+/// The implementation lives in the `rrl-crypto` crate, which the client side of the protocol
+/// shares — two copies of a key derivation are two ways to disagree, and a disagreement here
+/// shows up as a ticket nobody can open. Re-exported rather than wrapped so that every existing
+/// path (`rust_kdc::crypto::OwnCipher`) keeps working.
+pub use rrl_crypto as crypto;
 /// Strict DER for RFC 4120: minimal lengths, because the KDC hashes the octets.
 pub mod der;
 /// The single error type, and its mapping to `KRB-ERROR` codes.

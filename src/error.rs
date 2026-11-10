@@ -56,6 +56,15 @@ pub enum Error {
     /// A cryptographic operation failed: bad tag, short ciphertext, missing key.
     Crypto(String),
 
+    #[error(transparent)]
+    /// The same failures, arriving from the `rrl-crypto` crate, which owns the implementation.
+    ///
+    /// A separate variant rather than `#[from]` on [`Error::Crypto`] because the two carry
+    /// different information: this one still knows *which* failure it was (an unimplemented
+    /// enctype, a key of the wrong size), and the protocol code depends on that distinction —
+    /// flattening it to a string would answer `ETYPE_NOSUPP` as `BAD_INTEGRITY`.
+    CryptoLayer(#[from] crate::crypto::Error),
+
     #[error("message is not a KDC-REQ: {0}")]
     /// The bytes are not a `KDC-REQ` this KDC will answer.
     NotARequest(String),
@@ -247,6 +256,10 @@ impl Error {
             Error::Der(_) | Error::NotARequest(_) | Error::Protocol(_) => KRB_AP_ERR_MODIFIED,
             Error::UnsupportedEnctype(_) | Error::NoUsableEnctype { .. } => KDC_ERR_ETYPE_NOSUPP,
             Error::KeyLength { .. } | Error::Crypto(_) => KRB_AP_ERR_BAD_INTEGRITY,
+            Error::CryptoLayer(inner) => match inner {
+                crate::crypto::Error::UnsupportedEnctype(_) => KDC_ERR_ETYPE_NOSUPP,
+                _ => KRB_AP_ERR_BAD_INTEGRITY,
+            },
             Error::UnknownPrincipal(_) => KDC_ERR_C_PRINCIPAL_UNKNOWN,
             Error::NotFound(_) => KDC_ERR_S_PRINCIPAL_UNKNOWN,
             // Neither of these is a protocol answer: a create that collided and a
@@ -265,7 +278,11 @@ impl Error {
     pub fn is_client_facing(&self) -> bool {
         !matches!(
             self,
-            Error::Hdb(_) | Error::Config(_) | Error::Io(_) | Error::Crypto(_)
+            Error::Hdb(_)
+                | Error::Config(_)
+                | Error::Io(_)
+                | Error::Crypto(_)
+                | Error::CryptoLayer(_)
         )
     }
 
@@ -280,7 +297,8 @@ impl Error {
             Error::UnsupportedEnctype(_)
             | Error::NoUsableEnctype { .. }
             | Error::KeyLength { .. }
-            | Error::Crypto(_) => "crypto",
+            | Error::Crypto(_)
+            | Error::CryptoLayer(_) => "crypto",
             Error::NotARequest(_) | Error::Protocol(_) => "protocol",
             Error::UnknownPrincipal(_) | Error::NotFound(_) => "not_found",
             Error::Exists(_) => "already_exists",

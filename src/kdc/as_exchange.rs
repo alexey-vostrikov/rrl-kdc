@@ -493,7 +493,7 @@ impl Kdc {
             part.session_key.bytes(),
             "ticketarmor",
         )?;
-        Key::new(part.session_key.enctype(), mixed)
+        Ok(Key::new(part.session_key.enctype(), mixed)?)
     }
 
     /// The AS exchange proper, over a request that has already been unwrapped.

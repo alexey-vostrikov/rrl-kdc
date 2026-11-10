@@ -494,7 +494,7 @@ pub fn client_challenge_key(armor_key: &Key, long_term: &Key) -> Result<Key> {
         long_term.bytes(),
         "challengelongterm",
     )?;
-    Key::new(long_term.enctype(), mixed)
+    Ok(Key::new(long_term.enctype(), mixed)?)
 }
 
 /// The key the KDC answers the challenge with: the same construction under
@@ -511,7 +511,7 @@ pub fn kdc_challenge_key(armor_key: &Key, long_term: &Key) -> Result<Key> {
         long_term.bytes(),
         "challengelongterm",
     )?;
-    Key::new(long_term.enctype(), mixed)
+    Ok(Key::new(long_term.enctype(), mixed)?)
 }
 
 /// The KDC's half of the encrypted challenge: a timestamp sealed in the KDC challenge
@@ -578,7 +578,7 @@ pub fn implicit_armor_key(subkey: &Key, session_key: &Key) -> Result<Key> {
         session_key.bytes(),
         "ticketarmor",
     )?;
-    Key::new(session_key.enctype(), mixed)
+    Ok(Key::new(session_key.enctype(), mixed)?)
 }
 
 /// A `strengthen_key` and the reply key it produces (RFC 6113 §5.4.2.2).

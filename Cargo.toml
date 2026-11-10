@@ -37,6 +37,11 @@ rskrb5 = { version = "0.2", default-features = false, optional = true }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 rsa = { version = "0.9", optional = true }
 num-bigint = { version = "0.4", default-features = false, optional = true }
+# The curve arithmetic for SPAKE (RFC 9588). Not a Kerberos profile: unlike RFC 3961, where
+# this crate owns every octet, edwards25519 multiplication fails subtly rather than loudly when
+# written by hand. The protocol around it — w, the transcript, K'[n] — is ours and is checked
+# against the published vectors.
+curve25519-dalek = { version = "4", optional = true }
 num-traits = { version = "0.2", default-features = false, optional = true }
 # `rsa` 0.9 is built on `digest` 0.10 while this crate uses `sha2` 0.11, and the
 # two do not interop: `Pkcs1v15Sign::new::<D>()` needs the `Digest` the signature
@@ -58,6 +63,9 @@ hdb-ldap = []
 # `kadmind`: MIT's kadm5 protocol over ONC RPC, sealed by RPCSEC_GSS and RFC 4121
 # tokens. A front end over `Admin`, not a second implementation of it.
 kadmin = []
+# SPAKE pre-authentication (RFC 9588). Off by default: it adds a curve implementation and a
+# second way to log in, and a realm that has not thought about it should not grow one.
+spake = ["dep:curve25519-dalek"]
 # The JSON form of the administrator's vocabulary, for a transport that speaks
 # HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
 # this feature adds the request and reply envelopes and the base64 encoding the

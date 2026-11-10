@@ -40,6 +40,8 @@ pub mod pkinit;
 pub mod req_enc_pa_rep;
 /// S4U2Self (MS-SFU): a service asking for a ticket in somebody else's name.
 pub mod s4u;
+#[cfg(feature = "spake")]
+pub mod spake;
 
 /// The `till` a request asks for, with RFC 4120 §5.4.1's zero read as "as long as you allow".
 ///

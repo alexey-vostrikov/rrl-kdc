@@ -53,6 +53,11 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `kdc::fast` — RFC 6113 FAST | done: armored AS exchange, the implicit armor of a TGS request, `hide-client-names`, `PA-ENCRYPTED-CHALLENGE` instead of a plain timestamp inside the armor, and the reply key strengthened by a secret that travels only in the armor |
 | `kdc::pkinit` — RFC 4556 certificate login | done for finite-field Diffie-Hellman: CMS verification and signing, the chain to a configured anchor, `id-pkinit-san` for the principal, `PA-PK-AS-REQ` → `PA-PK-AS-REP`, reply key per RFC 8636. Judged by `openssl cms -verify` and by a wiring test that derives the key the client would |
 | `kdc::pkinit::anonymous` — RFC 8062 anonymous PKINIT | done: an unsigned `PA-PK-AS-REQ`, `WELLKNOWN/ANONYMOUS` in `WELLKNOWN:ANONYMOUS` with name type 11 and the anonymous flag, no authorization data, and the session key taken from `cf2` over the KDC's contribution in `PA-PKINIT-KX` so neither side picks it alone. Off unless a realm enables it; a build without the `pkinit` feature answers `KDC_ERR_NULL_KEY` |
+| `kdc::s4u` — MS-SFU delegation | done: `PA-FOR-USER` with the checksum over the non-DER blob Heimdal and MIT both use, `PA-S4U-X509-USER`, and a constrained-delegation ACL read from the entry or from `msDS-AllowedToDelegateTo` |
+| `kdc::req_enc_pa_rep` — RFC 6806 §11 | done: the request checksum in the *encrypted* part of the reply, the `enc-pa-rep` flag, and `PA-FX-FAST` beside it — which is how a client learns from FAST that S4U exists |
+| `kdc::cookie` — RFC 6113 §5.4.2.3 `PA-FX-COOKIE` | done: opaque realm state, sealed under a key of its own; an expired, foreign or altered cookie is ignored rather than refused, because refusing would let a rewritten request break a legitimate login |
+| `kdc::preauth` — the multi-round framework | done: `KDC_ERR_MORE_PREAUTH_DATA_REQUIRED` (91), a mechanism trait that returns the reply key itself, and nothing advertised by a realm that configured nothing |
+| `kdc::spake` — RFC 9588 SPAKE (feature `spake`) | done for `edwards25519`: the mask, the transcript, `K'[n]`, and the second factor that proves the password. Checked against the published vectors and accepted by `krb5` |
 
 ### Managing a realm without inventing an API
 
@@ -116,21 +121,34 @@ Active Directory does and what a client checks: a reply naming `HOST$` is refuse
 
 The target is behavioural parity with Heimdal's `kdc/`, so the gaps are worth stating rather
 than leaving to be discovered. Measured against `kdc/*.c` of the Heimdal tree and `src/` of
-this crate, thirteen capabilities are absent. Six are planned work; seven are outside the
-intent and would need a decision.
+this crate.
 
 Planned:
 
-* **S4U2Self / S4U2Proxy** (`kdc/mssfu.c`) — service delegation without a client's password.
 * **Cross-realm** — a `krbtgt` of another realm, `transited` fields and referrals
   (`kdc/krb5tgs.c`).
-* **SPAKE (RFC 9179) and OTP (RFC 8179)** — pre-authentication that survives an attacker who
-  records the exchange, and the multi-round flow that `PA-FX-COOKIE` exists to carry.
+* **OTP (RFC 6560)** — a pre-authentication that hands a one-time value to a token rather than
+  a password, inside FAST armor. The framework it needs is written: `KDC_ERR_MORE_PREAUTH_DATA_REQUIRED`
+  and the `PA-FX-COOKIE` that carries the state between rounds.
+* **SPAKE over the NIST groups** (RFC 9588 §12.2.2) — the exchange is written and accepted by
+  `krb5`, for `edwards25519` only, which is the group that client asks for.
 * **Audit trail and pre-authentication hooks** (`kdc/kdc-plugin.c`) — one stable record per
   decision, and a way to add a method without editing the exchange.
-* **`PA-FX-COOKIE`** — the state a multi-round exchange carries between messages. Nothing
-  today needs it, which is why it is not written yet.
-* **Replication** (`kdc/hprop.c`, `hpropd.c`) — a second domain controller.
+* **Replication** (`kdc/hprop.c`, `hpropd.c`) — a second domain controller. Not planned work
+  in the sense of "next": a decision was taken that one HDB is enough, so this sits at
+  `deferred` rather than `todo`.
+
+Done since an earlier version of this section listed them as absent, because a parity table
+that does not move reads as a claim about the code:
+
+* **S4U2Self / S4U2Proxy** (MS-SFU) — `src/kdc/s4u.rs`, with the delegation ACL read from a
+  directory (`msDS-AllowedToDelegateTo`) or from the record backend.
+* **`PA-FX-COOKIE`** (RFC 6113 §5.4.2.3) — `src/kdc/cookie.rs`. It was needed the moment SPAKE
+  arrived, which is the only thing that makes an exchange multi-round.
+* **`forwarded` and `proxy`** `kdc-options` — honoured in the TGS, including the refusal of a
+  proxied TGT.
+* **Enterprise names** (`NT-ENTERPRISE`, RFC 6806 §6), **anonymous PKINIT** (RFC 8062),
+  **`PA-REQ-ENC-PA-REP`** (RFC 6806 §11) and **SPAKE** (RFC 9588, `edwards25519`).
 
 Outside the intent: the Heimdal CA and its issuance protocols (`kdc/ca.c`, `kx509.c`,
 `bx509.c`, `httpkadmind`), JWT and token validators, `mit_dump`, and `announce`. These serve
@@ -218,10 +236,9 @@ Not implemented in the exchanges either, and refused by name rather than half-do
 |---|---|
 | PKINIT RSA key transport (`encKeyPack`) | `Unsupported`; MIT's own client rejects the mode too |
 | PKINIT elliptic-curve ECDH | `Unsupported`, with the offered algorithm named |
-| `PA-FX-COOKIE` | a plain cookie; a realm with single-round pre-authentication has no state to carry |
-| `kdc-options` `forwarded` / `proxy` | no ticket; the option is not read |
-
-| S4U2Self / S4U2Proxy, cross-realm | no ticket |
+| SPAKE over P-256 / P-384 / P-521 | `KDC_ERR_PREAUTH_FAILED` naming the groups asked for, and the client falls back |
+| OTP pre-authentication | `PA-OTP-*` is not offered at all; a client sees no such method |
+| cross-realm (a `krbtgt` of another realm) | no ticket |
 
 ## Building
 

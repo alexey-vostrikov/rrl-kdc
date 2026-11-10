@@ -40,6 +40,19 @@ use super::{Kdc, wrong_realm};
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
+/// The request as it arrived: the PA-DATA a reply may answer and the octets a checksum covers.
+///
+/// One value rather than two arguments because they are the same fact — this is what the client
+/// sent — and because `tgs_answer` already takes the body, the proof, the armor and the hiding
+/// flag, none of which travel with them.
+#[derive(Clone, Copy)]
+struct Received<'a> {
+    /// `PA-DATA` of the request that was answered (the inner one under FAST).
+    padata: &'a [(i32, Vec<u8>)],
+    /// The octets as they arrived, which is what RFC 6806 §11 checksums.
+    raw: &'a [u8],
+}
+
 /// What a constrained delegation decided.
 ///
 /// The client comes from the evidence ticket, and so does `authtime`: the user authenticated
@@ -277,7 +290,7 @@ fn renew_plan(tgt: &EncTicketPart, now: i64) -> Result<TicketPlan> {
 
 impl Kdc {
     /// Handles a `TGS-REQ`.
-    pub(super) fn handle_tgs(&self, req: &KdcReq, now: i64) -> Result<Vec<u8>> {
+    pub(super) fn handle_tgs(&self, req: &KdcReq, now: i64, raw: &[u8]) -> Result<Vec<u8>> {
         // RFC 6113 §5.4.2.6: a TGS request can be armored **implicitly** — there is no
         // `armor` field, because the armor already travelled: the `AP-REQ` in `PA-TGS-REQ`
         // presents the client's TGT and carries its subkey, and the armor key is derived
@@ -287,7 +300,11 @@ impl Kdc {
             // `check_evidence` looks the `AP-REQ` up itself; the unarmored path does not
             // need it here.
             let proven = self.check_evidence(req, now)?;
-            return self.tgs_answer(&req.body, &req.padata, proven, now, None, false);
+            let received = Received {
+                padata: &req.padata,
+                raw,
+            };
+            return self.tgs_answer(&req.body, proven, now, None, false, received);
         };
 
         let armored = super::fast::ArmoredRequest::decode(fast_bytes)?;
@@ -343,7 +360,11 @@ impl Kdc {
         let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
         let body = KdcReqBody::decode(content)?;
 
-        self.tgs_answer(&body, &inner.padata, proven, now, Some(&armor_key), hide)
+        let received = Received {
+            padata: &inner.padata,
+            raw,
+        };
+        self.tgs_answer(&body, proven, now, Some(&armor_key), hide, received)
     }
 
     /// The exchange itself, over a body that has already been recovered from wherever it
@@ -351,12 +372,14 @@ impl Kdc {
     fn tgs_answer(
         &self,
         body: &KdcReqBody,
-        padata: &[(i32, Vec<u8>)],
         proven: Proven,
         now: i64,
         armor: Option<&Key>,
         hide: bool,
+        received: Received<'_>,
     ) -> Result<Vec<u8>> {
+        // The PA-DATA a reply may answer: the inner one under FAST, the outer one otherwise.
+        let padata = received.padata;
         let config = self.config();
         if body.realm != config.realm() {
             return Err(wrong_realm(&body.realm, config.realm()));
@@ -491,6 +514,13 @@ impl Kdc {
         let authtime = proxy.as_ref().map_or(plan_authtime, |p| p.authtime);
         let mut flags = flags | forwarding;
 
+        // RFC 6806 §11, the same contract as in the AS exchange: `PA-REQ-ENC-PA-REP` present in
+        // the request means the reply carries a checksum over the request and sets the flag.
+        let wants_enc_pa_rep = super::req_enc_pa_rep::requested(padata);
+        if wants_enc_pa_rep {
+            flags |= tkt_flags::ENC_PA_REP;
+        }
+
         // The identity the ticket and the PAC name: the service's own, unless this was a
         // protocol transition.
         let (client, crealm) = match (&transition, &proxy) {
@@ -579,6 +609,21 @@ impl Kdc {
             // not what was asked for.
             sname: sname.clone(),
             caddr: body.addresses.clone(),
+            // Keyed with the reply key — the TGT's session key or the authenticator's subkey —
+            // and over the request as it arrived, which is what `krb5`'s client verifies.
+            padata: if wants_enc_pa_rep {
+                vec![(
+                    super::req_enc_pa_rep::PA_REQ_ENC_PA_REP,
+                    super::req_enc_pa_rep::checksum(
+                        self.cipher(),
+                        &proven.reply_key,
+                        super::req_enc_pa_rep::KU_TGS_REQ,
+                        received.raw,
+                    )?,
+                )]
+            } else {
+                Vec::new()
+            },
         };
         // The reply is encrypted in the TGT's session key (usage 8) or in the
         // authenticator's subkey (usage 9). Using the wrong usage produces a

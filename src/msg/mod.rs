@@ -82,6 +82,9 @@ pub mod tkt_flags {
     pub const TRANSITED_POLICY_CHECKED: u32 = 0x0008_0000;
     /// `ok-as-delegate`.
     pub const OK_AS_DELEGATE: u32 = 0x0004_0000;
+    /// `enc-pa-rep` (RFC 6806 §11, bit 15): the KDC answers with a checksum over the request,
+    /// in the encrypted part, and this says so.
+    pub const ENC_PA_REP: u32 = 0x0001_0000;
     /// `anonymous` (RFC 8062 §3, bit 16): this ticket names nobody on purpose.
     ///
     /// Bit 16 in `KerberosFlags` numbering is `1 << (31 - 16)`.
@@ -377,6 +380,12 @@ pub struct EncKdcRepPart {
     pub sname: Principal,
     /// The addresses the ticket is good from.
     pub caddr: Option<Vec<u8>>,
+    /// `encrypted-pa-data [12]`: PA-DATA a client may read only after decrypting this part.
+    ///
+    /// RFC 6806 §11 puts `PA-REQ-ENC-PA-REP` here rather than beside the ticket, because its
+    /// whole point is that an attacker who can rewrite the unprotected request cannot forge it.
+    /// A value that needs the reply key to read is what makes that true.
+    pub padata: Vec<(i32, Vec<u8>)>,
 }
 
 impl EncKdcRepPart {
@@ -423,6 +432,9 @@ impl EncKdcRepPart {
         parts.push(der::field(10, self.sname.encode_name()));
         if let Some(caddr) = &self.caddr {
             parts.push(der::field(11, caddr.clone()));
+        }
+        if !self.padata.is_empty() {
+            parts.push(der::field(12, encode_pa_data(&self.padata)));
         }
         der::cons(der::app(app_tag), &[der::seq(&parts)])
     }
@@ -484,6 +496,13 @@ impl EncKdcRepPart {
             srealm,
             sname,
             caddr: f.opt(11).map(<[u8]>::to_vec),
+            padata: match f.opt(12) {
+                None => Vec::new(),
+                Some(_) => {
+                    let mut r = Reader::new(f.get(12, "EncKDCRepPart")?);
+                    decode_pa_data("EncKDCRepPart", r.expect("EncKDCRepPart", der::SEQUENCE)?)?
+                }
+            },
         })
     }
 }
@@ -831,6 +850,7 @@ mod tests {
     fn enc_as_rep_part_uses_tag_25_and_tgs_tag_26() {
         let c = cipher();
         let part = EncKdcRepPart {
+            padata: Vec::new(),
             session_key: c.random(Enctype::Aes128Sha1).unwrap(),
             last_req: vec![(0, 0)],
             nonce: 0xdead_beef,

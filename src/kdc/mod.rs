@@ -34,6 +34,8 @@ pub mod kpasswd;
 pub mod logon_info;
 pub mod pac;
 pub mod pkinit;
+/// `PA-REQ-ENC-PA-REP` (RFC 6806 §11): the checksum that ties a reply to its request.
+pub mod req_enc_pa_rep;
 /// S4U2Self (MS-SFU): a service asking for a ticket in somebody else's name.
 pub mod s4u;
 
@@ -310,7 +312,7 @@ impl Kdc {
             Err(err) => Err(err),
             Ok(verdict) if verdict.is_allowed() => {
                 if req.msg_type == crate::msg::TGS_REQ {
-                    self.handle_tgs(&req, now)
+                    self.handle_tgs(&req, now, request)
                 } else {
                     // The exact octets: PKINIT's KDF binds the AS-REQ the client sent into
                     // its context, and a re-encoding would produce a different key.

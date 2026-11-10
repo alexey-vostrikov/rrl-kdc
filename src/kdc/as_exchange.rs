@@ -255,6 +255,10 @@ fn method_data(entries: &[EtypeInfo2Entry]) -> Vec<u8> {
         // to clients that already armored would be circular — the first armored request
         // is exactly the one that needs to learn it exists.
         (super::fast::PA_ENCRYPTED_CHALLENGE, Vec::new()),
+        // RFC 6806 §11: the client sends `(149, empty)` back only if it sees this, and until it
+        // does, it has no way to learn that this KDC answers with a request checksum — or, from
+        // that, that it supports FAST and therefore S4U.
+        (super::req_enc_pa_rep::PA_REQ_ENC_PA_REP, Vec::new()),
         (PA_ETYPE_INFO2, encode_etype_info2(entries)),
     ])
 }
@@ -710,13 +714,20 @@ impl Kdc {
             });
         }
         let renew_till = renew_till(config, body, &client, &server, effective_start);
-        let flags = ticket_flags(
+        // RFC 6806 §11: the flag and the checksum move together — a client reads the flag to
+        // decide whether to look for the checksum, so one without the other is a reply it
+        // rejects as modified.
+        let wants_enc_pa_rep = super::req_enc_pa_rep::requested(padata);
+        let mut flags = ticket_flags(
             body,
             &client,
             &server,
             preauthenticated,
             renew_till.is_some(),
         );
+        if wants_enc_pa_rep {
+            flags |= tkt_flags::ENC_PA_REP;
+        }
 
         // 7. One session key, written into both the ticket and the reply: two
         // keys would mean the client holds one the ticket does not accept.
@@ -776,7 +787,7 @@ impl Kdc {
         // ticket as the client will receive it, so it has to be the same octets.
         let ticket_der = ticket.encode();
 
-        let rep_part = EncKdcRepPart {
+        let mut rep_part = EncKdcRepPart {
             session_key,
             // Heimdal always sends at least one `last_req`: MIT's ASN.1 cannot
             // tell a zero-length SEQUENCE OF from an indefinite length, and
@@ -792,6 +803,7 @@ impl Kdc {
             srealm: server.principal.realm.clone(),
             sname: server.principal.clone(),
             caddr: body.addresses.clone(),
+            padata: Vec::new(),
         };
         // Under PKINIT the reply key came from a Diffie-Hellman exchange, so there is no
         // long-term key for an attacker to guess at and nothing to strengthen: the key
@@ -812,6 +824,27 @@ impl Kdc {
             }
             (None, false) => (None, reply_key.clone()),
         };
+
+        // RFC 6806 §11: the checksum is over the request *as received*, keyed with the key the
+        // client will reconstruct. Under FAST that is the strengthened key — the same one that
+        // opens this part — which is why it cannot be computed before the strengthening.
+        if wants_enc_pa_rep {
+            rep_part.padata = vec![(
+                super::req_enc_pa_rep::PA_REQ_ENC_PA_REP,
+                super::req_enc_pa_rep::checksum(
+                    self.cipher(),
+                    &sealed_with,
+                    super::req_enc_pa_rep::KU_AS_REQ,
+                    raw,
+                )?,
+            )];
+            // Heimdal's `add_enc_pa_rep` adds this beside the checksum, and it carries more than
+            // the checksum does: MIT's client reads "FAST is available" from the presence of
+            // PA-FX-FAST here, and from *that* concludes the KDC supports S4U. A KDC that sent
+            // only the checksum would be a KDC with protocol transition nobody ever tries.
+            rep_part.padata.push((super::fast::PA_FX_FAST, Vec::new()));
+        }
+
         let enc_part = EncryptedData::seal(
             self.cipher(),
             &sealed_with,
@@ -1143,6 +1176,9 @@ impl Kdc {
             srealm: server.realm.clone(),
             sname: server.clone(),
             caddr: body.addresses.clone(),
+            // Anonymous PKINIT authenticates nobody and the client cannot have asked for a
+            // request checksum before it had a key to check one with.
+            padata: Vec::new(),
         };
         let enc_part = EncryptedData::seal(
             self.cipher(),

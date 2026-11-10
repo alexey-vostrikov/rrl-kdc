@@ -22,6 +22,7 @@ use rust_kdc::der;
 use rust_kdc::hdb::{HdbEntry, MemoryHdb};
 use rust_kdc::kdc::fast::{self, Armor, ArmoredRequest, FastRequest};
 use rust_kdc::kdc::{Kdc, KdcConfig};
+use rust_kdc::msg;
 use rust_kdc::msg::{
     ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_enc_ts_enc, encode_pa_data,
     kdc_options, tkt_flags,
@@ -696,4 +697,37 @@ fn a_different_microsecond_is_not_a_replay() {
         rust_kdc::msg::KrbError::decode(&kdc.handle(&second_request, NOW)).is_err(),
         "a second login in the same second must not be read as a replay"
     );
+}
+
+#[test]
+fn a_login_inside_the_armor_marks_the_ticket_pre_authenticated() {
+    // The flag a service reads to know the client proved itself. It is computed from a chain
+    // of `||` over every method that can authenticate, and a mutation of that chain to `&&`
+    // survives everything else in this file: with the armored challenge and no PKINIT, the
+    // ticket would be issued *without* `PRE_AUTHENT`, so an armored login would look to the
+    // service exactly like a login that proved nothing.
+    let (request, armor_key) = armored_as_req(0x5151);
+    let kdc = kdc();
+    let reply = kdc.handle(&request, NOW);
+    assert!(
+        msg::KrbError::decode(&reply).is_err(),
+        "the armored login must succeed: {:?}",
+        msg::KrbError::decode(&reply).ok().map(|e| e.code)
+    );
+
+    // Inside FAST the reply is sealed in the strengthened key, so the ticket is the part
+    // reachable without opening anything.
+    let (_, ticket_der) = reply_parts(&reply);
+    let ticket = msg::Ticket::decode(&ticket_der).expect("a Ticket");
+    let plain = OwnCipher
+        .decrypt(&krbtgt_key(), usage::KDC_REP_TICKET, &ticket.enc.cipher)
+        .expect("the ticket opens with krbtgt's key");
+    let part = msg::EncTicketPart::decode(&plain).expect("an EncTicketPart");
+    assert_ne!(
+        part.flags & msg::tkt_flags::PRE_AUTHENT,
+        0,
+        "a login that presented the armored challenge is pre-authenticated: flags {:#010x}",
+        part.flags
+    );
+    let _ = armor_key;
 }

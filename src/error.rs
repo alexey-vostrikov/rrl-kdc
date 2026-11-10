@@ -98,6 +98,10 @@ pub enum Error {
         text: String,
         /// The encoded `METHOD-DATA`.
         method_data: Vec<u8>,
+        /// What the cookie must carry so that the client's next request is resumed
+        /// rather than restarted. Empty for a single-round method, and for any error
+        /// that ends the exchange: there is no next round to remember.
+        state: Vec<u8>,
     },
 
     #[error("pre-authentication failed for {0}")]
@@ -167,6 +171,9 @@ pub mod codes {
     pub const KDC_ERR_PREAUTH_FAILED: i32 = 24;
     /// More pre-authentication is needed; `e-data` carries METHOD-DATA.
     pub const KDC_ERR_PREAUTH_REQUIRED: i32 = 25;
+    /// Continue: the mechanism needs another round (RFC 6113 §3.1). Not a refusal —
+    /// the client answers with another request, resuming from the cookie.
+    pub const KDC_ERR_MORE_PREAUTH_DATA_REQUIRED: i32 = 91;
     /// The requested server does not match the ticket granted.
     pub const KDC_ERR_SERVER_NOMATCH: i32 = 26;
     /// The service requires a user-to-user ticket.

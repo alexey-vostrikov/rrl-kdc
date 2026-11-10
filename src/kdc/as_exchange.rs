@@ -247,8 +247,8 @@ pub fn ticket_flags(
 
 /// One `PA-DATA` element of `METHOD-DATA`: the pre-authentication type this
 /// stage announces, and the etype information that goes with it.
-fn method_data(entries: &[EtypeInfo2Entry]) -> Vec<u8> {
-    encode_pa_data(&[
+fn method_data(entries: &[EtypeInfo2Entry], extra: &[(i32, Vec<u8>)]) -> Vec<u8> {
+    let mut items = vec![
         (PA_ENC_TIMESTAMP, Vec::new()),
         // Advertised unconditionally, as MIT's KDC does: a client that armors replaces
         // the timestamp with this, a client that does not ignores it. Offering it only
@@ -260,7 +260,12 @@ fn method_data(entries: &[EtypeInfo2Entry]) -> Vec<u8> {
         // that, that it supports FAST and therefore S4U.
         (super::req_enc_pa_rep::PA_REQ_ENC_PA_REP, Vec::new()),
         (PA_ETYPE_INFO2, encode_etype_info2(entries)),
-    ])
+    ];
+    // The multi-round mechanisms the realm offers, after the single-round ones: a client
+    // reads this list to decide how to authenticate, and a mechanism missing from it is a
+    // mechanism it will never try.
+    items.extend_from_slice(extra);
+    encode_pa_data(&items)
 }
 
 /// The `ETYPE-INFO2` entries for `entry`: one per usable enctype, each with the
@@ -283,11 +288,17 @@ fn etype_info2(entry: &HdbEntry, usable: &[Enctype]) -> Vec<EtypeInfo2Entry> {
 }
 
 /// `KDC_ERR_PREAUTH_REQUIRED` with the method data attached.
-fn preauth_required(cname: &Principal, entries: &[EtypeInfo2Entry]) -> Error {
+fn preauth_required(
+    cname: &Principal,
+    entries: &[EtypeInfo2Entry],
+    announced: &[(i32, Vec<u8>)],
+    state: Vec<u8>,
+) -> Error {
     Error::Preauth {
         code: codes::KDC_ERR_PREAUTH_REQUIRED,
         text: format!("{cname} must pre-authenticate"),
-        method_data: method_data(entries),
+        method_data: method_data(entries, announced),
+        state,
     }
 }
 
@@ -297,7 +308,8 @@ fn preauth_failed(cname: &Principal, entries: &[EtypeInfo2Entry], why: &str) -> 
     Error::Preauth {
         code: codes::KDC_ERR_PREAUTH_FAILED,
         text: format!("{cname}: {why}"),
-        method_data: method_data(entries),
+        method_data: method_data(entries, &[]),
+        state: Vec::new(),
     }
 }
 
@@ -591,6 +603,60 @@ impl Kdc {
         }
         let entries = etype_info2(&client, &usable);
 
+        // 4b. Multi-round pre-authentication (SPAKE, OTP).
+        //
+        // Run before the single-round methods because a mechanism decides the reply key
+        // itself: under SPAKE it is derived from the exchange, not from the long-term key,
+        // so the timestamp path could not compute it even in principle.
+        let longterm: Vec<Key> = usable
+            .iter()
+            .filter_map(|e| client.key_for(*e).map(|k| k.key.clone()))
+            .collect();
+        let context = super::preauth::Request {
+            cname: &cname,
+            realm: config.realm(),
+            body: body_der,
+            longterm: &longterm,
+            armor,
+            now,
+            cipher: self.cipher(),
+        };
+        let (announced, announced_state) = self.preauth().announce_all(&context)?;
+        let mut mechanism_key: Option<Key> = None;
+        let mut mechanism_padata: Option<Vec<u8>> = None;
+        if let Some((mechanism, value)) = self.preauth().requested(padata) {
+            let resumed = self.resume_state(padata, now, config.realm(), Some(&cname));
+            match mechanism.round(&context, &resumed, &value) {
+                Ok(super::preauth::Step::More { padata, state }) => {
+                    // Not a refusal: the client answers with another request and the cookie
+                    // carries what this round learned. Returning PREAUTH_FAILED here would
+                    // make every multi-round mechanism look like a wrong password.
+                    return Err(Error::Preauth {
+                        code: super::preauth::MORE_PREAUTH_DATA_REQUIRED,
+                        text: format!("{cname}: {} needs another round", mechanism.name()),
+                        method_data: encode_pa_data(&[(mechanism.pa_type(), padata)]),
+                        state,
+                    });
+                }
+                Ok(super::preauth::Step::Done { reply_key, padata }) => {
+                    mechanism_key = Some(reply_key);
+                    mechanism_padata = padata;
+                }
+                Ok(super::preauth::Step::Failed { code, text }) => {
+                    return Err(Error::Kdc {
+                        code,
+                        text: format!("{cname}: {}: {text}", mechanism.name()),
+                    });
+                }
+                Err(err) => {
+                    return Err(Error::Kdc {
+                        code: codes::KDC_ERR_PREAUTH_FAILED,
+                        text: format!("{cname}: {}: {err}", mechanism.name()),
+                    });
+                }
+            }
+        }
+
         // 5. Pre-authentication.
         //
         // PKINIT first, when the realm offers it and the client asked for it: the reply key
@@ -649,22 +715,25 @@ impl Kdc {
         // close, so accepting it there would leave the hole open behind a lock.
         let timestamp = padata_value(padata, PA_ENC_TIMESTAMP);
         let challenge = padata_value(padata, super::fast::PA_ENCRYPTED_CHALLENGE);
-        let preauthenticated = timestamp.is_some() || challenge.is_some() || {
-            #[cfg(feature = "pkinit")]
-            {
-                pkinit_answer.is_some()
-            }
-            #[cfg(not(feature = "pkinit"))]
-            {
-                false
-            }
-        };
+        let preauthenticated =
+            mechanism_key.is_some() || timestamp.is_some() || challenge.is_some() || {
+                #[cfg(feature = "pkinit")]
+                {
+                    pkinit_answer.is_some()
+                }
+                #[cfg(not(feature = "pkinit"))]
+                {
+                    false
+                }
+            };
         #[cfg(feature = "pkinit")]
         let pkinit_key = pkinit_answer.as_ref().map(|a| a.reply_key.clone());
         #[cfg(not(feature = "pkinit"))]
         let pkinit_key: Option<Key> = None;
 
-        let reply_key = if let Some(key) = pkinit_key {
+        let reply_key = if let Some(key) = mechanism_key {
+            key
+        } else if let Some(key) = pkinit_key {
             key
         } else if let Some(value) = challenge {
             // A challenge cannot be answered without the armor: its key is
@@ -695,7 +764,12 @@ impl Kdc {
                 Err(err) => return Err(with_salts(err, &cname, &entries)),
             }
         } else if config.require_preauth() || client.has(entry_flags::REQUIRE_PREAUTH) {
-            return Err(preauth_required(&cname, &entries));
+            return Err(preauth_required(
+                &cname,
+                &entries,
+                &announced,
+                announced_state,
+            ));
         } else {
             client
                 .key_for(usable[0])
@@ -857,6 +931,14 @@ impl Kdc {
         // salt from the error still sees it here. Inside FAST it travels in the armor,
         // because a salt in the clear is one more thing to attack.
         let mut padata_out = vec![(PA_ETYPE_INFO2, encode_etype_info2(&entries))];
+        // Whatever the mechanism wants the client to see in the reply — SPAKE's `encdata`
+        // is what lets the client finish the exchange, so a reply without it is a reply
+        // the client cannot check.
+        if let Some(value) = mechanism_padata
+            && let Some((mechanism, _)) = self.preauth().requested(padata)
+        {
+            padata_out.push((mechanism.pa_type(), value));
+        }
         #[cfg(feature = "pkinit")]
         if let Some(answer) = &pkinit_answer {
             // The client needs this to derive the reply key; without it the `enc-part` it

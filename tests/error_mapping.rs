@@ -39,6 +39,7 @@ fn all_variants() -> Vec<Error> {
             code: codes::KDC_ERR_PREAUTH_REQUIRED,
             text: "need PA-ENC-TIMESTAMP".into(),
             method_data: vec![0x30, 0x00],
+            state: Vec::new(),
         },
         Error::PreauthFailed("alice@EXAMPLE.COM".into()),
         Error::Kdc {

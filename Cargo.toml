@@ -24,10 +24,12 @@ rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = 
 # way to disagree with a peer about a ticket that is otherwise valid.
 rrl-krb = { git = "https://github.com/alexey-vostrikov/rrl-krb", branch = "main" }
 sha1 = "0.11"
+# The crate is `md-5`; code imports it as `md5`. Used by the S4U checksum and, until the PAC moved
+# to `rrl-krb`, by the PAC signatures.
 md-5 = "0.11"
 sha2 = "0.11"
-# Used directly by the PAC signatures and the S4U checksum, which build their own HMAC over a
-# non-DER blob rather than going through the cipher profile.
+# Used directly by the S4U checksum, which builds its own HMAC over a non-DER blob rather than
+# going through the cipher profile.
 hmac = "0.13"
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }

@@ -50,7 +50,10 @@ struct StandIdentities {
 }
 
 impl PacIdentities for StandIdentities {
-    fn identity(&self, principal: &Principal) -> rust_kdc::Result<Option<Identity>> {
+    fn identity(
+        &self,
+        principal: &Principal,
+    ) -> rust_kdc::kdc::logon_info::PacResult<Option<Identity>> {
         let Some(rid) = self.rids.get(&principal.to_string()) else {
             // Not an error: a principal the directory has not been told about gets a
             // ticket without a PAC, which is what `TASQ-3.4`'s seam promises.

@@ -40,7 +40,10 @@ struct Directory {
 }
 
 impl PacIdentities for Directory {
-    fn identity(&self, principal: &Principal) -> rust_kdc::Result<Option<Identity>> {
+    fn identity(
+        &self,
+        principal: &Principal,
+    ) -> rust_kdc::kdc::logon_info::PacResult<Option<Identity>> {
         Ok((*principal == alice()).then(|| self.identity.clone()))
     }
 }
@@ -358,7 +361,10 @@ fn an_account_the_directory_does_not_know_gets_a_ticket_without_a_pac() {
     // deployment state, not an authentication failure.
     struct Empty;
     impl PacIdentities for Empty {
-        fn identity(&self, _: &Principal) -> rust_kdc::Result<Option<Identity>> {
+        fn identity(
+            &self,
+            _: &Principal,
+        ) -> rust_kdc::kdc::logon_info::PacResult<Option<Identity>> {
             Ok(None)
         }
     }

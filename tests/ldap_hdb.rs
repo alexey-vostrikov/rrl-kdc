@@ -14,7 +14,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use rust_kdc::crypto::{Enctype, OwnCipher};
+use rust_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
+use rust_kdc::der;
 use rust_kdc::error::Error;
 use rust_kdc::hdb::ldap::{
     Attributes, Directory, LdapHdb, attrs, dn_for, from_attributes, to_attributes, uac,
@@ -22,6 +23,10 @@ use rust_kdc::hdb::ldap::{
 use rust_kdc::hdb::{Hdb, HdbEntry, flags};
 use rust_kdc::kdc::{Kdc, KdcConfig};
 use rust_kdc::kdc::{Purpose, usable_enctypes};
+use rust_kdc::msg::{
+    self, ApReq, Authenticator, EncTicketPart, EncryptedData, Ticket, encode_pa_data, kdc_options,
+    tkt_flags,
+};
 use rust_kdc::name::Principal;
 use rust_kdc::transport::serve_loopback;
 
@@ -708,5 +713,230 @@ fn a_live_client_gets_a_ticket_for_the_name_it_asked_for() {
         asked.to_string(),
         machine_principal.to_string(),
         "the two names really differ, or this test proves nothing"
+    );
+}
+
+// ---- S4U2Proxy over a directory (RRL-3.27) -------------------------------------------
+
+/// A service account in the directory, with a key and an optional delegation list.
+fn service_entry(directory: &FakeDirectory, name: &str, delegate_to: Option<Vec<Principal>>) {
+    let cipher = OwnCipher;
+    let mut entry = HdbEntry::service(p(name));
+    for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
+        entry
+            .add_password_key(&cipher, e, b"service-key", 1)
+            .unwrap();
+    }
+    entry.constrained_delegation = delegate_to;
+    directory.insert(&entry);
+}
+
+/// The realm's `krbtgt` key, derived the way the test's directory derived it.
+fn krbtgt_key() -> Key {
+    let mut entry = HdbEntry::krbtgt(REALM);
+    entry
+        .add_password_key(
+            &OwnCipher,
+            Enctype::Aes256Sha1,
+            b"master-key-of-the-realm",
+            1,
+        )
+        .unwrap();
+    entry
+        .key_for(Enctype::Aes256Sha1)
+        .map(|k| k.key.clone())
+        .unwrap()
+}
+
+/// A service key, derived the way [`service_entry`] derived it.
+fn service_key() -> Key {
+    let mut entry = HdbEntry::service(p("svc/delegator.example.com"));
+    entry
+        .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"service-key", 1)
+        .unwrap();
+    entry
+        .key_for(Enctype::Aes256Sha1)
+        .map(|k| k.key.clone())
+        .unwrap()
+}
+
+/// A TGT for `client` and its session key.
+fn tgt_for(client: &Principal, krbtgt: &Key, now: i64) -> (Vec<u8>, Key) {
+    let cipher = OwnCipher;
+    let session = cipher.random(Enctype::Aes256Sha1).unwrap();
+    let part = EncTicketPart {
+        flags: tkt_flags::INITIAL | tkt_flags::PRE_AUTHENT | tkt_flags::FORWARDABLE,
+        session_key: session.clone(),
+        crealm: REALM.into(),
+        cname: client.clone(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: now - 60,
+        starttime: None,
+        endtime: now + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let ticket = Ticket {
+        realm: REALM.into(),
+        sname: Principal::krbtgt(REALM),
+        enc: EncryptedData::seal(
+            &cipher,
+            krbtgt,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
+    };
+    (ticket.encode(), session)
+}
+
+/// An evidence ticket in `alice`'s name, sealed in `key` — the delegating service's key.
+fn evidence(key: &Key, now: i64) -> Vec<u8> {
+    let cipher = OwnCipher;
+    let part = EncTicketPart {
+        flags: tkt_flags::INITIAL | tkt_flags::FORWARDABLE,
+        session_key: cipher.random(Enctype::Aes256Sha1).unwrap(),
+        crealm: REALM.into(),
+        cname: p("alice"),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: now - 300,
+        starttime: None,
+        endtime: now + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    Ticket {
+        realm: REALM.into(),
+        sname: p("svc/delegator.example.com"),
+        enc: EncryptedData::seal(&cipher, key, usage::KDC_REP_TICKET, Some(1), &part.encode())
+            .unwrap(),
+    }
+    .encode()
+}
+
+/// A `TGS-REQ` for `target`, with `cname-in-addl-tkt` and the evidence ticket.
+fn proxy_req(tgt: &[u8], session: &Key, target: &Principal, evidence: &[u8], now: i64) -> Vec<u8> {
+    let cipher = OwnCipher;
+    let body = der::seq(&[
+        der::field(0, der::flags32(kdc_options::CNAME_IN_ADDL_TKT)),
+        der::field(2, der::general_string(REALM)),
+        der::field(3, target.encode_name()),
+        der::field(5, der::time(now + 3600)),
+        der::field(7, der::int(0x4242)),
+        der::field(8, der::seq(&[der::int(18)])),
+        der::field(11, der::seq(&[evidence.to_vec()])),
+    ]);
+    let cksum = cipher
+        .checksum(session, usage::TGS_REQ_AUTH_CKSUM, &body)
+        .unwrap();
+    let authenticator = Authenticator {
+        crealm: REALM.into(),
+        cname: p("svc/delegator.example.com"),
+        cksum: Some((Enctype::Aes256Sha1.checksum_type(), cksum)),
+        cusec: 0,
+        ctime: now,
+        subkey: None,
+        seq_number: None,
+        authorization_data: None,
+    };
+    let ap_req = ApReq {
+        ap_options: 0,
+        ticket: tgt.to_vec(),
+        authenticator: EncryptedData::seal(
+            &cipher,
+            session,
+            usage::TGS_REQ_AUTH,
+            None,
+            &authenticator.encode(),
+        )
+        .unwrap(),
+    }
+    .encode();
+    der::cons(
+        der::app(12),
+        &[der::seq(&[
+            der::field(1, der::int(5)),
+            der::field(2, der::int(12)),
+            der::field(3, encode_pa_data(&[(msg::PA_TGS_REQ, ap_req)])),
+            der::field(4, body),
+        ])],
+    )
+}
+
+const NOW: i64 = 1_700_000_000;
+
+#[test]
+fn a_delegation_list_in_the_directory_decides_who_may_delegate() {
+    // The end of the chain RRL-3.27 is about: an administrator writes
+    // `msDS-AllowedToDelegateTo` in the directory, and the KDC honours it. Without this the
+    // attribute is decoded and nothing reads it, which is the shape of bug that looks like a
+    // working feature until somebody tries to use it.
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    service_entry(
+        &directory,
+        "svc/delegator.example.com",
+        Some(vec![p("cifs/files.example.com")]),
+    );
+    service_entry(&directory, "cifs/files.example.com", None);
+    let kdc = kdc_over(shared(&directory));
+
+    let (tgt, session) = tgt_for(&p("svc/delegator.example.com"), &krbtgt_key(), NOW);
+    let request = proxy_req(
+        &tgt,
+        &session,
+        &p("cifs/files.example.com"),
+        &evidence(&service_key(), NOW),
+        NOW,
+    );
+    let reply = kdc.handle(&request, NOW);
+    assert!(
+        msg::KrbError::decode(&reply).is_err(),
+        "a listed delegation must be granted: {:?}",
+        msg::KrbError::decode(&reply)
+    );
+
+    // And the ticket is the user's, sealed in the target service's key.
+    let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
+    let mut r = der::Reader::new(f.get(4, "TGS-REP").expect("cname"));
+    let seq = r.next("cname").unwrap();
+    assert_eq!(
+        Principal::decode("cname", seq.content, REALM)
+            .unwrap()
+            .components,
+        vec!["alice"],
+        "the delegated ticket names the user, not the service"
+    );
+}
+
+#[test]
+fn the_same_request_is_refused_when_the_directory_lists_nobody() {
+    // The pair: the granting above must come from the attribute, not from the service being
+    // trusted-for-delegation alone. A service with no list may delegate only to itself.
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    service_entry(&directory, "svc/delegator.example.com", None);
+    service_entry(&directory, "cifs/files.example.com", None);
+    let kdc = kdc_over(shared(&directory));
+
+    let (tgt, session) = tgt_for(&p("svc/delegator.example.com"), &krbtgt_key(), NOW);
+    let request = proxy_req(
+        &tgt,
+        &session,
+        &p("cifs/files.example.com"),
+        &evidence(&service_key(), NOW),
+        NOW,
+    );
+    let reply = kdc.handle(&request, NOW);
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, rust_kdc::error::codes::KDC_ERR_BADOPTION);
+    assert!(
+        err.e_text.unwrap_or_default().contains("may not delegate"),
+        "the refusal names the rule"
     );
 }

@@ -92,6 +92,12 @@ pub mod attrs {
     pub const AD_USER_ACCOUNT_CONTROL: &str = "userAccountControl";
     /// Microsoft's service names: `HOST/server.example.com`, no realm.
     pub const AD_SERVICE_PRINCIPAL_NAME: &str = "servicePrincipalName";
+    /// Microsoft's constrained-delegation list: the SPNs this account may delegate to.
+    ///
+    /// One value per target, each an SPN without a realm (`cifs/files.example.com`). AD's own
+    /// attribute, rather than a private one, so that a directory populated by AD tools and a
+    /// directory populated by this crate mean the same thing.
+    pub const AD_ALLOWED_TO_DELEGATE_TO: &str = "msDS-AllowedToDelegateTo";
     /// Microsoft's binary blob of every long-term key, a `USER_PROPERTIES`
     /// structure. Written here as a projection of `krb5Key`, never read: see
     /// [`crate::hdb::ad_blob`].
@@ -314,6 +320,15 @@ pub fn to_attributes(entry: &HdbEntry) -> Attributes {
     if let Some(spn) = service_principal_name(&entry.principal) {
         out.set(attrs::AD_SERVICE_PRINCIPAL_NAME, spn.into_bytes());
     }
+    // The constrained-delegation list, one SPN per value and no realm: that is how AD stores
+    // it, and a realm here would make the same entry mean different things in two realms.
+    if let Some(acl) = &entry.constrained_delegation {
+        for target in acl {
+            if let Some(spn) = service_principal_name(target) {
+                out.add(attrs::AD_ALLOWED_TO_DELEGATE_TO, spn.into_bytes());
+            }
+        }
+    }
     // The AD projection of the keys, so that an audit tool looking for it finds
     // something. Not written for an entry with no keys: an empty blob would say
     // "this account has no credentials", and absent says "nobody has filled this
@@ -413,6 +428,7 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
     let flags = reconcile_flags(&name, flags_krb5, uac)?;
 
     let etypes = enctypes(attributes, &name)?;
+    let constrained_delegation = delegation_acl(attributes, &principal)?;
 
     // Declared version, or the highest key when the directory does not say: an
     // entry whose keys are newer than its attribute is caught above rather than
@@ -427,7 +443,7 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
         // this crate's private format into somebody's schema. Delegation limits therefore come
         // from the record backend; an LDAP-backed realm delegates only to itself, which is the
         // conservative reading of "no list".
-        constrained_delegation: None,
+        constrained_delegation,
         valid_start: attributes.time(attrs::VALID_START, &name)?,
         valid_end: attributes.time(attrs::VALID_END, &name)?,
         pw_end: attributes.time(attrs::PASSWORD_END, &name)?,
@@ -620,6 +636,72 @@ pub fn ad_bits_to_enctypes(bits: u32) -> Vec<Enctype> {
         }
     }
     out
+}
+
+/// The constrained-delegation list, from `msDS-AllowedToDelegateTo`.
+///
+/// One value per target, each an SPN without a realm — AD's spelling. Three states are kept
+/// apart, because the difference is the authorization decision:
+///
+/// * absent — this entry never declared a list, and the KDC then allows delegation only to the
+///   service itself (MS-SFU §3.1.4);
+/// * present, with targets — delegation where the administrator said;
+/// * present and empty — a directory cannot express it: the attribute has no value to hold
+///   "nobody", so `Some([])` degrades to absent on a round trip. A realm that needs the
+///   prohibition keeps it in the record backend, and the test says so out loud rather than
+///   leaving it to be discovered.
+///
+/// A value that carries a realm is accepted when the realm is the entry's own — an
+/// administrator writing a full principal is not making a mistake — and refused when it is not,
+/// because constrained delegation does not cross realms.
+fn delegation_acl(
+    attributes: &Attributes,
+    principal: &Principal,
+) -> Result<Option<Vec<Principal>>> {
+    let values = attributes.get(attrs::AD_ALLOWED_TO_DELEGATE_TO);
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let text = std::str::from_utf8(value).map_err(|_| {
+            Error::Hdb(format!(
+                "{principal}: {} has a value that is not valid UTF-8, so it names no service",
+                attrs::AD_ALLOWED_TO_DELEGATE_TO
+            ))
+        })?;
+        out.push(delegation_target(text.trim(), principal)?);
+    }
+    Ok(Some(out))
+}
+
+/// One SPN from the delegation list, as a principal in `entry`'s realm.
+fn delegation_target(text: &str, entry: &Principal) -> Result<Principal> {
+    let (spn, realm) = match text.rsplit_once('@') {
+        None => (text, entry.realm.as_str()),
+        Some((spn, realm)) => {
+            if !realm.eq_ignore_ascii_case(&entry.realm) {
+                return Err(Error::Hdb(format!(
+                    "{entry}: {} names a delegation target in realm {realm}, and constrained \
+                     delegation does not cross realms (MS-SFU §3.1.5)",
+                    attrs::AD_ALLOWED_TO_DELEGATE_TO
+                )));
+            }
+            (spn, entry.realm.as_str())
+        }
+    };
+    let components: Vec<String> = spn.split('/').map(str::to_string).collect();
+    if components.is_empty() || components.iter().any(String::is_empty) {
+        return Err(Error::Hdb(format!(
+            "{entry}: {} holds {text:?}, which names no service",
+            attrs::AD_ALLOWED_TO_DELEGATE_TO
+        )));
+    }
+    Ok(Principal::new(
+        crate::name::NT_PRINCIPAL,
+        components,
+        realm.to_string(),
+    ))
 }
 
 /// `userAccountControl` for an entry.
@@ -1014,6 +1096,114 @@ mod tests {
             from_attributes(&to_attributes(&entry)).unwrap().etypes,
             None,
             "a directory cannot say `issued nothing`; it reads back as no restriction"
+        );
+    }
+
+    #[test]
+    fn a_delegation_acl_round_trips_through_the_ad_attribute() {
+        // RRL-3.27. Without this attribute an LDAP-backed realm can delegate to nobody but
+        // itself, which is the same as having no S4U2Proxy at all: the whole point of a
+        // service account in a directory is that an administrator can name where it may go.
+        let mut entry = entry();
+        entry.constrained_delegation = Some(vec![
+            Principal::parse("cifs/files.example.com@EXAMPLE.COM").unwrap(),
+            Principal::parse("http/web.example.com@EXAMPLE.COM").unwrap(),
+        ]);
+        let attributes = to_attributes(&entry);
+        assert_eq!(
+            attributes.get(attrs::AD_ALLOWED_TO_DELEGATE_TO).len(),
+            2,
+            "one value per delegation target, as AD stores them"
+        );
+        assert_eq!(
+            attributes.first(attrs::AD_ALLOWED_TO_DELEGATE_TO),
+            Some(&b"cifs/files.example.com"[..]),
+            "an SPN carries no realm: the entry's own realm is what it means"
+        );
+
+        let back = from_attributes(&attributes).unwrap();
+        let acl = back.constrained_delegation.expect("a list came back");
+        assert_eq!(acl.len(), 2);
+        assert_eq!(acl[0].components, vec!["cifs", "files.example.com"]);
+        assert_eq!(acl[0].realm, "EXAMPLE.COM");
+        assert_eq!(acl[1].components, vec!["http", "web.example.com"]);
+    }
+
+    #[test]
+    fn a_delegation_list_of_nobody_degrades_to_absent_and_that_is_stated() {
+        // `Some([])` — "to nobody" — has no spelling in a directory: `msDS-AllowedToDelegateTo`
+        // holds targets, and no value means "never declared". The round trip therefore widens a
+        // prohibition into a permission, and the test says so rather than leaving it to be
+        // discovered: a realm that must forbid delegation keeps the entry in the record backend,
+        // where an empty list survives.
+        let mut entry = entry();
+        entry.constrained_delegation = Some(Vec::new());
+        let back = from_attributes(&to_attributes(&entry)).unwrap();
+        assert_eq!(
+            back.constrained_delegation, None,
+            "a directory cannot say `delegates to nobody`; it reads back as `never declared`"
+        );
+    }
+
+    #[test]
+    fn a_delegation_target_naming_another_realm_is_refused() {
+        // Constrained delegation does not cross realms (MS-SFU §3.1.5): a target in another
+        // realm is a target this KDC can never issue a ticket for. Silently storing it would
+        // leave an administrator believing the delegation works.
+        let mut attributes = to_attributes(&entry());
+        attributes.set(
+            attrs::AD_ALLOWED_TO_DELEGATE_TO,
+            "cifs/files.example.com@OTHER.EXAMPLE",
+        );
+        let err = from_attributes(&attributes).unwrap_err().to_string();
+        assert!(
+            err.contains("OTHER.EXAMPLE") && err.contains("realm"),
+            "the refusal must name the realm it found: {err}"
+        );
+    }
+
+    #[test]
+    fn a_delegation_target_that_names_nothing_is_refused() {
+        // An empty value, or one that is not UTF-8, would otherwise become a principal with no
+        // components — a name that matches nothing and hides a typo in the directory.
+        let mut attributes = to_attributes(&entry());
+        attributes.set(attrs::AD_ALLOWED_TO_DELEGATE_TO, "");
+        let err = from_attributes(&attributes).unwrap_err().to_string();
+        assert!(err.contains("names no service"), "{err}");
+
+        let mut attributes = to_attributes(&entry());
+        attributes.set(attrs::AD_ALLOWED_TO_DELEGATE_TO, vec![0xff, 0xfe]);
+        let err = from_attributes(&attributes).unwrap_err().to_string();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn a_realm_suffix_that_matches_the_entry_is_accepted() {
+        // AD stores bare SPNs, but an administrator writing a full principal by hand is not
+        // making a mistake — and refusing it would send them to a directory they just edited
+        // correctly.
+        let mut attributes = to_attributes(&entry());
+        attributes.set(
+            attrs::AD_ALLOWED_TO_DELEGATE_TO,
+            "cifs/files.example.com@EXAMPLE.COM",
+        );
+        let back = from_attributes(&attributes).unwrap();
+        let acl = back.constrained_delegation.expect("a list");
+        assert_eq!(acl[0].components, vec!["cifs", "files.example.com"]);
+        assert_eq!(acl[0].realm, "EXAMPLE.COM");
+    }
+
+    #[test]
+    fn an_absent_delegation_attribute_stays_absent() {
+        // No list is not the same as a list of nobody: `None` means "this entry never said",
+        // and the KDC then allows delegation only to the service itself (MS-SFU §3.1.4).
+        let entry = entry();
+        assert_eq!(entry.constrained_delegation, None);
+        assert_eq!(
+            from_attributes(&to_attributes(&entry))
+                .unwrap()
+                .constrained_delegation,
+            None
         );
     }
 

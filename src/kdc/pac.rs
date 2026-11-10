@@ -917,32 +917,32 @@ mod tests {
         // SEQUENCE, which is the level below.
         let entry = |bytes: &[u8]| -> (i64, Vec<u8>) {
             let mut r = crate::der::Reader::new(bytes);
-            let sequence = r.next("entry").unwrap();
+            let sequence = r.next_tlv("entry").unwrap();
             assert_eq!(sequence.tag, 0x30, "an entry is a SEQUENCE");
             let fields = crate::der::Fields::parse("entry", sequence.content).unwrap();
             // Each field is `[n]` wrapping the value's own tag: `[0]` holds an
             // INTEGER, `[1]` an OCTET STRING, and the octets wanted are the content
             // of that inner TLV rather than its header.
-            let integer = crate::der::Reader::new(fields.get(0, "entry").unwrap())
-                .next("ad-type")
+            let integer = crate::der::Reader::new(fields.bytes(0, "entry").unwrap())
+                .next_tlv("ad-type")
                 .unwrap();
             assert_eq!(integer.tag, 0x02, "ad-type is an INTEGER");
-            let data = crate::der::Reader::new(fields.get(1, "entry").unwrap())
-                .next("ad-data")
+            let data = crate::der::Reader::new(fields.bytes(1, "entry").unwrap())
+                .next_tlv("ad-data")
                 .unwrap();
             assert_eq!(data.tag, 0x04, "ad-data is an OCTET STRING");
             (read_int(integer.content), data.content.to_vec())
         };
 
         let outer = crate::der::Reader::new(&ad)
-            .next("AuthorizationData")
+            .next_tlv("AuthorizationData")
             .unwrap();
         assert_eq!(outer.tag, 0x30);
         let (outer_type, outer_data) = entry(outer.content);
         assert_eq!(outer_type, 1, "AD-IF-RELEVANT");
 
         let inner = crate::der::Reader::new(&outer_data)
-            .next("IfRelevant")
+            .next_tlv("IfRelevant")
             .unwrap();
         assert_eq!(inner.tag, 0x30, "the payload is an AuthorizationData");
         let (inner_type, inner_data) = entry(inner.content);

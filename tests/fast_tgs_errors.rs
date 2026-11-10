@@ -477,11 +477,11 @@ fn the_armored_tgs_reply_carries_a_finished_checksum_over_the_ticket() {
     );
 
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).expect("a TGS-REP");
-    let padata = match f.opt(2) {
+    let padata = match f.opt_bytes(2) {
         None => Vec::new(),
         Some(raw) => {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("PA-DATA").expect("a SEQUENCE");
+            let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE");
             msg::decode_pa_data("TGS-REP", seq.content).expect("PA-DATA")
         }
     };
@@ -493,37 +493,37 @@ fn the_armored_tgs_reply_carries_a_finished_checksum_over_the_ticket() {
 
     // `PA-FX-FAST-REPLY ::= [0] KrbFastArmoredRep { enc-fast-rep [0] }`.
     let mut r = der::Reader::new(&wrapped);
-    let choice = r.next("PA-FX-FAST-REPLY").expect("the choice");
+    let choice = r.next_tlv("PA-FX-FAST-REPLY").expect("the choice");
     assert_eq!(choice.tag, 0xa0, "armored-data [0]");
     let mut inner = der::Reader::new(choice.content);
-    let seq = inner.next("KrbFastArmoredRep").expect("a SEQUENCE");
+    let seq = inner.next_tlv("KrbFastArmoredRep").expect("a SEQUENCE");
     let af = der::Fields::parse("KrbFastArmoredRep", seq.content).expect("fields");
-    let enc = EncryptedData::decode("enc-fast-rep", af.get(0, "enc-fast-rep").unwrap())
+    let enc = EncryptedData::decode("enc-fast-rep", af.bytes(0, "enc-fast-rep").unwrap())
         .expect("an EncryptedData");
     let plain = OwnCipher
         .decrypt(&armor_key, fast::usage::FAST_REP, &enc.cipher)
         .expect("the armor key must open the reply");
 
     let mut pr = der::Reader::new(&plain);
-    let response = pr.next("KrbFastResponse").expect("a KrbFastResponse");
+    let response = pr.next_tlv("KrbFastResponse").expect("a KrbFastResponse");
     let rf = der::Fields::parse("KrbFastResponse", response.content).expect("fields");
-    let finished_tlv = rf.opt(2).expect("KrbFastResponse.finished");
+    let finished_tlv = rf.opt_bytes(2).expect("KrbFastResponse.finished");
     let mut fr = der::Reader::new(finished_tlv);
-    let fin_seq = fr.next("KrbFastFinished").expect("a SEQUENCE");
+    let fin_seq = fr.next_tlv("KrbFastFinished").expect("a SEQUENCE");
     let finf = der::Fields::parse("KrbFastFinished", fin_seq.content).expect("fields");
 
-    let ticket_tlv = f.get(5, "TGS-REP").expect("the ticket");
+    let ticket_tlv = f.bytes(5, "TGS-REP").expect("the ticket");
     let mut tr = der::Reader::new(ticket_tlv);
-    let ticket_seq = tr.next("Ticket").expect("a SEQUENCE");
+    let ticket_seq = tr.next_tlv("Ticket").expect("a SEQUENCE");
     let ticket_der = der::tlv(der::app(1), ticket_seq.content);
 
-    let ck = finf.get(4, "ticket-checksum").expect("the checksum");
+    let ck = finf.bytes(4, "ticket-checksum").expect("the checksum");
     let mut cr = der::Reader::new(ck);
-    let ck_seq = cr.next("Checksum").expect("a SEQUENCE");
+    let ck_seq = cr.next_tlv("Checksum").expect("a SEQUENCE");
     let ckf = der::Fields::parse("Checksum", ck_seq.content).expect("fields");
-    let sum_tlv = ckf.get(1, "Checksum").expect("the checksum octets");
+    let sum_tlv = ckf.bytes(1, "Checksum").expect("the checksum octets");
     let mut sr = der::Reader::new(sum_tlv);
-    let sum = sr.next("checksum").expect("an OCTET STRING").content;
+    let sum = sr.next_tlv("checksum").expect("an OCTET STRING").content;
 
     assert!(
         OwnCipher
@@ -541,7 +541,7 @@ fn the_armored_tgs_reply_carries_a_finished_checksum_over_the_ticket() {
 fn inner_error_of(reply: &[u8], armor_key: &Key) -> Option<msg::KrbError> {
     let container = error_of(reply).e_data?;
     let mut r = der::Reader::new(&container);
-    let seq = r.next("METHOD-DATA").ok()?;
+    let seq = r.next_tlv("METHOD-DATA").ok()?;
     let padata = msg::decode_pa_data("METHOD-DATA", seq.content).ok()?;
     let value = padata
         .iter()
@@ -549,22 +549,22 @@ fn inner_error_of(reply: &[u8], armor_key: &Key) -> Option<msg::KrbError> {
         .map(|(_, v)| v.clone())?;
 
     let mut rr = der::Reader::new(&value);
-    let choice = rr.next("PA-FX-FAST-REPLY").ok()?;
+    let choice = rr.next_tlv("PA-FX-FAST-REPLY").ok()?;
     let mut inner = der::Reader::new(choice.content);
-    let armored_rep = inner.next("KrbFastArmoredRep").ok()?;
+    let armored_rep = inner.next_tlv("KrbFastArmoredRep").ok()?;
     let f = der::Fields::parse("KrbFastArmoredRep", armored_rep.content).ok()?;
-    let enc = msg::EncryptedData::decode("enc-fast-rep", f.get(0, "enc-fast-rep").ok()?).ok()?;
+    let enc = msg::EncryptedData::decode("enc-fast-rep", f.bytes(0, "enc-fast-rep").ok()?).ok()?;
     let plain = OwnCipher
         .decrypt(armor_key, fast::usage::FAST_REP, &enc.cipher)
         .ok()?;
 
     let mut body = der::Reader::new(&plain);
-    let response = body.next("KrbFastResponse").ok()?;
+    let response = body.next_tlv("KrbFastResponse").ok()?;
     let rf = der::Fields::parse("KrbFastResponse", response.content).ok()?;
     // `der::field` stores the whole TLV, so the SEQUENCE header is still there.
-    let raw = rf.get(0, "padata").ok()?.to_vec();
+    let raw = rf.bytes(0, "padata").ok()?.to_vec();
     let mut pr = der::Reader::new(&raw);
-    let pseq = pr.next("padata").ok()?;
+    let pseq = pr.next_tlv("padata").ok()?;
     let padata = msg::decode_pa_data("KrbFastResponse", pseq.content).ok()?;
 
     padata

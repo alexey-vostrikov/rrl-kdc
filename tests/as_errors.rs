@@ -352,12 +352,12 @@ fn read_as_rep(reply: &[u8]) -> AsRepView {
     // The client and realm are checked by the acceptance test against a real
     // client; here only the encrypted part matters.
     let _crealm = f.string(3, "KDC-REP").unwrap();
-    let mut r = rust_kdc::der::Reader::new(f.get(6, "KDC-REP").unwrap());
+    let mut r = rust_kdc::der::Reader::new(f.bytes(6, "KDC-REP").unwrap());
     let enc_part = EncryptedData::decode(
         "enc-part",
         &rust_kdc::der::tlv(
             rust_kdc::der::SEQUENCE,
-            r.expect("enc-part", rust_kdc::der::SEQUENCE).unwrap(),
+            r.expect_in("enc-part", rust_kdc::der::SEQUENCE).unwrap(),
         ),
     )
     .unwrap();
@@ -434,7 +434,7 @@ fn kdc_allowing(names: &str) -> Kdc {
 /// The enctype a reply's ticket is sealed in, or `None` when the reply is an error.
 fn ticket_enctype(reply: &[u8]) -> Option<Enctype> {
     let fields = der::Fields::parse_app("AS-REP", 11, reply).ok()?;
-    let ticket = Ticket::decode(fields.get(5, "AS-REP").ok()?).ok()?;
+    let ticket = Ticket::decode(fields.bytes(5, "AS-REP").ok()?).ok()?;
     Some(ticket.enc.etype)
 }
 

@@ -104,9 +104,9 @@ fn the_envelope_carries_the_content_type_and_the_content() {
         .expect("signs");
 
     let mut r = Reader::new(&signed);
-    let ci = r.next("ContentInfo").expect("a ContentInfo");
+    let ci = r.next_tlv("ContentInfo").expect("a ContentInfo");
     let mut cr = Reader::new(ci.content);
-    let oid = cr.next("contentType").expect("the contentType OID");
+    let oid = cr.next_tlv("contentType").expect("the contentType OID");
     assert_eq!(
         der::decode_oid("contentType", oid.content).unwrap(),
         "1.2.840.113549.1.7.2",
@@ -115,18 +115,18 @@ fn the_envelope_carries_the_content_type_and_the_content() {
 
     let sd = signed_data_content(&signed);
     let mut sr = Reader::new(&sd);
-    sr.next("version").unwrap();
-    sr.next("digestAlgorithms").unwrap();
-    let encap = sr.next("EncapsulatedContentInfo").unwrap();
+    sr.next_tlv("version").unwrap();
+    sr.next_tlv("digestAlgorithms").unwrap();
+    let encap = sr.next_tlv("EncapsulatedContentInfo").unwrap();
     let mut er = Reader::new(encap.content);
-    let etype = er.next("eContentType").unwrap();
+    let etype = er.next_tlv("eContentType").unwrap();
     assert_eq!(
         der::decode_oid("eContentType", etype.content).unwrap(),
         pkinit::ID_PKINIT_DH_KEY_DATA
     );
-    let wrapped = er.next("eContent").unwrap();
+    let wrapped = er.next_tlv("eContent").unwrap();
     let mut wr = Reader::new(wrapped.content);
-    let octets = wr.next("OCTET STRING").unwrap();
+    let octets = wr.next_tlv("OCTET STRING").unwrap();
     assert_eq!(octets.content, b"the dh key info");
 }
 
@@ -142,14 +142,14 @@ fn the_whole_reply_round_trips_to_the_structure_rfc_4556_describes() {
     let rep = reply::dh_rep_info(signed.clone());
 
     let mut r = Reader::new(&rep);
-    let dh_info = r.next("PA-PK-AS-REP").expect("the choice");
+    let dh_info = r.next_tlv("PA-PK-AS-REP").expect("the choice");
     assert_eq!(dh_info.tag, der::ctx(0));
     let mut ir = Reader::new(dh_info.content);
-    let seq = ir.next("DHRepInfo").expect("a SEQUENCE");
+    let seq = ir.next_tlv("DHRepInfo").expect("a SEQUENCE");
     let f = der::Fields::parse("DHRepInfo", seq.content).expect("fields");
-    let data = f.get(0, "DHRepInfo").expect("dhSignedData");
+    let data = f.bytes(0, "DHRepInfo").expect("dhSignedData");
     let mut dr = Reader::new(data);
-    let octets = dr.next("dhSignedData").expect("an OCTET STRING");
+    let octets = dr.next_tlv("dhSignedData").expect("an OCTET STRING");
     assert_eq!(
         octets.content,
         signed.as_slice(),
@@ -178,12 +178,12 @@ fn a_misordered_der_certificate_is_refused_rather_than_crashing() {
 /// `ContentInfo`. The same mistake cost a session in the verifier.
 fn signed_data_content(signed: &[u8]) -> Vec<u8> {
     let mut r = Reader::new(signed);
-    let ci = r.next("ContentInfo").expect("a ContentInfo");
+    let ci = r.next_tlv("ContentInfo").expect("a ContentInfo");
     let mut cr = Reader::new(ci.content);
-    cr.next("contentType").expect("the contentType OID");
-    let wrapped = cr.next("content [0]").expect("the content");
+    cr.next_tlv("contentType").expect("the contentType OID");
+    let wrapped = cr.next_tlv("content [0]").expect("the content");
     let mut wr = Reader::new(wrapped.content);
-    wr.next("SignedData")
+    wr.next_tlv("SignedData")
         .expect("the SignedData SEQUENCE")
         .content
         .to_vec()
@@ -193,13 +193,13 @@ fn signed_data_content(signed: &[u8]) -> Vec<u8> {
 fn carried_certificate(signed: &[u8]) -> Option<Vec<u8>> {
     let sd = signed_data_content(signed);
     let mut sr = Reader::new(&sd);
-    sr.next("version").ok()?;
-    sr.next("digestAlgorithms").ok()?;
-    sr.next("EncapsulatedContentInfo").ok()?;
-    let certs = sr.next("certificates").ok()?;
+    sr.next_tlv("version").ok()?;
+    sr.next_tlv("digestAlgorithms").ok()?;
+    sr.next_tlv("EncapsulatedContentInfo").ok()?;
+    let certs = sr.next_tlv("certificates").ok()?;
     assert_eq!(certs.tag, 0xa0, "certificates [0] IMPLICIT");
     let mut ir = Reader::new(certs.content);
-    let first = ir.next("Certificate").ok()?;
+    let first = ir.next_tlv("Certificate").ok()?;
     Some(der::tlv(der::SEQUENCE, first.content))
 }
 
@@ -207,19 +207,19 @@ fn carried_certificate(signed: &[u8]) -> Option<Vec<u8>> {
 fn signer_id(signed: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let sd = signed_data_content(signed);
     let mut sr = Reader::new(&sd);
-    sr.next("version").unwrap();
-    sr.next("digestAlgorithms").unwrap();
-    sr.next("EncapsulatedContentInfo").unwrap();
-    sr.next("certificates").unwrap();
-    let infos = sr.next("signerInfos").unwrap();
+    sr.next_tlv("version").unwrap();
+    sr.next_tlv("digestAlgorithms").unwrap();
+    sr.next_tlv("EncapsulatedContentInfo").unwrap();
+    sr.next_tlv("certificates").unwrap();
+    let infos = sr.next_tlv("signerInfos").unwrap();
     let mut ir = Reader::new(infos.content);
-    let info = ir.next("SignerInfo").unwrap();
+    let info = ir.next_tlv("SignerInfo").unwrap();
     let mut fr = Reader::new(info.content);
-    fr.next("version").unwrap();
-    let sid = fr.next("IssuerAndSerialNumber").unwrap();
+    fr.next_tlv("version").unwrap();
+    let sid = fr.next_tlv("IssuerAndSerialNumber").unwrap();
     let mut sidr = Reader::new(sid.content);
-    let issuer = sidr.next("issuer").unwrap();
-    let serial = sidr.next("serialNumber").unwrap();
+    let issuer = sidr.next_tlv("issuer").unwrap();
+    let serial = sidr.next_tlv("serialNumber").unwrap();
     (
         der::tlv(der::SEQUENCE, issuer.content),
         serial.content.to_vec(),
@@ -229,19 +229,19 @@ fn signer_id(signed: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// The same, taken from the certificate itself.
 fn certificate_id(cert: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut r = Reader::new(cert);
-    let c = r.next("Certificate").unwrap();
+    let c = r.next_tlv("Certificate").unwrap();
     let mut cr = Reader::new(c.content);
-    let tbs = cr.next("TBSCertificate").unwrap();
+    let tbs = cr.next_tlv("TBSCertificate").unwrap();
     let mut t = Reader::new(tbs.content);
-    let first = t.next("tbs").unwrap();
+    let first = t.next_tlv("tbs").unwrap();
     let mut tail = t;
     let serial = if first.tag == 0xa0 {
-        tail.next("serialNumber").unwrap()
+        tail.next_tlv("serialNumber").unwrap()
     } else {
         first
     };
-    tail.next("signature").unwrap();
-    let issuer = tail.next("issuer").unwrap();
+    tail.next_tlv("signature").unwrap();
+    let issuer = tail.next_tlv("issuer").unwrap();
     (
         der::tlv(der::SEQUENCE, issuer.content),
         serial.content.to_vec(),

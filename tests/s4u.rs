@@ -273,7 +273,7 @@ fn tgs_req_proxy(
 /// The `EncTicketPart` of the ticket in a `TGS-REP`, opened with `key`.
 fn ticket_part(reply: &[u8], key: &Key) -> EncTicketPart {
     let f = der::Fields::parse_app("TGS-REP", 13, reply).expect("a TGS-REP");
-    let ticket = Ticket::decode(f.get(5, "TGS-REP").expect("the ticket")).expect("a Ticket");
+    let ticket = Ticket::decode(f.bytes(5, "TGS-REP").expect("the ticket")).expect("a Ticket");
     let plain = OwnCipher
         .decrypt(key, usage::KDC_REP_TICKET, &ticket.enc.cipher)
         .expect("the ticket opens with the service key");
@@ -282,11 +282,11 @@ fn ticket_part(reply: &[u8], key: &Key) -> EncTicketPart {
 
 fn reply_padata(reply: &[u8]) -> Vec<(i32, Vec<u8>)> {
     let f = der::Fields::parse_app("TGS-REP", 13, reply).expect("a TGS-REP");
-    match f.opt(2) {
+    match f.opt_bytes(2) {
         None => Vec::new(),
         Some(raw) => {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("PA-DATA").expect("a SEQUENCE");
+            let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE");
             msg::decode_pa_data("TGS-REP", seq.content).expect("PA-DATA")
         }
     }
@@ -322,8 +322,8 @@ fn a_service_can_ask_for_a_ticket_in_a_users_name() {
 
     // And the reply states the same name in the clear, which is what a client compares.
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let mut r = der::Reader::new(f.get(4, "TGS-REP").expect("cname"));
-    let seq = r.next("cname").unwrap();
+    let mut r = der::Reader::new(f.bytes(4, "TGS-REP").expect("cname"));
+    let seq = r.next_tlv("cname").unwrap();
     let named = Principal::decode("cname", seq.content, REALM).unwrap();
     assert_eq!(named.components, vec!["alice"]);
 }
@@ -487,7 +487,7 @@ fn the_reply_enc_part_names_the_impersonated_user() {
     assert!(msg::KrbError::decode(&reply).is_err());
 
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let enc = EncryptedData::decode("enc-part", f.get(6, "TGS-REP").expect("enc-part")).unwrap();
+    let enc = EncryptedData::decode("enc-part", f.bytes(6, "TGS-REP").expect("enc-part")).unwrap();
     // The reply part is sealed in the TGT session key, which the test holds.
     let plain = OwnCipher
         .decrypt(&session, usage::TGS_REP_ENCPART_SESSKEY, &enc.cipher)
@@ -543,12 +543,12 @@ fn the_reply_echos_the_s4u_user_id_checksummed_with_the_subkey() {
     );
     // And the checksum is the KDC's: usage 27 over the id, under the subkey.
     let mut r = der::Reader::new(&value);
-    let seq = r.expect("PA-S4U-X509-USER", der::SEQUENCE).unwrap();
+    let seq = r.expect_in("PA-S4U-X509-USER", der::SEQUENCE).unwrap();
     let f = der::Fields::parse("PA-S4U-X509-USER", seq).unwrap();
-    let id = f.get(0, "user-id").unwrap().to_vec();
+    let id = f.bytes(0, "user-id").unwrap().to_vec();
     let expected = OwnCipher.checksum(&subkey, 27, &id).unwrap();
-    let mut cr = der::Reader::new(f.get(1, "checksum").unwrap());
-    let cseq = cr.expect("Checksum", der::SEQUENCE).unwrap();
+    let mut cr = der::Reader::new(f.bytes(1, "checksum").unwrap());
+    let cseq = cr.expect_in("Checksum", der::SEQUENCE).unwrap();
     let cf = der::Fields::parse("Checksum", cseq).unwrap();
     assert_eq!(
         cf.octets(1, "Checksum").unwrap(),
@@ -714,13 +714,13 @@ fn the_proxy_ticket_names_the_user_and_keeps_the_evidence_authtime() {
 
     // The reply's cleartext client is the user.
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let mut r = der::Reader::new(f.get(4, "TGS-REP").expect("cname"));
-    let seq = r.next("cname").unwrap();
+    let mut r = der::Reader::new(f.bytes(4, "TGS-REP").expect("cname"));
+    let seq = r.next_tlv("cname").unwrap();
     let named = Principal::decode("cname", seq.content, REALM).unwrap();
     assert_eq!(named.components, vec!["alice"], "the ticket is the user's");
 
     // And the reply part, sealed in the TGT's session key, carries the evidence's authtime.
-    let enc = EncryptedData::decode("enc-part", f.get(6, "TGS-REP").expect("enc-part")).unwrap();
+    let enc = EncryptedData::decode("enc-part", f.bytes(6, "TGS-REP").expect("enc-part")).unwrap();
     let plain = OwnCipher
         .decrypt(&session, usage::TGS_REP_ENCPART_SESSKEY, &enc.cipher)
         .expect("the reply opens with the TGT's session key");

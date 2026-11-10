@@ -121,7 +121,7 @@ fn encode_state(nonce: &[u8]) -> Vec<u8> {
 
 fn decode_state(state: &[u8]) -> Result<Vec<u8>> {
     let mut r = der::Reader::new(state);
-    let f = der::Fields::parse("OTP state", r.expect("OTP state", der::SEQUENCE)?)?;
+    let f = der::Fields::parse("OTP state", r.expect_in("OTP state", der::SEQUENCE)?)?;
     let version = f.int(0, "OTP state")?;
     if version != 1 {
         return Err(Error::Protocol(format!(
@@ -168,12 +168,15 @@ struct Request2 {
 /// Parses `PA-OTP-REQUEST`, refusing what cannot be answered.
 fn decode_request(value: &[u8]) -> Result<Request2> {
     let mut r = der::Reader::new(value);
-    let f = der::Fields::parse("PA-OTP-REQUEST", r.expect("PA-OTP-REQUEST", der::SEQUENCE)?)?;
-    let enc = f.get(2, "PA-OTP-REQUEST")?;
+    let f = der::Fields::parse(
+        "PA-OTP-REQUEST",
+        r.expect_in("PA-OTP-REQUEST", der::SEQUENCE)?,
+    )?;
+    let enc = f.bytes(2, "PA-OTP-REQUEST")?;
     // `[2]` is an IMPLICIT `EncryptedData`: the tag replaced its SEQUENCE, so what is left is
     // that SEQUENCE's content.
     let nonce_cipher = EncryptedData::decode_content("PA-OTP-REQUEST nonce", enc)?;
-    let raw = f.get(5, "PA-OTP-REQUEST")?;
+    let raw = f.bytes(5, "PA-OTP-REQUEST")?;
     let value = String::from_utf8(raw.to_vec())
         .map_err(|_| Error::Protocol("the OTP value is not UTF-8".into()))?;
     Ok(Request2 {
@@ -276,9 +279,9 @@ impl<V: Verifier> Mechanism for Otp<V> {
             let mut r = der::Reader::new(&nonce);
             let f = der::Fields::parse(
                 "PA-OTP-ENC-REQUEST",
-                r.expect("PA-OTP-ENC-REQUEST", der::SEQUENCE)?,
+                r.expect_in("PA-OTP-ENC-REQUEST", der::SEQUENCE)?,
             )?;
-            f.get(0, "PA-OTP-ENC-REQUEST")?.to_vec()
+            f.bytes(0, "PA-OTP-ENC-REQUEST")?.to_vec()
         };
         if !constant_time_eq(&got, &expected) {
             return Ok(Step::Failed {
@@ -333,29 +336,32 @@ mod tests {
         let nonce = vec![7u8; 32];
         let challenge = encode_challenge(&nonce, Some("cifs/host"));
         let mut r = der::Reader::new(&challenge);
-        let f = der::Fields::parse("challenge", r.expect("challenge", der::SEQUENCE).unwrap())
-            .expect("fields");
+        let f = der::Fields::parse(
+            "challenge",
+            r.expect_in("challenge", der::SEQUENCE).unwrap(),
+        )
+        .expect("fields");
         assert_eq!(
-            f.get(0, "challenge").unwrap(),
+            f.bytes(0, "challenge").unwrap(),
             &nonce[..],
             "the nonce is [0]"
         );
         assert_eq!(
-            f.get(1, "challenge").unwrap(),
+            f.bytes(1, "challenge").unwrap(),
             b"cifs/host",
             "the service is [1]"
         );
         // `[2]` is the concatenated token infos, and each one is a real SEQUENCE.
-        let mut tokens = der::Reader::new(f.get(2, "challenge").unwrap());
+        let mut tokens = der::Reader::new(f.bytes(2, "challenge").unwrap());
         let token = der::Fields::parse(
             "OTP-TOKENINFO",
-            tokens.expect("token", der::SEQUENCE).unwrap(),
+            tokens.expect_in("token", der::SEQUENCE).unwrap(),
         )
         .expect("token fields");
         assert!(tokens.is_empty(), "exactly one token");
         // The flags say "no PIN", which is what makes the client send a value instead of asking
         // for one: `collect-pin` is the bit that would change its behaviour.
-        let flags = token.get(0, "OTP-TOKENINFO").unwrap();
+        let flags = token.bytes(0, "OTP-TOKENINFO").unwrap();
         let value = u32::from_be_bytes([flags[1], flags[2], flags[3], flags[4]]);
         assert_eq!(value & OTP_FLAG_COLLECT_PIN, 0);
         assert_eq!(
@@ -391,10 +397,13 @@ mod tests {
         let announced = otp.announce(&request).unwrap().expect("armored");
 
         let mut r = der::Reader::new(&announced.padata);
-        let f = der::Fields::parse("challenge", r.expect("challenge", der::SEQUENCE).unwrap())
-            .expect("fields");
+        let f = der::Fields::parse(
+            "challenge",
+            r.expect_in("challenge", der::SEQUENCE).unwrap(),
+        )
+        .expect("fields");
         assert_eq!(
-            f.get(1, "challenge").unwrap(),
+            f.bytes(1, "challenge").unwrap(),
             b"cifs/files.example.com",
             "the service the token is for is [1]"
         );

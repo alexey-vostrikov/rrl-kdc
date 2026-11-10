@@ -64,13 +64,13 @@ impl EncApRepPart {
     pub fn decode(data: &[u8]) -> Result<Self> {
         let f = Fields::parse_app("EncAPRepPart", ENC_AP_REP_PART, data)?;
         Ok(EncApRepPart {
-            ctime: as_time("EncAPRepPart.ctime", f.get(0, "EncAPRepPart")?)?,
+            ctime: as_time("EncAPRepPart.ctime", f.bytes(0, "EncAPRepPart")?)?,
             cusec: f.u32(1, "EncAPRepPart")?,
-            subkey: match f.opt(2) {
+            subkey: match f.opt_bytes(2) {
                 None => None,
                 Some(_) => {
-                    let mut r = Reader::new(f.get(2, "EncAPRepPart")?);
-                    Some(decode_key(r.expect("EncAPRepPart", der::SEQUENCE)?)?)
+                    let mut r = Reader::new(f.bytes(2, "EncAPRepPart")?);
+                    Some(decode_key(r.expect_in("EncAPRepPart", der::SEQUENCE)?)?)
                 }
             },
             seq_number: f.opt_int(3, "EncAPRepPart")?.map(|v| v as u32),
@@ -118,11 +118,11 @@ impl ApRep {
                 "AP-REP msg-type is {msg_type}, expected {AP_REP}"
             )));
         }
-        let mut r = Reader::new(f.get(2, "AP-REP")?);
+        let mut r = Reader::new(f.bytes(2, "AP-REP")?);
         Ok(ApRep {
             enc_part: EncryptedData::decode_content(
                 "AP-REP.enc-part",
-                r.expect("AP-REP", der::SEQUENCE)?,
+                r.expect_in("AP-REP", der::SEQUENCE)?,
             )?,
         })
     }
@@ -170,22 +170,22 @@ impl EncKrbPrivPart {
         Ok(EncKrbPrivPart {
             user_data: f.octets(0, "EncKrbPrivPart")?.to_vec(),
             timestamp: f
-                .opt(1)
+                .opt_bytes(1)
                 .map(|_| {
                     as_time(
                         "EncKrbPrivPart.timestamp",
-                        f.get(1, "EncKrbPrivPart").unwrap(),
+                        f.bytes(1, "EncKrbPrivPart").unwrap(),
                     )
                 })
                 .transpose()?,
             usec: f.opt_int(2, "EncKrbPrivPart")?.map(|v| v as u32),
             seq_number: f.opt_int(3, "EncKrbPrivPart")?.map(|v| v as u32),
-            s_address: match f.opt(4) {
+            s_address: match f.opt_bytes(4) {
                 None => None,
                 Some(_) => {
-                    let mut r = Reader::new(f.get(4, "EncKrbPrivPart")?);
+                    let mut r = Reader::new(f.bytes(4, "EncKrbPrivPart")?);
                     Some(HostAddress::decode_content(
-                        r.expect("EncKrbPrivPart", der::SEQUENCE)?,
+                        r.expect_in("EncKrbPrivPart", der::SEQUENCE)?,
                     )?)
                 }
             },
@@ -232,9 +232,11 @@ pub fn open_krb_priv(
             "KRB-PRIV msg-type is {msg_type}, expected {KRB_PRIV}"
         )));
     }
-    let mut r = Reader::new(f.get(3, "KRB-PRIV")?);
-    let enc =
-        EncryptedData::decode_content("KRB-PRIV.enc-part", r.expect("KRB-PRIV", der::SEQUENCE)?)?;
+    let mut r = Reader::new(f.bytes(3, "KRB-PRIV")?);
+    let enc = EncryptedData::decode_content(
+        "KRB-PRIV.enc-part",
+        r.expect_in("KRB-PRIV", der::SEQUENCE)?,
+    )?;
     let plain = cipher
         .decrypt(key, usage::KRB_PRIV_ENCPART, &enc.cipher)
         .map_err(|_| {
@@ -276,10 +278,10 @@ impl ChangePasswdData {
         let mut r = Reader::new(data);
         let f = Fields::parse(
             "ChangePasswdData",
-            r.expect("ChangePasswdData", der::SEQUENCE)?,
+            r.expect_in("ChangePasswdData", der::SEQUENCE)?,
         )?;
         let new_password = f.octets(0, "ChangePasswdData")?.to_vec();
-        let target = match (f.opt(1), f.opt(2)) {
+        let target = match (f.opt_bytes(1), f.opt_bytes(2)) {
             (None, _) => None,
             (Some(_), None) => {
                 return Err(Error::Protocol(

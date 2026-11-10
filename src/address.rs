@@ -97,7 +97,7 @@ impl HostAddress {
     /// Decodes one whole `HostAddress` SEQUENCE, tag included.
     pub fn decode(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        HostAddress::decode_content(r.expect("HostAddress", der::SEQUENCE)?)
+        HostAddress::decode_content(r.expect_in("HostAddress", der::SEQUENCE)?)
     }
 }
 
@@ -110,12 +110,12 @@ impl HostAddresses {
     /// which is what a `KDC-REQ-BODY`'s `[9]` carries.
     pub fn decode(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        let content = r.expect("HostAddresses", der::SEQUENCE)?;
+        let content = r.expect_in("HostAddresses", der::SEQUENCE)?;
         let mut s = Reader::new(content);
         let mut out = Vec::new();
         while !s.is_empty() {
             out.push(HostAddress::decode_content(
-                s.expect("HostAddresses", der::SEQUENCE)?,
+                s.expect_in("HostAddresses", der::SEQUENCE)?,
             )?);
         }
         Ok(HostAddresses(out))

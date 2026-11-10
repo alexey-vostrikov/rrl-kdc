@@ -162,16 +162,19 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
 pub fn decode(data: &[u8]) -> Result<HdbEntry> {
     let ctx = "HdbEntry";
     let mut r = Reader::new(data);
-    let f = Fields::parse(ctx, r.expect(ctx, der::SEQUENCE)?)?;
+    let f = Fields::parse(ctx, r.expect_in(ctx, der::SEQUENCE)?)?;
 
-    let mut pr = Reader::new(f.get(0, ctx)?);
-    let pf = Fields::parse(ctx, pr.expect(ctx, der::SEQUENCE)?)?;
+    let mut pr = Reader::new(f.bytes(0, ctx)?);
+    let pf = Fields::parse(ctx, pr.expect_in(ctx, der::SEQUENCE)?)?;
     let name_type = pf.int(0, ctx)? as i32;
-    let mut cr = Reader::new(pf.get(1, ctx)?);
+    let mut cr = Reader::new(pf.bytes(1, ctx)?);
     let mut components = Vec::new();
-    let mut cs = Reader::new(cr.expect(ctx, der::SEQUENCE)?);
+    let mut cs = Reader::new(cr.expect_in(ctx, der::SEQUENCE)?);
     while !cs.is_empty() {
-        components.push(der::as_string(ctx, cs.expect(ctx, der::GENERAL_STRING)?)?);
+        components.push(der::as_string(
+            ctx,
+            cs.expect_in(ctx, der::GENERAL_STRING)?,
+        )?);
     }
     let realm = pf.string(2, ctx)?;
     if components.is_empty() {
@@ -183,14 +186,14 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         realm,
     };
 
-    let mut kr = Reader::new(f.get(1, ctx)?);
-    let mut ks = Reader::new(kr.expect(ctx, der::SEQUENCE)?);
+    let mut kr = Reader::new(f.bytes(1, ctx)?);
+    let mut ks = Reader::new(kr.expect_in(ctx, der::SEQUENCE)?);
     let mut keys = Vec::new();
     while !ks.is_empty() {
-        let kf = Fields::parse(ctx, ks.expect(ctx, der::SEQUENCE)?)?;
+        let kf = Fields::parse(ctx, ks.expect_in(ctx, der::SEQUENCE)?)?;
         let kvno = kf.u32(0, ctx)?;
-        let mut er = Reader::new(kf.get(1, ctx)?);
-        let ef = Fields::parse(ctx, er.expect(ctx, der::SEQUENCE)?)?;
+        let mut er = Reader::new(kf.bytes(1, ctx)?);
+        let ef = Fields::parse(ctx, er.expect_in(ctx, der::SEQUENCE)?)?;
         let id = ef.int(0, ctx)? as i32;
         let enctype = Enctype::from_id(id)
             .ok_or_else(|| Error::Hdb(format!("{ctx}: enctype {id} is not implemented")))?;
@@ -203,18 +206,17 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
     }
 
     let time_field = |n: u8| -> Result<Option<i64>> {
-        match f.opt(n) {
+        match f.opt_bytes(n) {
             None => Ok(None),
             Some(_) => {
-                let mut r = Reader::new(f.get(n, ctx)?);
+                let mut r = Reader::new(f.bytes(n, ctx)?);
                 let text = der::as_string(
                     ctx,
-                    r.expect(ctx, der::GENERALIZED_TIME)
-                        .map_err(|_| crate::der::DerError {
-                            context: ctx,
-                            detail: format!("field [{n}] is not a KerberosTime"),
-                        })?,
-                )?;
+                    r.expect_in(ctx, der::GENERALIZED_TIME).map_err(|_| {
+                        crate::der::DerError(format!("{ctx}: field [{n}] is not a KerberosTime"))
+                    })?,
+                )
+                .map_err(|e| Error::Hdb(e.0))?;
                 crate::time::parse_generalized_time(&text)
                     .map(Some)
                     .ok_or_else(|| Error::Hdb(format!("{ctx}: {text:?} is not a KerberosTime")))
@@ -227,14 +229,14 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
     // `Some([])` and absent are different states and both are written, so the
     // decoder must keep the difference rather than collapsing to `None`.
     let etypes_field = || -> Result<Option<Vec<Enctype>>> {
-        if f.opt(9).is_none() {
+        if f.opt_bytes(9).is_none() {
             return Ok(None);
         }
-        let mut r = Reader::new(f.get(9, ctx)?);
-        let mut inner = Reader::new(r.expect(ctx, der::SEQUENCE)?);
+        let mut r = Reader::new(f.bytes(9, ctx)?);
+        let mut inner = Reader::new(r.expect_in(ctx, der::SEQUENCE)?);
         let mut out = Vec::new();
         while !inner.is_empty() {
-            let content = inner.expect(ctx, der::INTEGER)?;
+            let content = inner.expect_in(ctx, der::INTEGER)?;
             let raw = der::as_int(ctx, content)?;
             let enctype = Enctype::from_id(raw as i32).ok_or_else(|| {
                 Error::Hdb(format!(
@@ -283,29 +285,31 @@ fn constrained_delegation(
     ctx: &'static str,
     realm: &str,
 ) -> Result<Option<Vec<Principal>>> {
-    if f.opt(13).is_none() {
+    if f.opt_bytes(13).is_none() {
         return Ok(None);
     }
-    let mut r = Reader::new(f.get(13, ctx)?);
-    let mut list = Reader::new(r.expect(ctx, der::SEQUENCE)?);
+    let mut r = Reader::new(f.bytes(13, ctx)?);
+    let mut list = Reader::new(r.expect_in(ctx, der::SEQUENCE)?);
     while !list.is_empty() {
-        let ef = Fields::parse(ctx, list.expect(ctx, der::SEQUENCE)?)?;
+        let ef = Fields::parse(ctx, list.expect_in(ctx, der::SEQUENCE)?)?;
         // The other extensions (PKINIT's, password, aliases) are not decoded here and are
         // skipped rather than refused: an entry written by a foreign tool would otherwise be
         // unreadable for a field this KDC has no use for.
-        let Some(_) = ef.opt(1) else { continue };
-        let mut dr = Reader::new(ef.get(1, ctx)?);
-        let choice = Fields::parse(ctx, dr.expect(ctx, der::SEQUENCE)?)?;
-        let Some(_) = choice.opt(2) else { continue };
-        let mut ar = Reader::new(choice.get(2, ctx)?);
-        let mut acl = Reader::new(ar.expect(ctx, der::SEQUENCE)?);
+        let Some(_) = ef.opt_bytes(1) else { continue };
+        let mut dr = Reader::new(ef.bytes(1, ctx)?);
+        let choice = Fields::parse(ctx, dr.expect_in(ctx, der::SEQUENCE)?)?;
+        let Some(_) = choice.opt_bytes(2) else {
+            continue;
+        };
+        let mut ar = Reader::new(choice.bytes(2, ctx)?);
+        let mut acl = Reader::new(ar.expect_in(ctx, der::SEQUENCE)?);
         let mut out = Vec::new();
         while !acl.is_empty() {
             // `Principal` in `krb5.asn1` carries no realm: a delegation target is named in this
             // entry's own realm, which is also what Heimdal's ACLs mean.
             out.push(Principal::decode(
                 ctx,
-                acl.expect(ctx, der::SEQUENCE)?,
+                acl.expect_in(ctx, der::SEQUENCE)?,
                 realm,
             )?);
         }

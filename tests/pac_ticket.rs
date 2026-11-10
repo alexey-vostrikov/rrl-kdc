@@ -189,7 +189,7 @@ fn ticket_part(reply: &[u8], key: &Key) -> EncTicketPart {
     // itself from the whole TLV. There is no reply decoder in the crate because
     // nothing in it needs one — a client does.
     let fields = der::Fields::parse_app("TGS-REP", 13, reply).expect("a TGS-REP");
-    let ticket = Ticket::decode(fields.get(5, "TGS-REP").expect("the ticket")).expect("a Ticket");
+    let ticket = Ticket::decode(fields.bytes(5, "TGS-REP").expect("the ticket")).expect("a Ticket");
     let plain = OwnCipher
         .decrypt(key, usage::KDC_REP_TICKET, &ticket.enc.cipher)
         .expect("the ticket opens with the service key");

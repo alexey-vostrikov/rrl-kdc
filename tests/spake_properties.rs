@@ -101,15 +101,15 @@ fn challenge_of(reply: &[u8]) -> Vec<u8> {
 /// The `T` inside a challenge: `[1] { [0]=group [1]=octets [2]=factors }`.
 fn public_of(challenge: &[u8]) -> Vec<u8> {
     let mut r = der::Reader::new(challenge);
-    let inner = r.expect("challenge", der::ctx(1)).expect("challenge");
+    let inner = r.expect_in("challenge", der::ctx(1)).expect("challenge");
     let mut sr = der::Reader::new(inner);
     let f = der::Fields::parse(
         "SPAKEChallenge",
-        sr.expect("challenge", der::SEQUENCE).unwrap(),
+        sr.expect_in("challenge", der::SEQUENCE).unwrap(),
     )
     .expect("fields");
-    let mut pr = der::Reader::new(f.get(1, "challenge").expect("pubkey"));
-    pr.expect("pubkey", der::OCTET_STRING)
+    let mut pr = der::Reader::new(f.bytes(1, "challenge").expect("pubkey"));
+    pr.expect_in("pubkey", der::OCTET_STRING)
         .expect("octets")
         .to_vec()
 }

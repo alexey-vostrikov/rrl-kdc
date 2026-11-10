@@ -225,11 +225,11 @@ fn oid_content(text: &str) -> Vec<u8> {
 
 fn rep_padata(reply: &[u8]) -> Vec<(i32, Vec<u8>)> {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
-    match f.opt(2) {
+    match f.opt_bytes(2) {
         None => Vec::new(),
         Some(raw) => {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("PA-DATA").expect("a SEQUENCE");
+            let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE");
             msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
         }
     }
@@ -253,8 +253,8 @@ fn an_anonymous_request_gets_a_ticket_that_names_nobody() {
         "an anonymous reply names the anonymous realm"
     );
 
-    let mut r = der::Reader::new(f.get(4, "AS-REP").expect("cname"));
-    let seq = r.next("cname").expect("a SEQUENCE");
+    let mut r = der::Reader::new(f.bytes(4, "AS-REP").expect("cname"));
+    let seq = r.next_tlv("cname").expect("a SEQUENCE");
     let cname = Principal::decode("cname", seq.content, &crealm).expect("a principal");
     assert_eq!(cname.components, vec!["WELLKNOWN", "ANONYMOUS"]);
     assert_eq!(
@@ -264,7 +264,7 @@ fn an_anonymous_request_gets_a_ticket_that_names_nobody() {
     );
 
     // The ticket itself carries the anonymous flag.
-    let ticket = msg::Ticket::decode(f.get(5, "AS-REP").expect("the ticket")).expect("a Ticket");
+    let ticket = msg::Ticket::decode(f.bytes(5, "AS-REP").expect("the ticket")).expect("a Ticket");
     let mut entry = HdbEntry::krbtgt(REALM);
     for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
         entry
@@ -300,7 +300,7 @@ fn an_anonymous_ticket_carries_no_identity_in_authorization_data() {
     assert!(msg::KrbError::decode(&reply).is_err());
 
     let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
-    let ticket = msg::Ticket::decode(f.get(5, "AS-REP").expect("the ticket")).expect("a Ticket");
+    let ticket = msg::Ticket::decode(f.bytes(5, "AS-REP").expect("the ticket")).expect("a Ticket");
     let mut entry = HdbEntry::krbtgt(REALM);
     for e in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
         entry
@@ -324,38 +324,40 @@ fn an_anonymous_ticket_carries_no_identity_in_authorization_data() {
 /// The KDC's public value out of a `DHRepInfo`, as a client reads it.
 fn kdc_public_value(pa_value: &[u8]) -> Vec<u8> {
     let mut r = der::Reader::new(pa_value);
-    let dh_info = r.next("PA-PK-AS-REP").expect("the choice");
+    let dh_info = r.next_tlv("PA-PK-AS-REP").expect("the choice");
     assert_eq!(dh_info.tag, der::ctx(0), "dhInfo [0]");
     let mut ir = der::Reader::new(dh_info.content);
-    let seq = ir.next("DHRepInfo").expect("a SEQUENCE");
+    let seq = ir.next_tlv("DHRepInfo").expect("a SEQUENCE");
     let mut sr = der::Reader::new(seq.content);
-    let signed_tlv = sr.next("dhSignedData").expect("dhSignedData");
+    let signed_tlv = sr.next_tlv("dhSignedData").expect("dhSignedData");
     let mut dr = der::Reader::new(signed_tlv.content);
-    let octets = dr.next("OCTET STRING").expect("an OCTET STRING");
+    let octets = dr.next_tlv("OCTET STRING").expect("an OCTET STRING");
 
     let mut cr = der::Reader::new(octets.content);
-    let ci = cr.next("ContentInfo").expect("a ContentInfo");
+    let ci = cr.next_tlv("ContentInfo").expect("a ContentInfo");
     let mut cir = der::Reader::new(ci.content);
-    cir.next("contentType").expect("the OID");
-    let wrapped = cir.next("content").expect("the content");
+    cir.next_tlv("contentType").expect("the OID");
+    let wrapped = cir.next_tlv("content").expect("the content");
     let mut wr = der::Reader::new(wrapped.content);
-    let sd = wr.next("SignedData").expect("a SignedData");
+    let sd = wr.next_tlv("SignedData").expect("a SignedData");
     let mut sdr = der::Reader::new(sd.content);
-    sdr.next("version").unwrap();
-    sdr.next("digestAlgorithms").unwrap();
-    let encap = sdr.next("EncapsulatedContentInfo").unwrap();
+    sdr.next_tlv("version").unwrap();
+    sdr.next_tlv("digestAlgorithms").unwrap();
+    let encap = sdr.next_tlv("EncapsulatedContentInfo").unwrap();
     let mut er = der::Reader::new(encap.content);
-    er.next("eContentType").unwrap();
-    let econtent = er.next("eContent").unwrap();
+    er.next_tlv("eContentType").unwrap();
+    let econtent = er.next_tlv("eContent").unwrap();
     let mut ecr = der::Reader::new(econtent.content);
-    let info_octets = ecr.next("OCTET STRING").expect("the KDCDHKeyInfo octets");
+    let info_octets = ecr
+        .next_tlv("OCTET STRING")
+        .expect("the KDCDHKeyInfo octets");
 
     let mut kr = der::Reader::new(info_octets.content);
-    let info = kr.next("KDCDHKeyInfo").expect("a SEQUENCE");
+    let info = kr.next_tlv("KDCDHKeyInfo").expect("a SEQUENCE");
     let mut krr = der::Reader::new(info.content);
-    let key_tlv = krr.next("subjectPublicKey").expect("the key");
+    let key_tlv = krr.next_tlv("subjectPublicKey").expect("the key");
     let mut br = der::Reader::new(key_tlv.content);
-    let bits = br.next("BIT STRING").expect("a BIT STRING");
+    let bits = br.next_tlv("BIT STRING").expect("a BIT STRING");
     bits.content[1..].to_vec()
 }
 
@@ -390,7 +392,7 @@ fn the_reply_proves_the_session_key_was_contributed_to_by_both_sides() {
         .expect("an anonymous reply must carry PA-PKINIT-KX");
 
     let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
-    let enc_part = msg::EncryptedData::decode("enc-part", f.get(6, "AS-REP").expect("enc-part"))
+    let enc_part = msg::EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
         .expect("an EncryptedData");
 
     // The client's half of the exchange, done as a client does it.
@@ -421,7 +423,7 @@ fn the_reply_proves_the_session_key_was_contributed_to_by_both_sides() {
         .expect("PA-PKINIT-KX opens under the reply key");
     // `decode_key` takes the content of the `EncryptionKey` SEQUENCE, not the TLV.
     let mut kxr = der::Reader::new(&kx_plain);
-    let key_seq = kxr.next("EncryptionKey").expect("a SEQUENCE");
+    let key_seq = kxr.next_tlv("EncryptionKey").expect("a SEQUENCE");
     let contribution = msg::decode_key(key_seq.content).expect("an EncryptionKey");
     let expected = rust_kdc::crypto::kdf::cf2(
         contribution.bytes(),

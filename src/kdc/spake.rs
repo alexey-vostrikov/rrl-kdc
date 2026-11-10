@@ -236,16 +236,16 @@ fn derive_key(
 /// The `SPAKESupport` a client sent: the groups it prefers, in order.
 fn decode_support(value: &[u8]) -> Result<Vec<i32>> {
     let mut r = der::Reader::new(value);
-    let content = r.expect("SPAKESupport", der::ctx(0))?;
+    let content = r.expect_in("SPAKESupport", der::ctx(0))?;
     let mut sr = der::Reader::new(content);
-    let inner = sr.expect("SPAKESupport", der::SEQUENCE)?;
+    let inner = sr.expect_in("SPAKESupport", der::SEQUENCE)?;
     let f = der::Fields::parse("SPAKESupport", inner)?;
-    let mut gr = der::Reader::new(f.get(0, "SPAKESupport")?);
-    let groups = gr.expect("SPAKESupport", der::SEQUENCE)?;
+    let mut gr = der::Reader::new(f.bytes(0, "SPAKESupport")?);
+    let groups = gr.expect_in("SPAKESupport", der::SEQUENCE)?;
     let mut out = Vec::new();
     let mut g = der::Reader::new(groups);
     while !g.is_empty() {
-        out.push(int_of(g.expect("SPAKESupport", der::INTEGER)?)?);
+        out.push(int_of(g.expect_in("SPAKESupport", der::INTEGER)?)?);
     }
     Ok(out)
 }
@@ -290,13 +290,16 @@ struct Response {
 
 fn decode_response(value: &[u8]) -> Result<Response> {
     let mut r = der::Reader::new(value);
-    let content = r.expect("SPAKEResponse", der::ctx(2))?;
+    let content = r.expect_in("SPAKEResponse", der::ctx(2))?;
     let mut sr = der::Reader::new(content);
-    let f = der::Fields::parse("SPAKEResponse", sr.expect("SPAKEResponse", der::SEQUENCE)?)?;
-    let mut pr = der::Reader::new(f.get(0, "SPAKEResponse")?);
-    let pubkey = pr.expect("SPAKEResponse", der::OCTET_STRING)?.to_vec();
+    let f = der::Fields::parse(
+        "SPAKEResponse",
+        sr.expect_in("SPAKEResponse", der::SEQUENCE)?,
+    )?;
+    let mut pr = der::Reader::new(f.bytes(0, "SPAKEResponse")?);
+    let pubkey = pr.expect_in("SPAKEResponse", der::OCTET_STRING)?.to_vec();
     let factor =
-        crate::msg::EncryptedData::decode("SPAKEResponse factor", f.get(1, "SPAKEResponse")?)?;
+        crate::msg::EncryptedData::decode("SPAKEResponse factor", f.bytes(1, "SPAKEResponse")?)?;
     Ok(Response { pubkey, factor })
 }
 
@@ -324,7 +327,7 @@ impl Pending {
 
     fn decode(state: &[u8]) -> Result<Pending> {
         let mut r = der::Reader::new(state);
-        let f = der::Fields::parse("SPAKE state", r.expect("SPAKE state", der::SEQUENCE)?)?;
+        let f = der::Fields::parse("SPAKE state", r.expect_in("SPAKE state", der::SEQUENCE)?)?;
         let group = f.int(0, "SPAKE state")? as i32;
         if group != GROUP_EDWARDS25519 {
             return Err(Error::Protocol(format!(
@@ -359,7 +362,7 @@ impl Spake {
         let mut r = der::Reader::new(plain);
         let f = der::Fields::parse(
             "SPAKESecondFactor",
-            r.expect("SPAKESecondFactor", der::SEQUENCE)?,
+            r.expect_in("SPAKESecondFactor", der::SEQUENCE)?,
         )?;
         Ok(f.int(0, "SPAKESecondFactor")?)
     }
@@ -383,7 +386,7 @@ impl Mechanism for Spake {
 
     fn round(&self, request: &Request<'_>, state: &[u8], padata: &[u8]) -> Result<Step> {
         let mut r = der::Reader::new(padata);
-        let tag = r.next("PA-SPAKE")?.tag;
+        let tag = r.next_tlv("PA-SPAKE")?.tag;
         if tag == der::ctx(0) {
             return challenge(request, padata);
         }

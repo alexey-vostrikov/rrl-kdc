@@ -326,7 +326,7 @@ fn the_reply_is_sealed_with_the_key_the_mechanism_produced() {
     );
 
     let f = der::Fields::parse_app("AS-REP", 11, &second).expect("an AS-REP");
-    let sealed = EncryptedData::decode("enc-part", f.get(6, "AS-REP").expect("enc-part"))
+    let sealed = EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
         .expect("an EncryptedData");
     let opened = OwnCipher.decrypt(
         &stub_reply_key(),
@@ -342,8 +342,8 @@ fn the_reply_is_sealed_with_the_key_the_mechanism_produced() {
     // it to finish: `encdata` is where the KDC proves it took part.
     let padata = msg::decode_pa_data(
         "AS-REP padata",
-        der::Reader::new(f.get(2, "AS-REP").expect("padata"))
-            .expect("padata", der::SEQUENCE)
+        der::Reader::new(f.bytes(2, "AS-REP").expect("padata"))
+            .expect_in("padata", der::SEQUENCE)
             .expect("a SEQUENCE"),
     )
     .expect("AS-REP padata decodes");
@@ -546,7 +546,7 @@ fn a_ticket_from_a_finished_mechanism_is_marked_pre_authenticated() {
 
     // The flags travel in the ticket, sealed with `krbtgt`'s key.
     let f = der::Fields::parse_app("AS-REP", 11, &second).expect("an AS-REP");
-    let ticket = msg::Ticket::decode(f.get(5, "AS-REP").expect("ticket")).expect("a Ticket");
+    let ticket = msg::Ticket::decode(f.bytes(5, "AS-REP").expect("ticket")).expect("a Ticket");
     let krbtgt = {
         let cipher = OwnCipher;
         let mut entry = HdbEntry::krbtgt(REALM);

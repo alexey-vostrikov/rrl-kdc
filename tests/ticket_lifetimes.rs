@@ -168,7 +168,7 @@ fn tgs_req(ticket: &[u8], session_key: &Key, till: i64) -> Vec<u8> {
 /// The `EncTGSRepPart` of a reply, opened with the TGT's session key.
 fn rep_part(reply: &[u8], session_key: &Key) -> EncKdcRepPart {
     let f = der::Fields::parse_app("TGS-REP", 13, reply).expect("a TGS-REP");
-    let enc = EncryptedData::decode("enc-part", f.get(6, "TGS-REP").expect("enc-part"))
+    let enc = EncryptedData::decode("enc-part", f.bytes(6, "TGS-REP").expect("enc-part"))
         .expect("an EncryptedData");
     let plain = OwnCipher
         .decrypt(session_key, usage::TGS_REP_ENCPART_SESSKEY, &enc.cipher)
@@ -264,7 +264,7 @@ fn as_req(till: i64) -> Vec<u8> {
 /// The `EncASRepPart` of an AS-REP, opened with `key`.
 fn as_rep_part(reply: &[u8], key: &Key) -> EncKdcRepPart {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
-    let enc = EncryptedData::decode("enc-part", f.get(6, "AS-REP").expect("enc-part"))
+    let enc = EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
         .expect("an EncryptedData");
     let plain = OwnCipher
         .decrypt(key, usage::AS_REP_ENCPART, &enc.cipher)

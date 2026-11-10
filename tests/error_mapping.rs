@@ -18,10 +18,8 @@ use rust_kdc::error::{Error, codes};
 /// One value of every variant, so the table below cannot silently miss one.
 fn all_variants() -> Vec<Error> {
     vec![
-        Error::Der(DerError {
-            context: "TGS-REQ",
-            detail: "expected tag 0x1b, got 0x30".into(),
-        }),
+        Error::Der(DerError("TGS-REQ: expected tag 0x1b, got 0x30".into())),
+        Error::Krb(rrl_krb::Error::Protocol("a shared-crate failure".into())),
         Error::UnsupportedEnctype(23),
         Error::KeyLength {
             enctype: Enctype::Aes256Sha1,

@@ -259,8 +259,8 @@ pub fn read_reply(reply: &[u8], key: &Key, usage: u32) -> EncKdcRepPart {
             msg::KrbError::decode(reply).map(|e| (e.code, e.e_text))
         )
     });
-    let mut r = rust_kdc::der::Reader::new(f.get(6, "TGS-REP").unwrap());
-    let content = r.expect("enc-part", der::SEQUENCE).unwrap();
+    let mut r = rust_kdc::der::Reader::new(f.bytes(6, "TGS-REP").unwrap());
+    let content = r.expect_in("enc-part", der::SEQUENCE).unwrap();
     let enc = EncryptedData::decode_content("enc-part", content).unwrap();
     let plain = OwnCipher
         .decrypt(key, usage, &enc.cipher)

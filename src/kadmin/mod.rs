@@ -55,6 +55,7 @@ use xdr::{Reader, Writer};
 /// The `kadmin/admin` principal of `realm` — the service a client's ticket is for.
 pub fn service_principal(realm: &str) -> Result<Principal> {
     Principal::parse(&format!("kadmin/admin@{realm}"))
+        .map_err(Error::from)
 }
 
 /// The `kadmin/admin` entry a realm needs, keyed with `password`.
@@ -530,9 +531,9 @@ fn unwrap_initial_context_token(token: &[u8]) -> Result<&[u8]> {
         return Ok(token);
     }
     let mut outer = Reader::new(token);
-    let body = outer.expect("GSS", app(0))?;
+    let body = outer.expect_in("GSS", app(0))?;
     let mut inner = Reader::new(body);
-    let oid = inner.expect("GSS", OID_TAG)?;
+    let oid = inner.expect_in("GSS", OID_TAG)?;
     if oid != KRB5_MECHANISM {
         return Err(Error::Protocol(
             "GSS: the initial context token is for another mechanism".into(),

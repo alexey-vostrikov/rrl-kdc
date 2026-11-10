@@ -213,7 +213,7 @@ impl ArmoredRequest {
     /// is an `OCTET STRING` holding the whole encoded choice.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let choice = r.next("PA-FX-FAST-REQUEST")?;
+        let choice = r.next_tlv("PA-FX-FAST-REQUEST")?;
         if choice.tag != 0xa0 {
             return Err(Error::Protocol(format!(
                 "PA-FX-FAST-REQUEST is {:#04x}, and only armored-data [0] is defined",
@@ -223,7 +223,7 @@ impl ArmoredRequest {
         // The CHOICE's content is the `KrbFastArmoredReq` SEQUENCE itself, so its own
         // tag and length come before the fields.
         let mut inside = Reader::new(choice.content);
-        let sequence = inside.next("KrbFastArmoredReq")?;
+        let sequence = inside.next_tlv("KrbFastArmoredReq")?;
         if sequence.tag != der::SEQUENCE {
             return Err(Error::Protocol(format!(
                 "KrbFastArmoredReq is {:#04x}, not a SEQUENCE",
@@ -235,13 +235,13 @@ impl ArmoredRequest {
         // which `unwrap` refuses by name. A present-but-malformed armor is a
         // different matter and is refused here: a client that sent something is not
         // a client that sent nothing.
-        let armor = match f.opt(0) {
+        let armor = match f.opt_bytes(0) {
             None => None,
             Some(raw) => {
                 let inner = Fields::parse("KrbFastArmor", inner_sequence("KrbFastArmor", raw)?)?;
                 Some(Armor {
                     armor_type: inner.int(0, "KrbFastArmor")? as i32,
-                    armor_value: inner_octets("armor-value", inner.get(1, "KrbFastArmor")?)?
+                    armor_value: inner_octets("armor-value", inner.bytes(1, "KrbFastArmor")?)?
                         .to_vec(),
                 })
             }
@@ -250,7 +250,7 @@ impl ArmoredRequest {
             "Checksum",
             inner_sequence(
                 "Checksum",
-                f.opt(1)
+                f.opt_bytes(1)
                     .ok_or_else(|| Error::Protocol("PA-FX-FAST without req-checksum".into()))?,
             )?,
         )?;
@@ -258,9 +258,9 @@ impl ArmoredRequest {
             armor,
             req_checksum: (
                 checksum.int(0, "Checksum")? as i32,
-                inner_octets("Checksum.checksum", checksum.get(1, "Checksum")?)?.to_vec(),
+                inner_octets("Checksum.checksum", checksum.bytes(1, "Checksum")?)?.to_vec(),
             ),
-            enc_fast_req: f.get(2, "enc-fast-req")?.to_vec(),
+            enc_fast_req: f.bytes(2, "enc-fast-req")?.to_vec(),
         })
     }
 
@@ -301,7 +301,7 @@ impl ArmoredRequest {
 /// the field's content as the value is off by two octets in every case here.
 fn inner_octets<'a>(context: &'static str, raw: &'a [u8]) -> Result<&'a [u8]> {
     let mut r = Reader::new(raw);
-    let octets = r.next(context)?;
+    let octets = r.next_tlv(context)?;
     if octets.tag != der::OCTET_STRING {
         return Err(Error::Protocol(format!(
             "{context} is {:#04x}, not an OCTET STRING",
@@ -313,7 +313,7 @@ fn inner_octets<'a>(context: &'static str, raw: &'a [u8]) -> Result<&'a [u8]> {
 
 fn inner_sequence<'a>(context: &'static str, raw: &'a [u8]) -> Result<&'a [u8]> {
     let mut r = Reader::new(raw);
-    let sequence = r.next(context)?;
+    let sequence = r.next_tlv(context)?;
     if sequence.tag != der::SEQUENCE {
         return Err(Error::Protocol(format!(
             "{context} is {:#04x}, not a SEQUENCE",
@@ -339,21 +339,21 @@ impl FastRequest {
     /// Decodes a decrypted `KrbFastReq`.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let seq = r.next("KrbFastReq")?;
+        let seq = r.next_tlv("KrbFastReq")?;
         if seq.tag != der::SEQUENCE {
             return Err(Error::Protocol("KrbFastReq is not a SEQUENCE".into()));
         }
         let f = Fields::parse("KrbFastReq", seq.content)?;
-        let mut p = Reader::new(f.get(1, "KrbFastReq")?);
+        let mut p = Reader::new(f.bytes(1, "KrbFastReq")?);
         let padata =
-            crate::msg::decode_pa_data("KrbFastReq", p.expect("KrbFastReq", der::SEQUENCE)?)?;
+            crate::msg::decode_pa_data("KrbFastReq", p.expect_in("KrbFastReq", der::SEQUENCE)?)?;
         // `[0]` wraps a `BIT STRING`, whose content is the unused-bit count followed by
         // the octets; the tag is unwrapped here so `options()` sees only the content.
-        let fast_options = match f.opt(0) {
+        let fast_options = match f.opt_bytes(0) {
             None => Vec::new(),
             Some(raw) => {
                 let mut r = Reader::new(raw);
-                let bits = r.next("fast-options")?;
+                let bits = r.next_tlv("fast-options")?;
                 if bits.tag != 0x03 {
                     return Err(Error::Protocol(format!(
                         "fast-options is {:#04x}, not a BIT STRING",
@@ -366,7 +366,7 @@ impl FastRequest {
         Ok(FastRequest {
             fast_options,
             padata,
-            req_body: f.get(2, "KrbFastReq")?.to_vec(),
+            req_body: f.bytes(2, "KrbFastReq")?.to_vec(),
         })
     }
 
@@ -528,7 +528,9 @@ pub fn kdc_challenge(
         der::field(0, der::time(time)),
         der::field(1, der::int(i64::from(usec))),
     ]);
-    EncryptedData::seal(cipher, &key, usage::ENC_CHALLENGE_KDC, None, &ts).map(|e| e.encode())
+    EncryptedData::seal(cipher, &key, usage::ENC_CHALLENGE_KDC, None, &ts)
+        .map(|e| e.encode())
+        .map_err(Error::from)
 }
 
 /// `KrbFastFinished` (RFC 6113 §5.4.2.4): what makes an armored reply provably the
@@ -736,19 +738,20 @@ mod tests {
         )
         .unwrap();
         let mut r = Reader::new(&wrapped);
-        let choice = r.next("PA-FX-FAST-REPLY").unwrap();
+        let choice = r.next_tlv("PA-FX-FAST-REPLY").unwrap();
         assert_eq!(choice.tag, 0xa0);
         let mut inside = Reader::new(choice.content);
-        let sequence = inside.next("KrbFastArmoredRep").unwrap();
+        let sequence = inside.next_tlv("KrbFastArmoredRep").unwrap();
         assert_eq!(sequence.tag, der::SEQUENCE);
         let f = Fields::parse("KrbFastArmoredRep", sequence.content).unwrap();
-        let enc = EncryptedData::decode("enc-fast-rep", f.get(0, "enc-fast-rep").unwrap()).unwrap();
+        let enc =
+            EncryptedData::decode("enc-fast-rep", f.bytes(0, "enc-fast-rep").unwrap()).unwrap();
         let plain = OwnCipher
             .decrypt(&key(), usage::FAST_REP, &enc.cipher)
             .unwrap();
         let response = Fields::parse("KrbFastResponse", {
             let mut rr = Reader::new(&plain);
-            let seq = rr.next("KrbFastResponse").unwrap();
+            let seq = rr.next_tlv("KrbFastResponse").unwrap();
             assert_eq!(seq.tag, der::SEQUENCE);
             seq.content
         })

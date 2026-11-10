@@ -121,7 +121,7 @@ fn as_req(padata: &[(i32, Vec<u8>)]) -> Vec<u8> {
 /// The `EncKDCRepPart` of an AS-REP, opened with the reply key.
 fn as_rep_part(reply: &[u8], key: &Key) -> EncKdcRepPart {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
-    let enc = EncryptedData::decode("enc-part", f.get(6, "AS-REP").expect("enc-part"))
+    let enc = EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
         .expect("an EncryptedData");
     let plain = OwnCipher
         .decrypt(key, usage::AS_REP_ENCPART, &enc.cipher)
@@ -137,7 +137,7 @@ fn request_checksum(rep: &EncKdcRepPart) -> Option<(i32, Vec<u8>)> {
         .find(|(t, _)| *t == PA_REQ_ENC_PA_REP)
         .map(|(_, v)| v)?;
     let mut r = der::Reader::new(value);
-    let seq = r.expect("Checksum", der::SEQUENCE).ok()?;
+    let seq = r.expect_in("Checksum", der::SEQUENCE).ok()?;
     let f = der::Fields::parse("Checksum", seq).ok()?;
     Some((
         f.int(0, "Checksum").ok()? as i32,
@@ -156,7 +156,7 @@ fn the_preauth_required_error_advertises_the_request_checksum() {
 
     let data = err.e_data.expect("METHOD-DATA");
     let mut r = der::Reader::new(&data);
-    let seq = r.expect("METHOD-DATA", der::SEQUENCE).unwrap();
+    let seq = r.expect_in("METHOD-DATA", der::SEQUENCE).unwrap();
     let padata = msg::decode_pa_data("METHOD-DATA", seq).unwrap();
     assert!(
         padata.iter().any(|(t, _)| *t == PA_REQ_ENC_PA_REP),
@@ -345,7 +345,7 @@ fn a_tgs_reply_carries_a_checksum_over_the_tgs_request() {
     );
 
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let enc = EncryptedData::decode("enc-part", f.get(6, "TGS-REP").expect("enc-part")).unwrap();
+    let enc = EncryptedData::decode("enc-part", f.bytes(6, "TGS-REP").expect("enc-part")).unwrap();
     let plain = OwnCipher
         .decrypt(&session, usage::TGS_REP_ENCPART_SESSKEY, &enc.cipher)
         .expect("the reply opens with the TGT's session key");

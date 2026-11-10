@@ -317,8 +317,8 @@ fn the_ticket_carries_the_addresses_the_client_named() {
 
     // The ticket's `caddr` is what a service will check, so it has to be there.
     let f = der::Fields::parse_app("AS-REP", 11, &reply).unwrap();
-    let mut r = der::Reader::new(f.get(5, "AS-REP").unwrap());
-    let ticket_bytes = der::tlv(der::app(1), r.expect("ticket", der::app(1)).unwrap());
+    let mut r = der::Reader::new(f.bytes(5, "AS-REP").unwrap());
+    let ticket_bytes = der::tlv(der::app(1), r.expect_in("ticket", der::app(1)).unwrap());
     let ticket = msg::Ticket::decode(&ticket_bytes).unwrap();
     let _ = ticket;
     // The ticket's encrypted part is not readable here (it is sealed with the

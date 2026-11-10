@@ -443,8 +443,8 @@ fn a_service_ticket_does_not_outlive_its_tgt() {
 fn read_reply(reply: &[u8], session_key: &Key) -> EncKdcRepPart {
     let f = rust_kdc::der::Fields::parse_app("TGS-REP", 13, reply)
         .expect("a TGS request that should have succeeded was answered with an error");
-    let mut r = rust_kdc::der::Reader::new(f.get(6, "TGS-REP").unwrap());
-    let content = r.expect("enc-part", der::SEQUENCE).unwrap();
+    let mut r = rust_kdc::der::Reader::new(f.bytes(6, "TGS-REP").unwrap());
+    let content = r.expect_in("enc-part", der::SEQUENCE).unwrap();
     let enc = EncryptedData::decode_content("enc-part", content).unwrap();
     let plain = OwnCipher
         .decrypt(session_key, usage::TGS_REP_ENCPART_SESSKEY, &enc.cipher)

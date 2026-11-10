@@ -19,6 +19,10 @@ categories = ["authentication", "cryptography", "network-programming"]
 # the branch named, `Cargo.lock` pins the exact revision, so a build is reproducible while the two
 # crates can still move together — after a change in `rrl-crypto`, `cargo update -p rrl-crypto`.
 rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
+# The DER layer and the RFC 4120 structures, shared with the acceptor that parses what this KDC
+# produces. One decoder for the octets a checksum covers is the point: a second copy is a second
+# way to disagree with a peer about a ticket that is otherwise valid.
+rrl-krb = { git = "https://github.com/alexey-vostrikov/rrl-krb", branch = "main" }
 sha1 = "0.11"
 md-5 = "0.11"
 sha2 = "0.11"
@@ -81,7 +85,7 @@ otp = []
 # HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
 # this feature adds the request and reply envelopes and the base64 encoding the
 # binary fields need.
-serde = ["dep:serde", "dep:base64", "rrl-crypto/serde"]
+serde = ["dep:serde", "dep:base64", "rrl-crypto/serde", "rrl-krb/serde"]
 # The JSON envelopes. Named separately so that a caller who only wants
 # `Principal` to serialize does not get the rest.
 admin-json = ["serde"]

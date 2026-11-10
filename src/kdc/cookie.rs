@@ -112,7 +112,7 @@ impl Cookie {
         let plain = cipher.decrypt(key, KU_COOKIE, &sealed.cipher)?;
         // `plaintext` is a whole SEQUENCE: the field tags live inside it, one level down.
         let mut r = der::Reader::new(&plain);
-        let content = r.expect("PA-FX-COOKIE", der::SEQUENCE)?;
+        let content = r.expect_in("PA-FX-COOKIE", der::SEQUENCE)?;
         let f = der::Fields::parse("PA-FX-COOKIE", content)?;
         let version = f.int(0, "PA-FX-COOKIE")?;
         if version != VERSION {
@@ -123,13 +123,14 @@ impl Cookie {
         }
         let realm = f.string(3, "PA-FX-COOKIE")?;
         let client = f
-            .opt(4)
+            .opt_bytes(4)
             .map(|_| {
                 // The name is stored as a whole `Principal` SEQUENCE inside the field, and
                 // `Principal::decode` takes the content of that SEQUENCE.
-                let mut nr = der::Reader::new(f.get(4, "PA-FX-COOKIE")?);
-                let inner = nr.expect("PA-FX-COOKIE", der::SEQUENCE)?;
+                let mut nr = der::Reader::new(f.bytes(4, "PA-FX-COOKIE")?);
+                let inner = nr.expect_in("PA-FX-COOKIE", der::SEQUENCE)?;
                 Principal::decode("PA-FX-COOKIE", inner, &realm)
+                    .map_err(Error::from)
             })
             .transpose()?;
         Ok(Cookie {

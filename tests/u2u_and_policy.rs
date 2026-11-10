@@ -217,7 +217,7 @@ fn a_user_to_user_ticket_is_sealed_in_the_servers_session_key() {
     // The ticket must open in the *server's* session key, not in any long-term
     // key: that is the whole meaning of user-to-user.
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let ticket = Ticket::decode(f.get(5, "TGS-REP").unwrap()).unwrap();
+    let ticket = Ticket::decode(f.bytes(5, "TGS-REP").unwrap()).unwrap();
     assert_eq!(ticket.sname, service());
     let plain = OwnCipher
         .decrypt(&server_side.1, usage::KDC_REP_TICKET, &ticket.enc.cipher)
@@ -251,7 +251,7 @@ fn a_user_to_user_ticket_does_not_open_in_the_service_key() {
     let reply = kdc.handle(&request, NOW);
     assert!(rust_kdc::msg::KrbError::decode(&reply).is_err());
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let ticket = Ticket::decode(f.get(5, "TGS-REP").unwrap()).unwrap();
+    let ticket = Ticket::decode(f.bytes(5, "TGS-REP").unwrap()).unwrap();
     assert!(
         OwnCipher
             .decrypt(&service_key, usage::KDC_REP_TICKET, &ticket.enc.cipher)

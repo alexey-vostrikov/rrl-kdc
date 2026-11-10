@@ -61,13 +61,13 @@ impl ForUser {
     /// Decodes `PA-FOR-USER`'s value.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let seq = r.expect("PA-FOR-USER", der::SEQUENCE)?;
+        let seq = r.expect_in("PA-FOR-USER", der::SEQUENCE)?;
         let f = Fields::parse("PA-FOR-USER", seq)?;
         let realm = f.string(1, "PA-FOR-USER")?;
         let user = Principal::decode_field(&f, 0, "PA-FOR-USER", &realm)?;
         let auth = f.string(3, "PA-FOR-USER")?;
-        let mut c = Reader::new(f.get(2, "PA-FOR-USER")?);
-        let cseq = c.expect("Checksum", der::SEQUENCE)?;
+        let mut c = Reader::new(f.bytes(2, "PA-FOR-USER")?);
+        let cseq = c.expect_in("Checksum", der::SEQUENCE)?;
         let cf = Fields::parse("Checksum", cseq)?;
         let ty = cf.int(0, "Checksum")?;
         if ty != CKSUMTYPE_HMAC_MD5 {
@@ -149,16 +149,16 @@ impl X509User {
     /// Decodes `PA-S4U-X509-USER`'s value.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let seq = r.expect("PA-S4U-X509-USER", der::SEQUENCE)?;
+        let seq = r.expect_in("PA-S4U-X509-USER", der::SEQUENCE)?;
         let f = Fields::parse("PA-S4U-X509-USER", seq)?;
-        let id_der = f.get(0, "PA-S4U-X509-USER")?.to_vec();
+        let id_der = f.bytes(0, "PA-S4U-X509-USER")?.to_vec();
 
         let mut ir = Reader::new(&id_der);
-        let id = ir.expect("S4UUserID", der::SEQUENCE)?;
+        let id = ir.expect_in("S4UUserID", der::SEQUENCE)?;
         let uf = Fields::parse("S4UUserID", id)?;
         let nonce = uf.u32(0, "S4UUserID")?;
         let crealm = uf.string(2, "S4UUserID")?;
-        let cname = match uf.opt(1) {
+        let cname = match uf.opt_bytes(1) {
             None => None,
             Some(_) => Some(Principal::decode_field(&uf, 1, "S4UUserID", &crealm)?),
         };
@@ -166,8 +166,8 @@ impl X509User {
             .opt_flags32(4, "S4UUserID")?
             .is_some_and(|o| o & S4U_OPTS_USE_REPLY_KEY_USAGE != 0);
 
-        let mut cr = Reader::new(f.get(1, "PA-S4U-X509-USER")?);
-        let cseq = cr.expect("Checksum", der::SEQUENCE)?;
+        let mut cr = Reader::new(f.bytes(1, "PA-S4U-X509-USER")?);
+        let cseq = cr.expect_in("Checksum", der::SEQUENCE)?;
         let cf = Fields::parse("Checksum", cseq)?;
         Ok(X509User {
             id_der,
@@ -443,9 +443,9 @@ mod tests {
         let reply = x509.reply(&cipher, &subkey).unwrap();
 
         let mut r = Reader::new(&reply);
-        let seq = r.expect("PA-S4U-X509-USER", der::SEQUENCE).unwrap();
+        let seq = r.expect_in("PA-S4U-X509-USER", der::SEQUENCE).unwrap();
         let f = Fields::parse("PA-S4U-X509-USER", seq).unwrap();
-        assert_eq!(f.get(0, "user-id").unwrap(), id.as_slice());
+        assert_eq!(f.bytes(0, "user-id").unwrap(), id.as_slice());
     }
 
     fn encode_for_user(user: &Principal, auth: &str, sum: &[u8]) -> Vec<u8> {
@@ -588,6 +588,7 @@ mod tests {
             der::field(
                 1,
                 Principal::parse("mallory@EXAMPLE.COM")
+                    .map_err(Error::from)
                     .unwrap()
                     .encode_name(),
             ),

@@ -245,21 +245,21 @@ fn armored_as_req_at(nonce: u32, options: u32, ctime: i64, cusec: u32) -> (Vec<u
 /// The `PA-DATA` of a reply, and its ticket.
 fn reply_parts(reply: &[u8]) -> (Vec<(i32, Vec<u8>)>, Vec<u8>) {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
-    let padata = match f.opt(2) {
+    let padata = match f.opt_bytes(2) {
         None => Vec::new(),
         Some(raw) => {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("PA-DATA").expect("a SEQUENCE of PA-DATA");
+            let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE of PA-DATA");
             rust_kdc::msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
         }
     };
-    (padata, f.get(5, "AS-REP").expect("the ticket").to_vec())
+    (padata, f.bytes(5, "AS-REP").expect("the ticket").to_vec())
 }
 
 /// The `EncryptedData` of the reply's `enc-part`.
 fn reply_enc_part(reply: &[u8]) -> EncryptedData {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
-    EncryptedData::decode("enc-part", f.get(6, "AS-REP").expect("enc-part"))
+    EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
         .expect("an EncryptedData")
 }
 
@@ -272,17 +272,17 @@ fn fast_response(reply: &[u8], armor_key: &Key) -> Vec<u8> {
         .map(|(_, v)| v.clone())
         .expect("the reply must carry PA-FX-FAST-REPLY");
     let mut r = der::Reader::new(&value);
-    let choice = r.next("PA-FX-FAST-REPLY").unwrap();
+    let choice = r.next_tlv("PA-FX-FAST-REPLY").unwrap();
     assert_eq!(choice.tag, 0xa0, "armored-data [0]");
     let mut inner = der::Reader::new(choice.content);
-    let seq = inner.next("KrbFastArmoredRep").unwrap();
+    let seq = inner.next_tlv("KrbFastArmoredRep").unwrap();
     let f = der::Fields::parse("KrbFastArmoredRep", seq.content).unwrap();
-    let enc = EncryptedData::decode("enc-fast-rep", f.get(0, "enc-fast-rep").unwrap()).unwrap();
+    let enc = EncryptedData::decode("enc-fast-rep", f.bytes(0, "enc-fast-rep").unwrap()).unwrap();
     let plain = OwnCipher
         .decrypt(armor_key, fast::usage::FAST_REP, &enc.cipher)
         .expect("the armor key opens PA-FX-FAST-REPLY");
     let mut rr = der::Reader::new(&plain);
-    let response = rr.next("KrbFastResponse").unwrap();
+    let response = rr.next_tlv("KrbFastResponse").unwrap();
     response.content.to_vec()
 }
 
@@ -325,10 +325,10 @@ fn the_reply_opens_with_the_strengthened_key() {
     let fields = der::Fields::parse("KrbFastResponse", &response).expect("KrbFastResponse");
 
     let strength = fields
-        .opt(1)
+        .opt_bytes(1)
         .map(|raw| {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("EncryptionKey").unwrap();
+            let seq = r.next_tlv("EncryptionKey").unwrap();
             rust_kdc::msg::decode_key(seq.content).unwrap()
         })
         .expect("a FAST reply must carry a strengthen key, or the reply is an oracle");
@@ -512,10 +512,10 @@ fn the_kdc_proves_it_holds_the_long_term_key() {
     let fields = der::Fields::parse("KrbFastResponse", &response).expect("KrbFastResponse");
 
     let challenge = fields
-        .opt(0)
+        .opt_bytes(0)
         .map(|raw| {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("PA-DATA").unwrap();
+            let seq = r.next_tlv("PA-DATA").unwrap();
             rust_kdc::msg::decode_pa_data("PA-DATA", seq.content).unwrap()
         })
         .unwrap_or_default()
@@ -542,18 +542,18 @@ fn the_reply_names_the_ticket_it_answers() {
     let response = fast_response(&reply, &armor_key);
     let fields = der::Fields::parse("KrbFastResponse", &response).expect("KrbFastResponse");
 
-    let finished = fields.opt(2).expect("KrbFastResponse.finished");
+    let finished = fields.opt_bytes(2).expect("KrbFastResponse.finished");
     let mut r = der::Reader::new(finished);
-    let seq = r.next("KrbFastFinished").unwrap();
+    let seq = r.next_tlv("KrbFastFinished").unwrap();
     let f = der::Fields::parse("KrbFastFinished", seq.content).unwrap();
-    let ck = f.get(4, "KrbFastFinished ticket-checksum").unwrap();
+    let ck = f.bytes(4, "KrbFastFinished ticket-checksum").unwrap();
     let mut cr = der::Reader::new(ck);
-    let ckseq = cr.next("Checksum").unwrap();
+    let ckseq = cr.next_tlv("Checksum").unwrap();
     let cf = der::Fields::parse("Checksum", ckseq.content).unwrap();
     // `Fields::get` returns the whole TLV, so the octets are unwrapped explicitly.
-    let sum_raw = cf.get(1, "Checksum").unwrap();
+    let sum_raw = cf.bytes(1, "Checksum").unwrap();
     let mut sr = der::Reader::new(sum_raw);
-    let sum = sr.next("Checksum.checksum").unwrap().content;
+    let sum = sr.next_tlv("Checksum.checksum").unwrap().content;
     assert!(
         OwnCipher
             .verify_checksum(&armor_key, fast::usage::FAST_FINISHED, &ticket, sum)
@@ -578,10 +578,10 @@ fn hide_client_names_keeps_the_client_out_of_the_reply() {
     let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
     let crealm = f.string(3, "AS-REP").unwrap();
     let cname = f
-        .opt(4)
+        .opt_bytes(4)
         .map(|raw| {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("cname").unwrap();
+            let seq = r.next_tlv("cname").unwrap();
             rust_kdc::name::Principal::decode("cname", seq.content, &crealm).unwrap()
         })
         .expect("the reply names some client");

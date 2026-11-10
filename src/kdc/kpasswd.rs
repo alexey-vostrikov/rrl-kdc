@@ -287,7 +287,7 @@ impl Kdc {
                 code: crate::error::codes::KRB_AP_ERR_BAD_INTEGRITY,
                 text: "the change-password ticket does not decrypt".into(),
             })?;
-        crate::msg::EncTicketPart::decode(&plain)
+        crate::msg::EncTicketPart::decode(&plain).map_err(Error::from)
     }
 
     /// Decrypts the authenticator in the ticket's session key.
@@ -303,7 +303,7 @@ impl Kdc {
                 code: crate::error::codes::KRB_AP_ERR_BAD_INTEGRITY,
                 text: "the authenticator does not decrypt under the ticket's session key".into(),
             })?;
-        Authenticator::decode(&plain)
+        Authenticator::decode(&plain).map_err(Error::from)
     }
 }
 

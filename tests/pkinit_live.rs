@@ -106,11 +106,11 @@ fn pkinit_as_req() -> (Vec<u8>, BigUint) {
 /// The `PA-DATA` of an AS-REP.
 fn rep_padata(reply: &[u8]) -> Vec<(i32, Vec<u8>)> {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
-    match f.opt(2) {
+    match f.opt_bytes(2) {
         None => Vec::new(),
         Some(raw) => {
             let mut r = der::Reader::new(raw);
-            let seq = r.next("PA-DATA").expect("a SEQUENCE");
+            let seq = r.next_tlv("PA-DATA").expect("a SEQUENCE");
             rust_kdc::msg::decode_pa_data("AS-REP", seq.content).expect("PA-DATA")
         }
     }
@@ -152,7 +152,7 @@ fn a_certificate_login_produces_a_tgt_the_client_can_read() {
     // `enc-part`'s enctype tells which enctype the client should derive for.
     let f = der::Fields::parse_app("AS-REP", 11, &reply).expect("an AS-REP");
     let enc_part =
-        rust_kdc::msg::EncryptedData::decode("enc-part", f.get(6, "AS-REP").expect("enc-part"))
+        rust_kdc::msg::EncryptedData::decode("enc-part", f.bytes(6, "AS-REP").expect("enc-part"))
             .expect("an EncryptedData");
 
     // Derive as the client does. The KDF is the one this KDC prefers among those the request
@@ -179,7 +179,7 @@ fn a_certificate_login_produces_a_tgt_the_client_can_read() {
 
     // And the ticket is a real one: it decrypts under `krbtgt`'s key.
     assert!(
-        f.opt(5).is_some(),
+        f.opt_bytes(5).is_some(),
         "the reply must carry a ticket, not only a key"
     );
 }
@@ -187,41 +187,43 @@ fn a_certificate_login_produces_a_tgt_the_client_can_read() {
 /// The KDC's DH public value out of a `PA-PK-AS-REP`.
 fn kdc_public_value(pa_value: &[u8]) -> Vec<u8> {
     let mut r = der::Reader::new(pa_value);
-    let dh_info = r.next("PA-PK-AS-REP").expect("the choice");
+    let dh_info = r.next_tlv("PA-PK-AS-REP").expect("the choice");
     assert_eq!(dh_info.tag, der::ctx(0), "dhInfo [0]");
     let mut ir = der::Reader::new(dh_info.content);
-    let seq = ir.next("DHRepInfo").expect("a SEQUENCE");
+    let seq = ir.next_tlv("DHRepInfo").expect("a SEQUENCE");
     let mut sr = der::Reader::new(seq.content);
-    let signed_tlv = sr.next("dhSignedData").expect("dhSignedData");
+    let signed_tlv = sr.next_tlv("dhSignedData").expect("dhSignedData");
     let mut dr = der::Reader::new(signed_tlv.content);
-    let octets = dr.next("OCTET STRING").expect("an OCTET STRING");
+    let octets = dr.next_tlv("OCTET STRING").expect("an OCTET STRING");
 
     // Walk the CMS envelope to its content: `ContentInfo { OID, [0] SignedData }`, and the
     // `KDCDHKeyInfo` inside `EncapsulatedContentInfo`.
     let mut cr = der::Reader::new(octets.content);
-    let ci = cr.next("ContentInfo").expect("a ContentInfo");
+    let ci = cr.next_tlv("ContentInfo").expect("a ContentInfo");
     let mut cir = der::Reader::new(ci.content);
-    cir.next("contentType").expect("the OID");
-    let wrapped = cir.next("content").expect("the content");
+    cir.next_tlv("contentType").expect("the OID");
+    let wrapped = cir.next_tlv("content").expect("the content");
     let mut wr = der::Reader::new(wrapped.content);
-    let sd = wr.next("SignedData").expect("a SignedData");
+    let sd = wr.next_tlv("SignedData").expect("a SignedData");
     let mut sdr = der::Reader::new(sd.content);
-    sdr.next("version").unwrap();
-    sdr.next("digestAlgorithms").unwrap();
-    let encap = sdr.next("EncapsulatedContentInfo").unwrap();
+    sdr.next_tlv("version").unwrap();
+    sdr.next_tlv("digestAlgorithms").unwrap();
+    let encap = sdr.next_tlv("EncapsulatedContentInfo").unwrap();
     let mut er = der::Reader::new(encap.content);
-    er.next("eContentType").unwrap();
-    let econtent = er.next("eContent").unwrap();
+    er.next_tlv("eContentType").unwrap();
+    let econtent = er.next_tlv("eContent").unwrap();
     let mut ecr = der::Reader::new(econtent.content);
-    let info_octets = ecr.next("OCTET STRING").expect("the KDCDHKeyInfo octets");
+    let info_octets = ecr
+        .next_tlv("OCTET STRING")
+        .expect("the KDCDHKeyInfo octets");
 
     // `KDCDHKeyInfo ::= SEQUENCE { [0] BIT STRING, [1] INTEGER }`
     let mut kr = der::Reader::new(info_octets.content);
-    let info = kr.next("KDCDHKeyInfo").expect("a SEQUENCE");
+    let info = kr.next_tlv("KDCDHKeyInfo").expect("a SEQUENCE");
     let mut krr = der::Reader::new(info.content);
-    let key_tlv = krr.next("subjectPublicKey").expect("the key");
+    let key_tlv = krr.next_tlv("subjectPublicKey").expect("the key");
     let mut br = der::Reader::new(key_tlv.content);
-    let bits = br.next("BIT STRING").expect("a BIT STRING");
+    let bits = br.next_tlv("BIT STRING").expect("a BIT STRING");
     bits.content[1..].to_vec()
 }
 

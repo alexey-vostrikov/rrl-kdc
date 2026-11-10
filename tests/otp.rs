@@ -84,14 +84,14 @@ fn request(nonce: &[u8], value: &str, armor: &Key) -> Vec<u8> {
     // that SEQUENCE's content.
     let encoded = sealed.encode();
     let mut r = der::Reader::new(&encoded);
-    let content = r.expect("EncryptedData", der::SEQUENCE).unwrap();
+    let content = r.expect_in("EncryptedData", der::SEQUENCE).unwrap();
     der::seq(&[der::tlv(0xa2, content), der::tlv(0x85, value.as_bytes())])
 }
 
 /// The nonce out of the state an announcement produced.
 fn nonce_of(state: &[u8]) -> Vec<u8> {
     let mut r = der::Reader::new(state);
-    let f = der::Fields::parse("state", r.expect("state", der::SEQUENCE).unwrap()).unwrap();
+    let f = der::Fields::parse("state", r.expect_in("state", der::SEQUENCE).unwrap()).unwrap();
     f.octets(1, "state").unwrap().to_vec()
 }
 

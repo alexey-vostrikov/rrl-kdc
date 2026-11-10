@@ -186,7 +186,7 @@ fn ticket_flags_of(reply: &[u8]) -> u32 {
     use rust_kdc::msg::{EncTicketPart, Ticket};
 
     let f = der::Fields::parse_app("TGS-REP", 13, reply).expect("a TGS-REP");
-    let ticket = Ticket::decode(f.get(5, "TGS-REP").expect("the ticket")).expect("a Ticket");
+    let ticket = Ticket::decode(f.bytes(5, "TGS-REP").expect("the ticket")).expect("a Ticket");
 
     // The service key is the one the test put in the database.
     let mut entry = HdbEntry::service(service());

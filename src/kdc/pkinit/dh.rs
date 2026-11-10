@@ -239,7 +239,7 @@ impl KeyPair {
 fn parse_domain_parameters(params: &[u8]) -> Result<(BigUint, BigUint), PkinitError> {
     let mut r = crate::der::Reader::new(params);
     let seq = r
-        .next("DomainParameters")
+        .next_tlv("DomainParameters")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     if seq.tag != crate::der::SEQUENCE {
         return Err(PkinitError::Malformed(
@@ -254,7 +254,7 @@ fn parse_domain_parameters(params: &[u8]) -> Result<(BigUint, BigUint), PkinitEr
 
 fn integer(r: &mut crate::der::Reader<'_>, what: &str) -> Result<BigUint, PkinitError> {
     let tlv = r
-        .next("DomainParameters")
+        .next_tlv("DomainParameters")
         .map_err(|e| PkinitError::Malformed(format!("{what}: {e}")))?;
     if tlv.tag != crate::der::INTEGER {
         return Err(PkinitError::Malformed(format!(

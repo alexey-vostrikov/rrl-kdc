@@ -790,7 +790,7 @@ pub fn principal_from_spn(spn: &str, realm: &str) -> Result<Principal> {
             "{spn:?} carries a realm, which a servicePrincipalName must not"
         )));
     }
-    Principal::parse_in_realm(spn, realm)
+    Principal::parse_in_realm(spn, realm).map_err(Error::from)
 }
 
 /// One `krb5Key` value: the ASN.1 `Key`, DER.
@@ -816,10 +816,10 @@ fn decode_key(value: &[u8]) -> Result<HdbKey> {
     use crate::der::{Fields, Reader};
     let context = "krb5Key";
     let mut r = Reader::new(value);
-    let f = Fields::parse(context, r.expect(context, crate::der::SEQUENCE)?)?;
+    let f = Fields::parse(context, r.expect_in(context, crate::der::SEQUENCE)?)?;
     let kvno = f.u32(0, context)?;
-    let mut er = Reader::new(f.get(1, context)?);
-    let ef = Fields::parse(context, er.expect(context, crate::der::SEQUENCE)?)?;
+    let mut er = Reader::new(f.bytes(1, context)?);
+    let ef = Fields::parse(context, er.expect_in(context, crate::der::SEQUENCE)?)?;
     let id = ef.int(0, context)? as i32;
     let enctype = Enctype::from_id(id)
         .ok_or_else(|| Error::Hdb(format!("enctype {id} is not one this KDC implements")))?;

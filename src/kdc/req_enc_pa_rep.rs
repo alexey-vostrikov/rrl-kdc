@@ -70,7 +70,7 @@ mod tests {
         let cipher = OwnCipher;
         let value = checksum(&cipher, &key(), KU_AS_REQ, b"the request").unwrap();
         let mut r = der::Reader::new(&value);
-        let seq = r.expect("Checksum", der::SEQUENCE).unwrap();
+        let seq = r.expect_in("Checksum", der::SEQUENCE).unwrap();
         let f = der::Fields::parse("Checksum", seq).unwrap();
         assert_eq!(
             f.int(0, "Checksum").unwrap() as i32,
@@ -96,7 +96,7 @@ mod tests {
         );
 
         let mut r = der::Reader::new(&as_value);
-        let seq = r.expect("Checksum", der::SEQUENCE).unwrap();
+        let seq = r.expect_in("Checksum", der::SEQUENCE).unwrap();
         let f = der::Fields::parse("Checksum", seq).unwrap();
         let sum = f.octets(1, "Checksum").unwrap();
         assert!(

@@ -340,7 +340,7 @@ impl Kdc {
     pub fn handle_from(&self, request: &[u8], now: i64, peer: Option<IpAddr>) -> Vec<u8> {
         let req = match KdcReq::decode(request) {
             Ok(req) => req,
-            Err(err) => return self.error(None, &err, now),
+            Err(err) => return self.error(None, &Error::from(err), now),
         };
         let outcome = match address::check(
             self.config.address_policy(),
@@ -494,7 +494,7 @@ impl Kdc {
                 .as_deref()
                 .and_then(|m| {
                     let mut rd = crate::der::Reader::new(m);
-                    let seq = rd.next("METHOD-DATA").ok()?;
+                    let seq = rd.next_tlv("METHOD-DATA").ok()?;
                     crate::msg::decode_pa_data("METHOD-DATA", seq.content).ok()
                 })
                 .unwrap_or_default();

@@ -172,7 +172,7 @@ impl Identity {
 fn issuer_and_serial(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PkinitError> {
     let mut r = der::Reader::new(cert_der);
     let cert = r
-        .next("Certificate")
+        .next_tlv("Certificate")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     if cert.tag != der::SEQUENCE {
         return Err(PkinitError::Malformed(
@@ -181,25 +181,25 @@ fn issuer_and_serial(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PkinitError>
     }
     let mut cr = der::Reader::new(cert.content);
     let tbs = cr
-        .next("TBSCertificate")
+        .next_tlv("TBSCertificate")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     let mut t = der::Reader::new(tbs.content);
     // `version [0] EXPLICIT` is optional; its presence shifts every field by one.
     let first = t
-        .next("TBSCertificate")
+        .next_tlv("TBSCertificate")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     let mut tail = t;
     let serial = if first.tag == 0xa0 {
-        tail.next("serialNumber")
+        tail.next_tlv("serialNumber")
             .map_err(|e| PkinitError::Malformed(e.to_string()))?
     } else {
         first
     };
     // serialNumber, then the signature algorithm, then the issuer.
-    tail.next("signature")
+    tail.next_tlv("signature")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     let issuer = tail
-        .next("issuer")
+        .next_tlv("issuer")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     Ok((
         der::tlv(der::SEQUENCE, issuer.content),
@@ -515,7 +515,7 @@ pub fn answer_anonymous(
 fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>), PkinitError> {
     let mut r = der::Reader::new(value);
     let spki = r
-        .next("clientPublicValue")
+        .next_tlv("clientPublicValue")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     if spki.tag != der::SEQUENCE {
         return Err(PkinitError::Malformed(
@@ -524,10 +524,10 @@ fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>)
     }
     let mut sr = der::Reader::new(spki.content);
     let alg = sr
-        .next("algorithm")
+        .next_tlv("algorithm")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     let bits = sr
-        .next("subjectPublicKey")
+        .next_tlv("subjectPublicKey")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     if bits.tag != 0x03 {
         return Err(PkinitError::Malformed(
@@ -539,7 +539,7 @@ fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>)
     // KDC does not implement, and guessing would derive a key nobody else computes.
     let mut ar = der::Reader::new(alg.content);
     let oid = ar
-        .next("algorithm")
+        .next_tlv("algorithm")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     let name = der::decode_oid("algorithm", oid.content)
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
@@ -549,7 +549,7 @@ fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>)
              (dhpublicnumber) only"
         )));
     }
-    let params = ar.next("DomainParameters").map_err(|_| {
+    let params = ar.next_tlv("DomainParameters").map_err(|_| {
         PkinitError::Malformed(
             "dhpublicnumber without domain parameters: the group cannot be inferred".into(),
         )
@@ -596,22 +596,22 @@ mod tests {
     fn the_kdcdh_key_info_carries_the_public_value_and_echoes_the_nonce() {
         let info = kdcdh_key_info(&[0xde, 0xad, 0xbe, 0xef], 0x1234_5678);
         let mut r = Reader::new(&info);
-        let seq = r.next("KDCDHKeyInfo").unwrap();
+        let seq = r.next_tlv("KDCDHKeyInfo").unwrap();
         assert_eq!(seq.tag, der::SEQUENCE);
 
         let mut inner = Reader::new(seq.content);
-        let key_tlv = inner.next("subjectPublicKey").unwrap();
+        let key_tlv = inner.next_tlv("subjectPublicKey").unwrap();
         assert_eq!(key_tlv.tag, 0xa0, "subjectPublicKey [0]");
         let mut kr = Reader::new(key_tlv.content);
-        let bits = kr.next("BIT STRING").unwrap();
+        let bits = kr.next_tlv("BIT STRING").unwrap();
         assert_eq!(bits.tag, 0x03);
         assert_eq!(bits.content[0], 0, "no unused bits");
         assert_eq!(&bits.content[1..], &[0xde, 0xad, 0xbe, 0xef]);
 
-        let nonce_tlv = inner.next("nonce").unwrap();
+        let nonce_tlv = inner.next_tlv("nonce").unwrap();
         assert_eq!(nonce_tlv.tag, 0xa1);
         let mut nr = Reader::new(nonce_tlv.content);
-        let nonce = nr.next("INTEGER").unwrap();
+        let nonce = nr.next_tlv("INTEGER").unwrap();
         assert_eq!(
             crate::der::as_int("nonce", nonce.content).unwrap(),
             0x1234_5678
@@ -626,16 +626,16 @@ mod tests {
         assert_eq!(rep[0], der::ctx(0), "dhInfo [0] is the outermost tag");
 
         let mut r = Reader::new(&rep);
-        let outer = r.next("PA-PK-AS-REP").unwrap();
+        let outer = r.next_tlv("PA-PK-AS-REP").unwrap();
         let mut or = Reader::new(outer.content);
-        let seq = or.next("DHRepInfo").unwrap();
+        let seq = or.next_tlv("DHRepInfo").unwrap();
         assert_eq!(seq.tag, der::SEQUENCE);
 
         let mut sr = Reader::new(seq.content);
-        let field = sr.next("dhSignedData").unwrap();
+        let field = sr.next_tlv("dhSignedData").unwrap();
         assert_eq!(field.tag, 0xa0);
         let mut fr = Reader::new(field.content);
-        let octets = fr.next("OCTET STRING").unwrap();
+        let octets = fr.next_tlv("OCTET STRING").unwrap();
         assert_eq!(octets.tag, 0x04);
         assert_eq!(octets.content, &[0x30, 0x00]);
     }

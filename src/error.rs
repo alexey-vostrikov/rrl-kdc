@@ -17,6 +17,12 @@ pub enum Error {
     /// A message did not decode: wrong tag, wrong length, truncated buffer.
     Der(#[from] crate::der::DerError),
 
+    #[error(transparent)]
+    /// A failure inside `rrl-krb`: a structure that did not decode, an enctype it does not
+    /// implement. Transparent because the crate's errors already name the value and the reason,
+    /// and re-wording them here would lose the field number a caller needs.
+    Krb(#[from] rrl_krb::Error),
+
     #[error("enctype {0} is not one this KDC implements (17, 18, 19, 20)")]
     /// An enctype this KDC does not implement (it issues 17, 18, 19 and 20).
     UnsupportedEnctype(i32),
@@ -254,6 +260,13 @@ impl Error {
         use codes::*;
         match self {
             Error::Der(_) | Error::NotARequest(_) | Error::Protocol(_) => KRB_AP_ERR_MODIFIED,
+            Error::Krb(inner) => match inner {
+                rrl_krb::Error::UnsupportedEnctype(_) => KDC_ERR_ETYPE_NOSUPP,
+                rrl_krb::Error::Crypto(_) | rrl_krb::Error::KeyLength { .. } => {
+                    KRB_AP_ERR_BAD_INTEGRITY
+                }
+                _ => KRB_AP_ERR_MODIFIED,
+            },
             Error::UnsupportedEnctype(_) | Error::NoUsableEnctype { .. } => KDC_ERR_ETYPE_NOSUPP,
             Error::KeyLength { .. } | Error::Crypto(_) => KRB_AP_ERR_BAD_INTEGRITY,
             Error::CryptoLayer(inner) => match inner {
@@ -294,6 +307,17 @@ impl Error {
     pub fn kind(&self) -> &'static str {
         match self {
             Error::Der(_) => "der",
+            // The shared crate's failures keep their own names, so a transport that switched on
+            // "der" before the crate existed does not start seeing everything as one kind.
+            Error::Krb(e) => match e {
+                rrl_krb::Error::Der(_) => "der",
+                rrl_krb::Error::UnsupportedEnctype(_) | rrl_krb::Error::KeyLength { .. } => {
+                    "crypto"
+                }
+                rrl_krb::Error::Crypto(_) => "crypto",
+                rrl_krb::Error::NotARequest(_) | rrl_krb::Error::Protocol(_) => "protocol",
+                _ => "protocol",
+            },
             Error::UnsupportedEnctype(_)
             | Error::NoUsableEnctype { .. }
             | Error::KeyLength { .. }

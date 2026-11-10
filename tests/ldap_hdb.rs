@@ -903,8 +903,8 @@ fn a_delegation_list_in_the_directory_decides_who_may_delegate() {
 
     // And the ticket is the user's, sealed in the target service's key.
     let f = der::Fields::parse_app("TGS-REP", 13, &reply).unwrap();
-    let mut r = der::Reader::new(f.get(4, "TGS-REP").expect("cname"));
-    let seq = r.next("cname").unwrap();
+    let mut r = der::Reader::new(f.bytes(4, "TGS-REP").expect("cname"));
+    let seq = r.next_tlv("cname").unwrap();
     assert_eq!(
         Principal::decode("cname", seq.content, REALM)
             .unwrap()

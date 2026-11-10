@@ -91,8 +91,8 @@ fn enterprise_as_req(enterprise: &str, options: u32) -> Vec<u8> {
 fn reply_identity(reply: &[u8]) -> (String, Principal) {
     let f = der::Fields::parse_app("AS-REP", 11, reply).expect("an AS-REP");
     let crealm = f.string(3, "AS-REP").expect("crealm");
-    let mut r = der::Reader::new(f.get(4, "AS-REP").expect("cname"));
-    let seq = r.next("cname").expect("a SEQUENCE");
+    let mut r = der::Reader::new(f.bytes(4, "AS-REP").expect("cname"));
+    let seq = r.next_tlv("cname").expect("a SEQUENCE");
     let cname = Principal::decode("cname", seq.content, &crealm).expect("the cname is decodable");
     (crealm, cname)
 }

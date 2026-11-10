@@ -325,7 +325,7 @@ impl Kdc {
         let armor_key = self.armor_key(&armored, now)?;
         let inner = super::fast::unwrap(&armored, &armor_key, &req.raw_body, self.cipher())?;
         let mut r = crate::der::Reader::new(&inner.req_body);
-        let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
+        let content = r.expect_in("KrbFastReq req-body", crate::der::SEQUENCE)?;
         let body = KdcReqBody::decode(content)?;
 
         // `hide-client-names` decides how much of the outer body means anything: with it

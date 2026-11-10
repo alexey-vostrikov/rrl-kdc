@@ -364,7 +364,7 @@ impl Kdc {
         let hide = options & super::fast::HIDE_CLIENT_NAMES != 0;
 
         let mut r = crate::der::Reader::new(&inner.req_body);
-        let content = r.expect("KrbFastReq req-body", crate::der::SEQUENCE)?;
+        let content = r.expect_in("KrbFastReq req-body", crate::der::SEQUENCE)?;
         let body = KdcReqBody::decode(content)?;
 
         let received = Received {
@@ -1138,7 +1138,7 @@ impl Kdc {
                 self.cipher()
                     .decrypt(&key.key, usage::KDC_REP_TICKET, &ticket.enc.cipher)
             {
-                return EncTicketPart::decode(&plain);
+                return EncTicketPart::decode(&plain).map_err(Error::from);
             }
         }
         Err(Error::Kdc {
@@ -1174,7 +1174,7 @@ impl Kdc {
                 code: codes::KRB_AP_ERR_BAD_INTEGRITY,
                 text: "the authenticator does not decrypt under the ticket's session key".into(),
             })?;
-        Authenticator::decode(&plain)
+        Authenticator::decode(&plain).map_err(Error::from)
     }
 }
 
@@ -1184,9 +1184,9 @@ impl Kdc {
 /// wrapper; its first element is the server's TGT.
 fn first_ticket(encoded: &[u8]) -> Result<Vec<u8>> {
     let mut r = crate::der::Reader::new(encoded);
-    let content = r.expect("additional-tickets", crate::der::SEQUENCE)?;
+    let content = r.expect_in("additional-tickets", crate::der::SEQUENCE)?;
     let mut s = crate::der::Reader::new(content);
-    let tlv = s.next("additional-tickets")?;
+    let tlv = s.next_tlv("additional-tickets")?;
     if tlv.tag != crate::der::app(crate::msg::TICKET) {
         return Err(Error::Kdc {
             code: codes::KDC_ERR_BADOPTION,

@@ -101,7 +101,7 @@ impl<'a> Seq<'a> {
         let mut items = Vec::new();
         while !r.is_empty() {
             items.push(
-                r.next(context)
+                r.next_tlv(context)
                     .map_err(|e| PkinitError::Malformed(e.to_string()))?,
             );
         }
@@ -170,7 +170,7 @@ fn explicit<'a>(
 ) -> std::result::Result<crate::der::Tlv<'a>, PkinitError> {
     let mut r = crate::der::Reader::new(tlv.content);
     let inner = r
-        .next(context)
+        .next_tlv(context)
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     Ok(inner)
 }
@@ -317,7 +317,7 @@ impl Request {
 
         let mut r = Reader::new(pa);
         let seq = r
-            .next("PA-PK-AS-REQ")
+            .next_tlv("PA-PK-AS-REQ")
             .map_err(|e| PkinitError::Malformed(e.to_string()))?;
         if seq.tag != crate::der::SEQUENCE {
             return Err(PkinitError::Malformed(
@@ -328,7 +328,7 @@ impl Request {
         // is universal; only the outermost `[0]` is a context tag.
         let mut outer = Reader::new(seq.content);
         let signed_tlv = outer
-            .next("signedAuthPack")
+            .next_tlv("signedAuthPack")
             .map_err(|e| PkinitError::Malformed(e.to_string()))?;
         if signed_tlv.tag != crate::der::ctx(0) {
             return Err(PkinitError::Malformed(format!(
@@ -372,7 +372,7 @@ impl Request {
 
         let mut r = Reader::new(&self.auth_pack);
         let seq = r
-            .next("AuthPack")
+            .next_tlv("AuthPack")
             .map_err(|e| PkinitError::Malformed(e.to_string()))?;
         let f = Fields::parse("AuthPack", seq.content)
             .map_err(|e| PkinitError::Malformed(e.to_string()))?;
@@ -381,11 +381,11 @@ impl Request {
         // structure rather than replacing its tag — unlike CMS, which is IMPLICIT. The two
         // conventions meet in this file, and mixing them up shifts every field by one.
         let pa_tlv = f
-            .opt(0)
+            .opt_bytes(0)
             .ok_or_else(|| PkinitError::Malformed("AuthPack has no pkAuthenticator".into()))?;
         let mut pr = Reader::new(pa_tlv);
         let pa_seq = pr
-            .next("PKAuthenticator")
+            .next_tlv("PKAuthenticator")
             .map_err(|e| PkinitError::Malformed(e.to_string()))?;
         let pf = Fields::parse("PKAuthenticator", pa_seq.content)
             .map_err(|e| PkinitError::Malformed(e.to_string()))?;
@@ -405,20 +405,20 @@ impl Request {
                 .to_vec(),
         };
 
-        let client_public_value = f.opt(1).map(<[u8]>::to_vec);
+        let client_public_value = f.opt_bytes(1).map(<[u8]>::to_vec);
 
         // `[4] SEQUENCE OF AlgorithmIdentifier`: the KDFs the client can do. The OIDs are
         // kept as text because the choice among them belongs to the exchange, not here.
         let mut supported_kdfs = Vec::new();
-        if let Some(list) = f.opt(4) {
+        if let Some(list) = f.opt_bytes(4) {
             let mut lr = Reader::new(list);
             let seq = lr
-                .next("supportedKDFs")
+                .next_tlv("supportedKDFs")
                 .map_err(|e| PkinitError::Malformed(e.to_string()))?;
             let mut items = Reader::new(seq.content);
             while !items.is_empty() {
                 let item = items
-                    .next("AlgorithmIdentifier")
+                    .next_tlv("AlgorithmIdentifier")
                     .map_err(|e| PkinitError::Malformed(e.to_string()))?;
                 let af = Fields::parse("AlgorithmIdentifier", item.content)
                     .map_err(|e| PkinitError::Malformed(e.to_string()))?;
@@ -722,11 +722,11 @@ mod trusted {
         // the SEQUENCE.
         let mut r = Reader::new(value);
         let outer = r
-            .next("id-pkinit-san")
+            .next_tlv("id-pkinit-san")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let mut or = Reader::new(outer.content);
         let seq = or
-            .next("KRB5PrincipalName")
+            .next_tlv("KRB5PrincipalName")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let f = Fields::parse("KRB5PrincipalName", seq.content)
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
@@ -735,11 +735,11 @@ mod trusted {
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         // RFC 4120's module is EXPLICIT too, so `[1]` wraps the `PrincipalName`.
         let name_tlv = f
-            .get(1, "KRB5PrincipalName")
+            .bytes(1, "KRB5PrincipalName")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let mut nr = Reader::new(name_tlv);
         let name_seq = nr
-            .next("PrincipalName")
+            .next_tlv("PrincipalName")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let nf = Fields::parse("PrincipalName", name_seq.content)
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
@@ -747,17 +747,17 @@ mod trusted {
             .int(0, "PrincipalName")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let components_tlv = nf
-            .get(1, "PrincipalName")
+            .bytes(1, "PrincipalName")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let mut cr = Reader::new(components_tlv);
         let components_seq = cr
-            .next("principal components")
+            .next_tlv("principal components")
             .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
         let mut items = Reader::new(components_seq.content);
         let mut components = Vec::new();
         while !items.is_empty() {
             let item = items
-                .next("component")
+                .next_tlv("component")
                 .map_err(|e| PkinitError::BadPrincipalName(e.to_string()))?;
             components.push(
                 String::from_utf8(item.content.to_vec()).map_err(|_| {
@@ -948,7 +948,7 @@ mod trusted {
                 let mut r = crate::der::Reader::new(slot.content);
                 while !r.is_empty() {
                     let item = r
-                        .next("CertificateChoices")
+                        .next_tlv("CertificateChoices")
                         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
                     if item.tag == crate::der::SEQUENCE {
                         certificates.push(crate::der::tlv(item.tag, item.content));
@@ -968,7 +968,7 @@ mod trusted {
             }
             let mut items = crate::der::Reader::new(infos.content);
             let first = items
-                .next("SignerInfo")
+                .next_tlv("SignerInfo")
                 .map_err(|e| PkinitError::Malformed(e.to_string()))?;
             if !items.is_empty() {
                 return Err(PkinitError::Unsupported(
@@ -1004,7 +1004,7 @@ mod trusted {
             let mut attributes = Vec::new();
             while !items.is_empty() {
                 let attr = items
-                    .next("Attribute")
+                    .next_tlv("Attribute")
                     .map_err(|e| PkinitError::Malformed(e.to_string()))?;
                 let af = Seq::parse("Attribute", attr.content)?;
                 let oid = af.oid(0, "Attribute")?;
@@ -1013,7 +1013,7 @@ mod trusted {
                 let mut out = Vec::new();
                 while !vr.is_empty() {
                     out.push(
-                        vr.next("Attribute value")
+                        vr.next_tlv("Attribute value")
                             .map_err(|e| PkinitError::Malformed(e.to_string()))?
                             .content
                             .to_vec(),

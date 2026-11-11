@@ -311,7 +311,7 @@ impl Kdc {
                 padata: &req.padata,
                 raw,
             };
-            return self.tgs_answer(&req.body, proven, now, None, false, received);
+            return self.tgs_answer(&req.body, proven, now, None, false, false, received);
         };
 
         let armored = super::fast::ArmoredRequest::decode(fast_bytes)?;
@@ -341,7 +341,8 @@ impl Kdc {
         //   `gss_init_sec_context` for a `cifs/` ticket. Refusing it left the join at
         //   "FAST fast response is missing FX-FAST", which names the armor rather than the
         //   service the KDC could not issue.
-        let (armor_key, inner) = if armored.armor.is_some() {
+        let explicit_armor = armored.armor.is_some();
+        let (armor_key, inner) = if explicit_armor {
             let armor_key = self.armor_key(&armored, now)?;
             let inner = super::fast::unwrap(&armored, &armor_key, ap_req_bytes, self.cipher())?;
             (armor_key, inner)
@@ -378,7 +379,15 @@ impl Kdc {
             padata: &inner.padata,
             raw,
         };
-        self.tgs_answer(&body, proven, now, Some(&armor_key), hide, received)
+        self.tgs_answer(
+            &body,
+            proven,
+            now,
+            Some(&armor_key),
+            explicit_armor,
+            hide,
+            received,
+        )
     }
 
     /// The exchange itself, over a body that has already been recovered from wherever it
@@ -389,6 +398,7 @@ impl Kdc {
         proven: Proven,
         now: i64,
         armor: Option<&Key>,
+        explicit_armor: bool,
         hide: bool,
         received: Received<'_>,
     ) -> Result<Vec<u8>> {
@@ -667,7 +677,11 @@ impl Kdc {
         // value it is handed, and a reply sealed in the unstrengthened key is one it cannot open -
         // measured as `Failed to decode encpart in ticket` from Samba's client, which armors where
         // MIT's `kvno` does not, so the same KDC answered MIT and not Samba.
-        let (strengthen_key, sealed_with) = if armor.is_some() {
+        // Only for an **explicit** armor ticket. The implicit form (RFC 6113 5.4.2.6) has no
+        // strength to add: its key already comes from the PA-TGS-REQ subkey, and a client that
+        // armors that way reconstructs no strengthen key - sealing the reply in a strengthened one
+        // leaves it with a reply it cannot open, which it reports as a decode failure.
+        let (strengthen_key, sealed_with) = if explicit_armor {
             let (strength, strengthened) =
                 super::fast::strengthen(self.cipher(), &proven.reply_key)?;
             (Some(strength), strengthened)

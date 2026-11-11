@@ -223,12 +223,13 @@ fn issuer_and_serial(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PkinitError>
 /// suite against MIT, and this is the policy on top of it.
 fn check_group(group: super::dh::Group, policy: &PkinitPolicy) -> Result<(), PkinitError> {
     if group.bits() < policy.dh_min_bits {
-        return Err(PkinitError::Unsupported(format!(
-            "the client's Diffie-Hellman group is {} bits, and this realm requires at least {} \
-             (pkinit_dh_min_bits)",
-            group.bits(),
-            policy.dh_min_bits
-        )));
+        // Its own variant, not `Unsupported`: this is the one PKINIT refusal a client can answer
+        // by trying again with a stronger group, and the KDC turns it into
+        // `KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED` with the groups it does accept.
+        return Err(PkinitError::GroupTooWeak {
+            have: group.bits(),
+            want: policy.dh_min_bits,
+        });
     }
     Ok(())
 }
@@ -1070,7 +1071,18 @@ mod tests {
             err.to_string().contains("pkinit_dh_min_bits"),
             "the refusal must name the option: {err}"
         );
-        assert!(matches!(err, PkinitError::Unsupported(_)));
+        // Its own variant: the KDC turns this one into `KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED`
+        // and names the groups it does accept, so the client can retry.
+        assert!(
+            matches!(
+                err,
+                PkinitError::GroupTooWeak {
+                    have: 2048,
+                    want: 4096
+                }
+            ),
+            "got {err:?}"
+        );
 
         // And the larger group passes the strict floor, so the rule is a floor and not a
         // blacklist of one group.

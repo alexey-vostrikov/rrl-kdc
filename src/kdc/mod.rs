@@ -758,6 +758,9 @@ impl Kdc {
         if code != codes::KDC_ERR_PREAUTH_REQUIRED
             && code != codes::KDC_ERR_PREAUTH_FAILED
             && code != codes::KDC_ERR_MORE_PREAUTH_DATA_REQUIRED
+            // A client told to retry with a stronger Diffie-Hellman group pays for its certificate
+            // twice otherwise: the signed AuthPack is the expensive half of a PKINIT request.
+            && code != codes::KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED
         {
             return None;
         }

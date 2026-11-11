@@ -810,6 +810,29 @@ impl Kdc {
                 );
                 match answer {
                     Ok(a) => Some(a),
+                    Err(super::pkinit::PkinitError::GroupTooWeak { have, want }) => {
+                        // The one PKINIT refusal with a next step (RFC 4556 §3.2.4): the groups
+                        // this realm accepts go back as `TD-DH-PARAMETERS`, and a client that has
+                        // a stronger one retries. A generic failure would end a login that has a
+                        // remedy, and raising `pkinit_dh_min_bits` would silently break every
+                        // PKINIT client rather than move it up a group.
+                        let accepted: Vec<super::pkinit::dh::Group> = [2048u32, 4096]
+                            .into_iter()
+                            .filter(|bits| *bits >= want)
+                            .map(super::pkinit::dh::Group::at_least)
+                            .collect();
+                        return Err(Error::Preauth {
+                            code: codes::KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED,
+                            text: format!(
+                                "the client's Diffie-Hellman group is {have} bits, and this \
+                                 realm requires at least {want}"
+                            ),
+                            method_data: super::pkinit::td_dh_parameters(&accepted),
+                            // No state: the next round restarts the exchange with a stronger
+                            // group, and there is nothing from this one to carry into it.
+                            state: Vec::new(),
+                        });
+                    }
                     Err(e) => {
                         return Err(Error::Kdc {
                             code: codes::KDC_ERR_PREAUTH_FAILED,

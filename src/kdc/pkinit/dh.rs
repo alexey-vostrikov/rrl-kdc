@@ -115,6 +115,34 @@ impl Group {
         self.bits
     }
 
+    /// This group's `DomainParameters`, encoded as the `dhpublicnumber` AlgorithmIdentifier's
+    /// parameters: `SEQUENCE { p [0] INTEGER, g [1] INTEGER, q [2] INTEGER }`.
+    ///
+    /// Written out rather than kept as a string because the only consumer is a client that was
+    /// refused and needs to be told which groups it may retry with — and a client parses exactly
+    /// the shape `from_domain_parameters` reads here.
+    pub fn domain_parameters(&self) -> Vec<u8> {
+        // Untagged, as X9.42's `DomainParameters` and PKCS#3's `DHParameter` both spell their
+        // fields — and as `from_domain_parameters` above reads them. Tagging them here would
+        // produce a blob this KDC itself cannot parse.
+        crate::der::seq(&[
+            crate::der::int_bytes(&self.p().to_bytes_be()),
+            crate::der::int_bytes(&self.g().to_bytes_be()),
+            crate::der::int_bytes(&self.q().to_bytes_be()),
+        ])
+    }
+
+    /// `AlgorithmIdentifier { dhpublicnumber, DomainParameters }` for this group.
+    pub fn alg_id(&self) -> Vec<u8> {
+        crate::der::seq(&[
+            crate::der::tlv(
+                crate::der::OBJECT_IDENTIFIER,
+                &oid_content(DH_PUBLIC_NUMBER),
+            ),
+            self.domain_parameters(),
+        ])
+    }
+
     /// The prime.
     pub fn p(&self) -> BigUint {
         BigUint::from_bytes_be(&unhex(if self.bits > 2048 {
@@ -390,6 +418,23 @@ pub fn octetstring2key(z: &[u8], len: usize) -> Vec<u8> {
         counter = counter.wrapping_add(1);
     }
     out.truncate(len);
+    out
+}
+
+/// OID content octets from its dotted text.
+pub fn oid_content(text: &str) -> Vec<u8> {
+    let parts: Vec<u64> = text.split('.').map(|p| p.parse().unwrap()).collect();
+    let mut out = vec![(40 * parts[0] + parts[1]) as u8];
+    for &part in &parts[2..] {
+        let mut chunk = vec![(part & 0x7f) as u8];
+        let mut rest = part >> 7;
+        while rest > 0 {
+            chunk.push(0x80 | (rest & 0x7f) as u8);
+            rest >>= 7;
+        }
+        chunk.reverse();
+        out.extend(chunk);
+    }
     out
 }
 

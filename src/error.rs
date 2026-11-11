@@ -168,6 +168,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod codes {
     /// No error.
     pub const KDC_ERR_NONE: i32 = 0;
+    /// The client's Diffie-Hellman group is one this realm does not accept (RFC 4556 §3.2.4).
+    ///
+    /// Its own code, not `PREAUTH_FAILED`, because it is the one PKINIT refusal a client can act
+    /// on: the `e-data` lists the groups the realm does accept, and a client that has something
+    /// stronger retries with it. A generic refusal ends the login instead.
+    pub const KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED: i32 = 65;
     /// The client principal is not in the database.
     pub const KDC_ERR_C_PRINCIPAL_UNKNOWN: i32 = 6;
     /// The service principal is not in the database.

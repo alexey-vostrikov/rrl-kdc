@@ -192,6 +192,18 @@ fn explicit<'a>(
 /// issuer, because the two have nothing in common but the word "refused".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PkinitError {
+    /// The client's Diffie-Hellman group is smaller than the realm allows.
+    ///
+    /// Separate from `Unsupported` because it is the one refusal with a next step: the KDC answers
+    /// `KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED` and lists the groups it does accept, so a client
+    /// with a stronger one retries instead of failing.
+    GroupTooWeak {
+        /// The size the client offered, in bits.
+        have: u32,
+        /// The floor the realm set.
+        want: u32,
+    },
+
     /// The `PA-DATA` is not a `PA-PK-AS-REQ` this KDC can read.
     Malformed(String),
     /// The client sent no signature, which is anonymous PKINIT — a different feature,
@@ -229,6 +241,11 @@ impl fmt::Display for PkinitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Malformed(m) => write!(f, "PA-PK-AS-REQ is malformed: {m}"),
+            Self::GroupTooWeak { have, want } => write!(
+                f,
+                "the client's Diffie-Hellman group is {have} bits, and this realm requires at \
+                 least {want} (pkinit_dh_min_bits)"
+            ),
             Self::Anonymous => write!(f, "PA-PK-AS-REQ carries no signature (anonymous PKINIT)"),
             Self::UntrustedIssuer => write!(
                 f,
@@ -1096,6 +1113,86 @@ mod trusted {
             return Err(PkinitError::BodyMismatch);
         }
         Ok(())
+    }
+}
+
+/// `TD-DH-PARAMETERS` (109): the groups a client may retry with, in `KDC_ERR_DH_KEY_PARAMETERS_
+/// NOT_ACCEPTED`'s `e-data`.
+///
+/// `TYPED-DATA ::= SEQUENCE OF TD`, `TD ::= SEQUENCE { data-type [0] INTEGER, data-value [1] OCTET
+/// STRING }`, and the value is a `SEQUENCE OF AlgorithmIdentifier` (RFC 4556 §3.2.4). The shape
+/// matters twice over: a client looks for the typed-data form on this error, and it reads the
+/// algorithm identifiers to decide whether it has anything stronger to offer.
+#[cfg(feature = "pkinit")]
+pub fn td_dh_parameters(groups: &[dh::Group]) -> Vec<u8> {
+    let algs: Vec<Vec<u8>> = groups.iter().map(|g| g.alg_id()).collect();
+    let td = crate::der::seq(&[
+        crate::der::field(0, crate::der::int(TD_DH_PARAMETERS)),
+        crate::der::field(1, crate::der::octets(&crate::der::seq(&algs))),
+    ]);
+    crate::der::seq(&[td])
+}
+
+/// `TD-DH-PARAMETERS`'s number, as `rrl-krb5`'s client reads it.
+#[cfg(feature = "pkinit")]
+pub const TD_DH_PARAMETERS: i64 = 109;
+
+#[cfg(all(test, feature = "pkinit"))]
+mod td_tests {
+    use super::*;
+
+    /// `TD-DH-PARAMETERS` has to be readable by a client: the typed-data wrapper, the number, and
+    /// inside it an `AlgorithmIdentifier` per accepted group. Parsed back here the way a client
+    /// parses it, because "we produced some octets" is not the property that matters.
+    #[test]
+    fn the_accepted_groups_travel_as_typed_data_a_client_can_read() {
+        let groups = [dh::Group::at_least(2048), dh::Group::at_least(4096)];
+        let encoded = td_dh_parameters(&groups);
+
+        let mut r = crate::der::Reader::new(&encoded);
+        let outer = r.next_tlv("TYPED-DATA").expect("a SEQUENCE");
+        assert_eq!(outer.tag, crate::der::SEQUENCE);
+        let mut tds = crate::der::Reader::new(outer.content);
+        let td = tds.next_tlv("TD").expect("one typed datum");
+        let mut f = crate::der::Reader::new(td.content);
+        let ty = f.next_tlv("data-type").expect("data-type [0]");
+        let mut tr = crate::der::Reader::new(ty.content);
+        let ty = tr.next_tlv("INTEGER").expect("an INTEGER");
+        assert_eq!(
+            crate::der::as_int("data-type", ty.content).unwrap(),
+            TD_DH_PARAMETERS,
+            "the type a client looks for"
+        );
+        let value = f.next_tlv("data-value").expect("data-value [1]");
+        let mut vr = crate::der::Reader::new(value.content);
+        let octets = vr.next_tlv("OCTET STRING").expect("an OCTET STRING");
+
+        // `SEQUENCE OF AlgorithmIdentifier`, one per group, each of which the KDC's own parser
+        // reads back as the group it names — the round trip that matters.
+        let mut algs = crate::der::Reader::new(octets.content);
+        let list = algs.next_tlv("algorithms").expect("a SEQUENCE");
+        let mut seq = crate::der::Reader::new(list.content);
+        let mut seen = Vec::new();
+        while !seq.is_empty() {
+            let alg = seq
+                .next_tlv("AlgorithmIdentifier")
+                .expect("an AlgorithmIdentifier");
+            let mut af = crate::der::Reader::new(alg.content);
+            let oid = af.next_tlv("algorithm").expect("an OID");
+            assert_eq!(
+                crate::der::decode_oid("algorithm", oid.content).unwrap(),
+                dh::DH_PUBLIC_NUMBER,
+                "a client is offered finite-field DH here, and it checks the OID"
+            );
+            let params = af.next_tlv("parameters").expect("DomainParameters");
+            let group = dh::Group::from_domain_parameters(&crate::der::tlv(
+                crate::der::SEQUENCE,
+                params.content,
+            ))
+            .expect("the group parses back");
+            seen.push(group.bits());
+        }
+        assert_eq!(seen, vec![2048, 4096]);
     }
 }
 

@@ -947,7 +947,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#932838c9bbbaa7d6bb6399754c2485f075a94bdb"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#12ae2bcd0c9263c768e6fd0c952e7cf317ab8d2b"
 dependencies = [
  "hmac",
  "rrl-crypto",

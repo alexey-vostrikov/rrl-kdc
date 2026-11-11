@@ -617,16 +617,6 @@ impl Kdc {
             // is over the whole buffer, so a copied one would not verify.
             authorization_data: self.pac_authorization_data(&client, &ticket_key.0, authtime)?,
         };
-        // TEMP-DIAG: the three enctypes a client has to agree with before it can use the ticket.
-        if std::env::var_os("KDC_TGS_DIAG").is_some() {
-            eprintln!(
-                "tgs-diag: sname={sname} requested={:?} session={session_enctype:?} \
-                 ticket_key={:?} reply_key={:?}",
-                usable,
-                ticket_key.0.enctype(),
-                proven.reply_key.enctype()
-            );
-        }
         let ticket = Ticket {
             realm: config.realm().to_owned(),
             // What the client asked for, which may not be the entry's own name: the
@@ -687,11 +677,18 @@ impl Kdc {
         // value it is handed, and a reply sealed in the unstrengthened key is one it cannot open -
         // measured as `Failed to decode encpart in ticket` from Samba's client, which armors where
         // MIT's `kvno` does not, so the same KDC answered MIT and not Samba.
-        // Only for an **explicit** armor ticket. The implicit form (RFC 6113 5.4.2.6) has no
-        // strength to add: its key already comes from the PA-TGS-REQ subkey, and a client that
-        // armors that way reconstructs no strengthen key - sealing the reply in a strengthened one
-        // leaves it with a reply it cannot open, which it reports as a decode failure.
-        let (strengthen_key, sealed_with) = if explicit_armor {
+        // Only when the reply is sealed in the TGT's session key - that is, when the client sent no
+        // subkey. Heimdal's own rule, from `get_cred.c`: with a subkey the reply is opened with it
+        // directly under usage 9; without one, the session key is first run through
+        // `fast_tgs_strengthen_key` and usage 8. Strengthening a subkey seals the reply in a key the
+        // client never derives, and it reports that as `Failed to decode encpart in ticket` - a
+        // message about a ticket, for a reply it could not open.
+        // Both conditions, and Heimdal needs both: `fast_tgs_strengthen_key` is a no-op when there
+        // is no FAST state, so an unarmored exchange is never strengthened; and the subkey branch
+        // opens the reply with the subkey directly, so an armored one that sent a subkey is not
+        // strengthened either.
+        let strengthen = armor.is_some() && proven.subkey.is_none();
+        let (strengthen_key, sealed_with) = if strengthen {
             let (strength, strengthened) =
                 super::fast::strengthen(self.cipher(), &proven.reply_key)?;
             (Some(strength), strengthened)

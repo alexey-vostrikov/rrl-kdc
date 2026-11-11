@@ -19,8 +19,13 @@ use std::time::Duration;
 use crate::error::{Error, Result, codes};
 use crate::kdc::Kdc;
 
-/// RFC 4120 §7.2.1: a reply that does not fit in this many octets goes over
-/// TCP, and UDP gets `KDC_ERR_RESPONSE_TOO_BIG` instead.
+/// RFC 4120 §7.2.1: a reply that does not fit in this many octets goes over TCP, and UDP gets
+/// `KDC_ERR_RESPONSE_TOO_BIG` instead.
+///
+/// Heimdal's default, and this crate's: an Ethernet MTU minus the IP and UDP headers, which is what
+/// a datagram carries without being fragmented anywhere on the path. The value a realm runs with is
+/// [`crate::kdc::KdcConfig::max_datagram_reply_length`] — this is only where that default comes
+/// from, and the value the engine uses when it has been given no configuration of its own.
 pub const MAX_DATAGRAM_REPLY: usize = 1400;
 
 /// A KDC answering on loopback until it is dropped.
@@ -147,7 +152,8 @@ fn serve_udp(socket: &UdpSocket, kdc: &Kdc, stop: &AtomicBool) {
         // The peer's address is known here and nowhere else: the engine cannot
         // see a socket, and a check it cannot answer would have to pass.
         let reply = kdc.handle_from(&buf[..n], now(), Some(from.ip()));
-        let reply = if reply.len() > MAX_DATAGRAM_REPLY {
+        let limit = kdc.config().max_datagram_reply_length();
+        let reply = if reply.len() > limit {
             too_big(&reply, kdc)
         } else {
             reply

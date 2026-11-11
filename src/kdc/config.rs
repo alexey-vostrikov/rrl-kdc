@@ -107,6 +107,16 @@ pub struct KdcConfig {
     /// three session-key options above: with it on, the KDC ignores the entry's key order and
     /// walks its own list. Turning it off is for an entry whose key order was chosen on purpose.
     use_strongest_server_key: bool,
+    /// `max-kdc-datagram-reply-length`: how large a reply may be before it is refused over UDP
+    /// with `KDC_ERR_RESPONSE_TOO_BIG` and the client is sent to TCP.
+    ///
+    /// Heimdal's default is 1400 — an Ethernet MTU minus IP and UDP headers, which is what a
+    /// datagram can carry without being fragmented anywhere on the path. The value belongs to the
+    /// deployment: a realm whose replies carry a large PAC and whose clients are all on a network
+    /// with a 9000-octet MTU may raise it, and one behind a tunnel whose MTU is smaller must lower
+    /// it, because a fragmented Kerberos datagram is one that some middlebox drops silently and the
+    /// client then waits for a timeout instead of retrying over TCP.
+    max_datagram_reply_length: usize,
     /// `strict-nametypes`: refuse a `krbtgt` name whose name type is neither `NT-SRV-INST` nor
     /// `NT-UNKNOWN`.
     ///
@@ -159,6 +169,7 @@ impl KdcConfig {
             preauth_use_strongest_session_key: false,
             use_strongest_server_key: true,
             strict_nametypes: false,
+            max_datagram_reply_length: crate::transport::MAX_DATAGRAM_REPLY,
         })
     }
 
@@ -312,6 +323,11 @@ impl KdcConfig {
     /// `strict-nametypes`.
     pub fn strict_nametypes(&self) -> bool {
         self.strict_nametypes
+    }
+
+    /// `max-kdc-datagram-reply-length`: the largest reply this KDC sends over UDP.
+    pub fn max_datagram_reply_length(&self) -> usize {
+        self.max_datagram_reply_length
     }
 
     /// The realms this KDC accepts as transit realms, when an operator listed them. `None`
@@ -476,13 +492,40 @@ impl KdcConfig {
                 self.strict_nametypes = parse_bool(value)?;
                 Ok(())
             }
+            "max-kdc-datagram-reply-length" | "max_kdc_datagram_reply_length" => {
+                // A UDP datagram cannot exceed 65507 octets of payload (65535 minus the IP and UDP
+                // headers), so a larger value is not a policy this KDC can honour. Refusing at
+                // startup rather than clipping: an operator who wrote 70000 believes something
+                // about the network that is not true, and silently sending 65507 would hide it
+                // until the first client that could not receive one.
+                const MAX_UDP_PAYLOAD: usize = 65_507;
+                let n: usize = value.trim().parse().map_err(|_| {
+                    Error::Config(format!(
+                        "option {name}: {value:?} is not a number of octets"
+                    ))
+                })?;
+                if n == 0 {
+                    return Err(Error::Config(format!(
+                        "option {name} must be positive: a KDC that may send no datagram at all \
+                         would answer every UDP request with RESPONSE_TOO_BIG"
+                    )));
+                }
+                if n > MAX_UDP_PAYLOAD {
+                    return Err(Error::Config(format!(
+                        "option {name}: {n} octets exceeds the largest UDP payload ({MAX_UDP_PAYLOAD})"
+                    )));
+                }
+                self.max_datagram_reply_length = n;
+                Ok(())
+            }
             other => Err(Error::Config(format!(
                 "KDC option {other:?} is not implemented by this engine. \
                  Implemented: max_life, max_renewable_life, clockskew, require-preauth, \
                  allowed_enctypes, check-ticket-addresses, allow-null-ticket-addresses, \
                  warn-ticket-addresses, transited-policy, transited-realms, require-pac, \
                  disable-pac, tgt-use-strongest-session-key, svc-use-strongest-session-key, \
-                 preauth-use-strongest-session-key, use-strongest-server-key, strict-nametypes. \
+                 preauth-use-strongest-session-key, use-strongest-server-key, strict-nametypes, \
+                 max-kdc-datagram-reply-length. \
                  Refusing rather than \
                  ignoring it: a KDC that silently \
                  does not do what its configuration says is worse than one that will not start."
@@ -569,16 +612,36 @@ mod tests {
     #[test]
     fn an_unimplemented_option_is_refused_by_name() {
         let mut c = KdcConfig::new("R").unwrap();
-        // `max-kdc-datagram-reply-length` is Heimdal's and is not implemented here yet, which is
-        // what this test is for: the refusal has to name the option, not just happen.
-        let err = c
-            .apply("max-kdc-datagram-reply-length", "1400")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("max-kdc-datagram-reply-length"), "{err}");
+        // `kdc-warn-pwexpire` is Heimdal's and is not implemented here, which is what this test is
+        // for: the refusal has to name the option, not just happen.
+        let err = c.apply("kdc-warn-pwexpire", "1d").unwrap_err().to_string();
+        assert!(err.contains("kdc-warn-pwexpire"), "{err}");
         assert!(err.contains("not implemented"), "{err}");
         assert!(c.apply("enable-pkinit", "true").is_err());
         assert!(c.apply("enable_fast", "true").is_err());
+    }
+
+    /// `max-kdc-datagram-reply-length`: the default is Heimdal's 1400, a value is honoured, and
+    /// both ends of the range are refused at startup — zero, which would answer every UDP request
+    /// with `RESPONSE_TOO_BIG`, and anything above what a datagram can carry.
+    #[test]
+    fn the_datagram_limit_is_heimdals_by_default_and_bounded_when_set() {
+        let mut c = KdcConfig::new("R").unwrap();
+        assert_eq!(c.max_datagram_reply_length(), 1400);
+        c.apply("max-kdc-datagram-reply-length", "9000").unwrap();
+        assert_eq!(c.max_datagram_reply_length(), 9000);
+        c.apply("max_kdc_datagram_reply_length", "576").unwrap();
+        assert_eq!(c.max_datagram_reply_length(), 576);
+
+        for bad in ["0", "70000", "-1", "big"] {
+            assert!(
+                c.apply("max-kdc-datagram-reply-length", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        // Nothing above the largest UDP payload: 65507 octets is 65535 minus the two headers.
+        c.apply("max-kdc-datagram-reply-length", "65507").unwrap();
+        assert!(c.apply("max-kdc-datagram-reply-length", "65508").is_err());
     }
 
     /// Every option this engine understands, with its default and its non-default, so that a name

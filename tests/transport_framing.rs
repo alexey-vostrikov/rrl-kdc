@@ -17,11 +17,14 @@ use std::sync::Arc;
 use rrl_kdc::crypto::{Enctype, OwnCipher};
 use rrl_kdc::hdb::{Hdb, HdbEntry, MemoryHdb};
 use rrl_kdc::kdc::{Kdc, KdcConfig};
-use rrl_kdc::transport::{read_frame, serve_kpasswd_loopback, serve_loopback, write_frame};
+use rrl_kdc::transport::{
+    read_frame, serve_kpasswd_loopback, serve_loopback, serve_on, write_frame,
+};
 
 const REALM: &str = "EXAMPLE.COM";
 
-fn kdc() -> Kdc {
+/// A realm with nothing but `krbtgt`: enough for the transport to have something to answer for.
+fn db() -> MemoryHdb {
     let cipher = OwnCipher;
     let db = MemoryHdb::new();
     let mut krbtgt = HdbEntry::krbtgt(REALM);
@@ -29,10 +32,14 @@ fn kdc() -> Kdc {
         .add_password_key(&cipher, Enctype::Aes256Sha1, b"master", 1)
         .unwrap();
     db.insert(krbtgt).unwrap();
+    db
+}
+
+fn kdc() -> Kdc {
     Kdc::new(
         KdcConfig::new(REALM).unwrap(),
-        Arc::new(db) as Arc<dyn Hdb>,
-        Arc::new(cipher),
+        Arc::new(db()) as Arc<dyn Hdb>,
+        Arc::new(OwnCipher),
     )
 }
 
@@ -149,6 +156,76 @@ fn the_udp_and_tcp_ports_are_both_serving() {
         })
         .collect();
     assert_eq!(replies, vec![true, true], "both transports must answer");
+}
+
+/// `max-kdc-datagram-reply-length` changes what UDP answers.
+///
+/// The same request, twice: with a limit below the size of any reply, UDP gets
+/// `KDC_ERR_RESPONSE_TOO_BIG` (52) and the client is told to retry over TCP; with the option raised
+/// the reply is the engine's own answer. One test with both halves, because a KDC that always said
+/// 52 would pass the first alone.
+#[test]
+fn the_datagram_limit_decides_whether_udp_answers_or_refuses() {
+    let reply_code = |limit: usize| {
+        let mut config = KdcConfig::new(REALM).unwrap();
+        config
+            .apply("max-kdc-datagram-reply-length", &limit.to_string())
+            .unwrap();
+        let running = serve_loopback(Kdc::new(
+            config,
+            Arc::new(db()) as Arc<dyn Hdb>,
+            Arc::new(OwnCipher),
+        ));
+        use std::net::UdpSocket;
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // A message the engine refuses: what it says does not matter here, only its size, and an
+        // error is smaller than any limit tried below.
+        socket.send_to(&[0x30, 0x00], running.addr()).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, _) = socket.recv_from(&mut buf).expect("a reply over UDP");
+        running.stop();
+        rrl_kdc::msg::KrbError::decode(&buf[..n])
+            .expect("a KRB-ERROR")
+            .code
+    };
+
+    assert_eq!(
+        reply_code(60),
+        rrl_kdc::error::codes::KDC_ERR_RESPONSE_TOO_BIG,
+        "a limit below the reply's size must send the client to TCP"
+    );
+    assert_ne!(
+        reply_code(4000),
+        52,
+        "with room for it the engine's own answer comes back"
+    );
+}
+
+/// An explicit port that cannot be bound is a failure with the address in the message, not a
+/// retry loop.
+///
+/// The race the retry exists for is a kernel handing out a port for TCP that it then refuses for
+/// UDP; that can only happen to a port nobody chose. An operator writing a port down is making a
+/// decision, so the bind either works or says which address failed — sixteen silent attempts and
+/// then the same failure is a worse message than the failure.
+#[test]
+#[should_panic(expected = "cannot bind UDP on 127.0.0.1:")]
+fn an_explicit_port_that_cannot_be_bound_fails_with_the_address() {
+    // UDP held by somebody else on the port the test is about to name, its TCP side free: exactly
+    // the collision `serve_on` must report rather than retry.
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("a port to occupy");
+    let port = occupied.local_addr().expect("an address").port();
+    serve_on(
+        ("127.0.0.1", port),
+        Kdc::new(
+            KdcConfig::new(REALM).unwrap(),
+            Arc::new(db()) as Arc<dyn Hdb>,
+            Arc::new(OwnCipher),
+        ),
+    );
 }
 
 #[test]

@@ -50,7 +50,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `admin::wire` — the operations as values, with the authorization in one place | done |
 | `admin::json` — the JSON form (feature `admin-json`) | done, for a REST front end to wrap |
 | `hdb::ldap` — an entry as directory attributes (feature `hdb-ldap`) | done: Heimdal's schema, plus the Microsoft spellings |
-| `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, chpass, chrand |
+| `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, modify, rename, chpass, chrand, get/set/del string attributes, extract_keys |
 | `hdb::ad_blob` — `supplementalCredentials` (feature `hdb-ldap`) | done both ways: written as a projection, read back when `krb5Key` is absent |
 | `kdc::pac` — the privilege attribute certificate | done: envelope, `PAC_CLIENT_INFO`, `KERB_VALIDATION_INFO`, both signatures |
 | `kdc::logon_info` — NDR for `KERB_VALIDATION_INFO` | done: encoded by hand, checked by impacket and by a live client |
@@ -229,13 +229,20 @@ up with an account enabled in the directory and disabled in the realm.
 
 `kadmin` speaks MIT's `kadm5` protocol over ONC RPC with RPCSEC_GSS privacy, and
 this crate answers it: the acceptance tests drive a real `krb5` 1.0
-`AdminClient` — connect, handshake, `get_principals`, create, delete, `chpass`,
-`chrand`, and then log in with an ordinary client using the password that was just
-set. Authorization is the same `Policy` the in-process and JSON front ends use, so
-a `kadmin` user without rights gets MIT's `KADM5_AUTH_*` and no data.
+`AdminClient` — connect, handshake, `get_principals`, create, delete, `modprinc`,
+`renprinc`, `chpass`, `chrand`, `getstr`/`setstr`/`delstr`, `extract_keys`, and then
+log in with an ordinary client using the password that was just set or the keytab
+the extracted keys built. Authorization is the same `Policy` the in-process and JSON
+front ends use, so a `kadmin` user without rights gets MIT's `KADM5_AUTH_*` and no
+data; `extract_keys` needs a right of its own, because handing out keys in the clear
+is a stronger thing to be allowed than writing a keytab.
+
+String attributes live in `HDB-Ext-Strings [16]`, an extension of this crate's own:
+Heimdal has none (`setstr` is MIT's), and its `HDB-extension` CHOICE ends with `...`,
+so a Heimdal KDC reading such an entry skips what it does not know.
 
 Not implemented, and answered with an error rather than a fabricated success:
-policies, string attributes, `extract_keys`.
+policies.
 
 Not implemented in the exchanges either, and refused by name rather than half-done:
 

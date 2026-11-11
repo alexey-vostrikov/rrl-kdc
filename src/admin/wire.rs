@@ -57,6 +57,11 @@ pub enum Right {
     PruneKeys,
     /// Export a keytab, which is the entry's long-term keys in a file.
     ExportKeytab,
+    /// Read a principal's long-term keys in the clear, which is what `ktadd -norandkey` does.
+    ///
+    /// Separate from [`Right::ExportKeytab`] because it is a stronger thing to be allowed: a keytab
+    /// is written by the server where it says, and keys handed back are keys the caller can keep.
+    ExtractKeys,
 }
 
 /// A set of [`Right`]s.
@@ -85,8 +90,10 @@ impl Rights {
     pub const PRUNE_KEYS: Rights = Rights(1 << 6);
     /// Exporting keytabs.
     pub const EXPORT_KEYTAB: Rights = Rights(1 << 7);
+    /// Reading keys in the clear.
+    pub const EXTRACT_KEYS: Rights = Rights(1 << 8);
     /// Everything.
-    pub const ALL: Rights = Rights(0xff);
+    pub const ALL: Rights = Rights(0x1ff);
 
     /// Adds a right.
     pub fn with(self, right: Right) -> Rights {
@@ -104,6 +111,7 @@ impl Rights {
             Right::SetPassword => 1 << 5,
             Right::PruneKeys => 1 << 6,
             Right::ExportKeytab => 1 << 7,
+            Right::ExtractKeys => 1 << 8,
         })
     }
 

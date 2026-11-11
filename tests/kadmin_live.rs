@@ -274,6 +274,83 @@ fn a_stock_kadmin_client_modifies_a_principal() {
     stand.kadmin_stand.stop();
 }
 
+/// `ktadd -norandkey`: the keys the admin server hands out are the keys the KDC will accept.
+///
+/// The point of the test is not that the reply parsed — it is that a ticket obtained with the
+/// extracted keytab is issued: keys that look right and open nothing are the failure this catches.
+#[test]
+fn a_stock_kadmin_client_extracts_the_keys_a_keytab_needs() {
+    let mut stand = stand_with(owner());
+    let stored = stand.db.fetch(&p("alice")).unwrap().unwrap();
+
+    let extracted = stand
+        .client
+        .extract_keys(&kp("alice"), None)
+        .expect("extract_keys");
+    assert_eq!(
+        extracted.len(),
+        stored.keys.len(),
+        "one record per key, not one per enctype or per kvno"
+    );
+    for (kvno, key) in &extracted {
+        let record = stored
+            .keys
+            .iter()
+            .find(|k| k.kvno == *kvno && k.key.enctype().id() == key.enctype())
+            .unwrap_or_else(|| {
+                panic!("kvno {kvno}, enctype {} is not in the entry", key.enctype())
+            });
+        assert_eq!(
+            key.bytes(),
+            record.key.bytes(),
+            "the bytes must be the stored ones"
+        );
+    }
+
+    // And the keytab built from them authenticates: a wrong key would fail every exchange after
+    // the initial ticket was handed out, which is exactly what a service operator would report.
+    let path = std::env::temp_dir()
+        .join(format!("rrl-kadmin-{}-alice.keytab", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    let _ = std::fs::remove_file(&path);
+    stand
+        .client
+        .ktadd(&kp("alice"), &path, false)
+        .expect("ktadd -norandkey");
+    let keytab = krb5::Keytab::load(&path).expect("the keytab must be readable");
+    stand
+        .kdc
+        .login_with_keytab(
+            &krb5::Principal::parse(&p("alice").to_string()).unwrap(),
+            &keytab,
+        )
+        .expect("the extracted keys must be the ones the KDC knows");
+
+    // A kvno the entry does not have is a refusal, not an empty keytab.
+    let absent = stand.client.extract_keys(&kp("alice"), Some(9));
+    assert!(absent.is_err(), "kvno 9 is not in the entry: {absent:?}");
+    let _ = std::fs::remove_file(&path);
+    stand.kadmin_stand.stop();
+}
+
+/// Extracting keys is its own right: reading an entry's metadata must not be enough to walk away
+/// with the keys themselves.
+#[test]
+fn extracting_keys_needs_the_extract_right() {
+    // The administrator may read and list, and nothing more.
+    let reader = Arc::new(Grants::new().grant(&p("kadmin/admin"), Rights::READ | Rights::LIST));
+    let mut stand = stand_with(reader);
+    let refused = stand.client.extract_keys(&kp("alice"), None);
+    assert!(
+        matches!(refused, Err(krb5::kadmin::Error::Kadm5(_))),
+        "a reader must be refused with a kadm5 status, not a key list: {refused:?}"
+    );
+    // And what it may do still works, so the refusal is about the right and not the connection.
+    stand.client.get_principal(&kp("alice")).expect("get");
+    stand.kadmin_stand.stop();
+}
+
 /// `setstr` / `getstr` / `delstr` over the wire, from the client that writes them.
 #[test]
 fn a_stock_kadmin_client_sets_and_reads_string_attributes() {

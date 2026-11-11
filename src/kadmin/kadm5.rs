@@ -53,11 +53,14 @@ pub mod proc_ {
     pub const GET_STRINGS: u32 = 23;
     /// `set_string`, which with a NULL value deletes the attribute.
     pub const SET_STRING: u32 = 24;
+    /// `extract_keys`: the long-term keys in the clear, for `ktadd -norandkey`.
+    pub const EXTRACT_KEYS: u32 = 26;
 }
 
 pub use proc_::{
-    CHPASS_PRINCIPAL, CHRAND_PRINCIPAL3, CREATE_PRINCIPAL, DELETE_PRINCIPAL, GET_PRINCIPAL,
-    GET_PRINCS, GET_PRIVS, GET_STRINGS, INIT, MODIFY_PRINCIPAL, RENAME_PRINCIPAL, SET_STRING,
+    CHPASS_PRINCIPAL, CHRAND_PRINCIPAL3, CREATE_PRINCIPAL, DELETE_PRINCIPAL, EXTRACT_KEYS,
+    GET_PRINCIPAL, GET_PRINCS, GET_PRIVS, GET_STRINGS, INIT, MODIFY_PRINCIPAL, RENAME_PRINCIPAL,
+    SET_STRING,
 };
 
 /// The field masks of a `kadm5_principal_ent_rec` (`kadm5/admin.h`).
@@ -535,6 +538,46 @@ pub fn encode_strings(strings: &[(String, String)]) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// A `extract_keys` request: the principal and the kvno, where zero means every kvno the database
+/// holds.
+pub fn decode_extract_keys(args: &[u8]) -> std::result::Result<(Principal, Option<u32>), u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let name = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_PRINC)?;
+    let principal = Principal::parse(&name).map_err(|_| UNK_PRINC)?;
+    // An older client sends no kvno at all, and MIT reads that as "all of them" — the same meaning
+    // as an explicit zero, so the two cases collapse here.
+    let kvno = r.u32().ok().filter(|k| *k != 0);
+    Ok((principal, kvno))
+}
+
+/// `KRB5_KDB_SALTTYPE_NORMAL` and `KRB5_KDB_SALTTYPE_SPECIAL`, the two a key record can name.
+///
+/// A key with no recorded salt took the enctype's default construction, which is what `NORMAL`
+/// means; one with octets was built from those octets, which is `SPECIAL`. The client that asks for
+/// keys rebuilds nothing from these two fields, but a client that does reads them correctly.
+const SALTTYPE_NORMAL: i32 = 0;
+const SALTTYPE_SPECIAL: i32 = 4;
+
+/// The body of an `extract_keys` reply: the key records, each with its own kvno.
+///
+/// The count appears once here, unlike in `get_strings`: `kadm5_key_data` is an XDR array and the
+/// decoder reads the array count alone.
+pub fn encode_key_data(keys: &[crate::hdb::HdbKey]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(keys.len() as u32);
+    for record in keys {
+        w.u32(record.kvno);
+        w.i32(record.key.enctype().id());
+        w.opaque(record.key.bytes());
+        match &record.salt {
+            Some(salt) => w.i32(SALTTYPE_SPECIAL).opaque(salt),
+            None => w.i32(SALTTYPE_NORMAL).opaque(&[]),
+        };
+    }
+    w.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +680,71 @@ mod tests {
         w.i32(0).i32(0).bool(true).u32(0);
         w.u32(mask);
         w.into_bytes()
+    }
+
+    /// An extract request carries a kvno, and zero means every one — the same meaning as an older
+    /// client that sends no kvno at all.
+    #[test]
+    fn an_extract_request_reads_zero_as_all_kvnos() {
+        for (written, want) in [(Some(3u32), Some(3u32)), (Some(0), None), (None, None)] {
+            let mut w = Writer::new();
+            w.u32(API_VERSION_2).nullstring(Some("alice@R"));
+            if let Some(kvno) = written {
+                w.u32(kvno);
+            }
+            let (principal, kvno) = decode_extract_keys(&w.into_bytes()).unwrap();
+            assert_eq!(principal.to_string(), "alice@R");
+            assert_eq!(kvno, want, "written {written:?}");
+        }
+    }
+
+    /// The key records go out with one count and one salt type per key — the two places a decoder
+    /// that assumed "count twice" (as `get_strings` has it) or "no salt" would read past.
+    #[test]
+    fn key_records_carry_their_kvno_enctype_and_salt() {
+        use crate::crypto::{Enctype, Key};
+        let keys = vec![
+            crate::hdb::HdbKey {
+                kvno: 2,
+                key: Key::new(Enctype::Aes256Sha1, [7u8; 32]).unwrap(),
+                salt: None,
+            },
+            crate::hdb::HdbKey {
+                kvno: 2,
+                key: Key::new(Enctype::Aes128Sha1, [9u8; 16]).unwrap(),
+                salt: Some(b"EXAMPLE.COMalice".to_vec()),
+            },
+        ];
+        let bytes = encode_key_data(&keys);
+        let mut r = Reader::new(&bytes);
+        let n = r.u32().unwrap();
+        assert_eq!(n, 2, "the array count appears once");
+        let first_kvno = r.u32().unwrap();
+        let first_enctype = r.i32().unwrap();
+        let first_key = r.opaque().unwrap().to_vec();
+        let first_salttype = r.i32().unwrap();
+        let first_salt = r.opaque().unwrap().to_vec();
+        assert_eq!(
+            (first_kvno, first_enctype),
+            (2, 18),
+            "aes256-cts-hmac-sha1-96"
+        );
+        assert_eq!(first_key, [7u8; 32]);
+        assert_eq!(
+            (first_salttype, first_salt.len()),
+            (0, 0),
+            "no salt recorded"
+        );
+
+        let _second_kvno = r.u32().unwrap();
+        let second_enctype = r.i32().unwrap();
+        let _second_key = r.opaque().unwrap();
+        let second_salttype = r.i32().unwrap();
+        let second_salt = r.opaque().unwrap().to_vec();
+        assert_eq!(second_enctype, 17, "aes128-cts-hmac-sha1-96");
+        assert_eq!(second_salttype, 4, "a recorded salt is SALTTYPE_SPECIAL");
+        assert_eq!(second_salt, b"EXAMPLE.COMalice");
+        assert!(r.rest().is_empty(), "and nothing follows the last key");
     }
 
     #[test]

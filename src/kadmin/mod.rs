@@ -234,6 +234,34 @@ impl Kadmin {
                 })?;
                 Ok(Vec::new())
             }
+            kadm5::EXTRACT_KEYS => {
+                // A stronger right than `Keytab`: the caller keeps the keys, so this is the one
+                // place where a per-realm policy has to say yes to the keys themselves.
+                self.require(actor, Right::ExtractKeys)?;
+                let (principal, kvno) = kadm5::decode_extract_keys(args).inspect_err(|status| {
+                    log_refusal(&format!("extract_keys: the request was refused ({status})"));
+                })?;
+                let entry = self.admin.get(&principal).map_err(|e| {
+                    log_refusal(&format!("extract_keys {principal}: {e}"));
+                    status_of(e)
+                })?;
+                let keys: Vec<crate::hdb::HdbKey> = entry
+                    .keys
+                    .into_iter()
+                    .filter(|k| kvno.is_none_or(|want| k.kvno == want))
+                    .collect();
+                // Asking for a kvno the entry does not have is not "no keys": a caller that
+                // builds a keytab from an empty answer would write a keytab that authenticates
+                // nothing, and would blame the service rather than the request.
+                if keys.is_empty() {
+                    log_refusal(&format!(
+                        "extract_keys {principal}: no keys at kvno {}",
+                        kvno.map(|k| k.to_string()).unwrap_or_else(|| "any".into())
+                    ));
+                    return Err(kadm5::UNK_PRINC);
+                }
+                Ok(kadm5::encode_key_data(&keys))
+            }
             kadm5::GET_STRINGS => {
                 self.require(actor, Right::Read)?;
                 let principal = kadm5::decode_get_strings(args).inspect_err(|status| {

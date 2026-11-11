@@ -700,7 +700,7 @@ impl Kdc {
         // `[APPLICATION 26]` as implicit - the sequence's *contents* behind the tag, with no
         // inner SEQUENCE. RFC 4120's module says EXPLICIT, which is what `encode` writes.
         if std::env::var_os("KDC_TGS_IMPLICIT").is_some()
-            && let Some(stripped) = strip_inner_sequence(&plaintext)
+            && let Some(stripped) = Self::strip_inner_sequence(&plaintext)
         {
             plaintext = stripped;
         }

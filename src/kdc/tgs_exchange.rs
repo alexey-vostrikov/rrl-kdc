@@ -696,6 +696,22 @@ impl Kdc {
             (None, proven.reply_key.clone())
         };
         let plaintext = rep_part.encode(msg::ENC_TGS_REP_PART);
+        if std::env::var_os("KDC_TGS_DIAG").is_some() {
+            eprintln!(
+                "tgs-diag: sname={sname} armor={} subkey={:?} reply_usage={} strengthened={} \
+                 sealed_key={:?} plaintext={}",
+                if explicit_armor {
+                    "explicit"
+                } else {
+                    "implicit"
+                },
+                proven.subkey.as_ref().map(|k| k.enctype()),
+                proven.reply_usage,
+                strengthen,
+                sealed_with.enctype(),
+                plaintext.len()
+            );
+        }
         // TEMP-DIAG: the plaintext the client has to parse once it has opened the reply.
         if std::env::var_os("KDC_DUMP").is_some() {
             let _ = std::fs::write("/tmp/kdc-enctgsrep.der", &plaintext);

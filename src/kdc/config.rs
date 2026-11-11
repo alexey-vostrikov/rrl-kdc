@@ -72,6 +72,51 @@ pub struct KdcConfig {
     /// configuration — so the explicit list is an option here and the hierarchy is the
     /// default.
     transited_realms: Option<Vec<String>>,
+    /// `require-pac`: a ticket-granting ticket that carries no PAC is treated as revoked.
+    ///
+    /// Heimdal's meaning, and narrower than it sounds: the KDC does not refuse to *issue* a
+    /// ticket when no PAC can be built (it issues one without, which is a realm that answers for
+    /// an account the directory does not know). What it refuses is to *accept* such a TGT in the
+    /// TGS — a client holding a TGT without a PAC in a realm that requires one holds a TGT this
+    /// KDC would not have issued, and the code for that is `KRB5KDC_ERR_TGT_REVOKED`.
+    require_pac: bool,
+    /// `disable-pac`: issue no PAC at all, whatever the entry flags and the client ask for.
+    disable_pac: bool,
+    /// `tgt-use-strongest-session-key`: pick the TGS session key's enctype by this KDC's own
+    /// preference rather than by the client's list.
+    ///
+    /// Heimdal's default is off, and off means **the client's order** — the first enctype in the
+    /// request's `etype` list that this KDC and the service both support. The option exists to
+    /// encourage stronger enctypes against a client that still lists weaker ones first; it does
+    /// not exist to make "strongest" the default, and a KDC that always used its own order would
+    /// be answering a question the client asked in a particular order.
+    tgt_use_strongest_session_key: bool,
+    /// `svc-use-strongest-session-key`: the same for a session key granted in an AS exchange —
+    /// the TGT's own session key, whose "service" is `krbtgt`. Heimdal's name for the AS case;
+    /// its defaults and its meaning are the same as the TGS one's.
+    svc_use_strongest_session_key: bool,
+    /// `preauth-use-strongest-session-key`: the same for the enctype a client is asked to
+    /// pre-authenticate with (`ETYPE-INFO2`). Separate from the two above because a realm may
+    /// want strong pre-authentication keys long before it is willing to change what every
+    /// service's tickets are sealed with.
+    preauth_use_strongest_session_key: bool,
+    /// `use-strongest-server-key`: seal a ticket in the strongest key the *service* has, by this
+    /// KDC's preference, rather than in the first of the service's keys in storage order.
+    ///
+    /// Heimdal's default is **on**, which is why this one reads the other way round from the
+    /// three session-key options above: with it on, the KDC ignores the entry's key order and
+    /// walks its own list. Turning it off is for an entry whose key order was chosen on purpose.
+    use_strongest_server_key: bool,
+    /// `strict-nametypes`: refuse a `krbtgt` name whose name type is neither `NT-SRV-INST` nor
+    /// `NT-UNKNOWN`.
+    ///
+    /// Heimdal's rule (`kdc/misc.c:name_type_ok`) and nothing wider: names that are not `krbtgt`
+    /// are unaffected, and `NT-ENTERPRISE` is handled where enterprise names are resolved, not
+    /// here. What it protects is the cross-realm lookup: a `krbtgt/REALM@REALM` sent as
+    /// `NT-PRINCIPAL` is a different name in Heimdal's database, and a KDC that ignored the type
+    /// would answer for a ticket-granting ticket nobody asked for. Heimdal's default is
+    /// **off** — the parenthetical in the task list that called it `true` was wrong.
+    strict_nametypes: bool,
 }
 
 impl KdcConfig {
@@ -104,6 +149,16 @@ impl KdcConfig {
             addresses: crate::address::AddressPolicy::default(),
             transited_policy: TransitedPolicy::AlwaysCheck,
             transited_realms: None,
+            // Every default below is Heimdal's (`kdc/default_config.c`). The three session-key
+            // options are off and `use_strongest_server_key` is on: the KDC's own order decides
+            // which key seals a ticket, and the client's order decides the session key.
+            require_pac: false,
+            disable_pac: false,
+            tgt_use_strongest_session_key: false,
+            svc_use_strongest_session_key: false,
+            preauth_use_strongest_session_key: false,
+            use_strongest_server_key: true,
+            strict_nametypes: false,
         })
     }
 
@@ -220,6 +275,43 @@ impl KdcConfig {
     pub fn with_transited_policy(mut self, policy: TransitedPolicy) -> Self {
         self.transited_policy = policy;
         self
+    }
+
+    /// `require-pac`: is a TGT without a PAC revoked?
+    pub fn require_pac(&self) -> bool {
+        self.require_pac
+    }
+
+    /// `disable-pac`: does this realm issue PACs at all?
+    pub fn disable_pac(&self) -> bool {
+        self.disable_pac
+    }
+
+    /// Whether the TGS session key's enctype follows this KDC's preference rather than the
+    /// client's.
+    pub fn tgt_use_strongest_session_key(&self) -> bool {
+        self.tgt_use_strongest_session_key
+    }
+
+    /// The same for the session key granted in an AS exchange.
+    pub fn svc_use_strongest_session_key(&self) -> bool {
+        self.svc_use_strongest_session_key
+    }
+
+    /// The same for the enctype a client is asked to pre-authenticate with.
+    pub fn preauth_use_strongest_session_key(&self) -> bool {
+        self.preauth_use_strongest_session_key
+    }
+
+    /// Whether a ticket is sealed in the strongest key the service has, by this KDC's
+    /// preference, rather than in the first of the service's keys.
+    pub fn use_strongest_server_key(&self) -> bool {
+        self.use_strongest_server_key
+    }
+
+    /// `strict-nametypes`.
+    pub fn strict_nametypes(&self) -> bool {
+        self.strict_nametypes
     }
 
     /// The realms this KDC accepts as transit realms, when an operator listed them. `None`
@@ -356,11 +448,42 @@ impl KdcConfig {
                 self.transited_realms = Some(realms);
                 Ok(())
             }
+            "require_pac" | "require-pac" => {
+                self.require_pac = parse_bool(value)?;
+                Ok(())
+            }
+            "disable_pac" | "disable-pac" => {
+                self.disable_pac = parse_bool(value)?;
+                Ok(())
+            }
+            "tgt-use-strongest-session-key" | "tgt_use_strongest_session_key" => {
+                self.tgt_use_strongest_session_key = parse_bool(value)?;
+                Ok(())
+            }
+            "svc-use-strongest-session-key" | "svc_use_strongest_session_key" => {
+                self.svc_use_strongest_session_key = parse_bool(value)?;
+                Ok(())
+            }
+            "preauth-use-strongest-session-key" | "preauth_use_strongest_session_key" => {
+                self.preauth_use_strongest_session_key = parse_bool(value)?;
+                Ok(())
+            }
+            "use-strongest-server-key" | "use_strongest_server_key" => {
+                self.use_strongest_server_key = parse_bool(value)?;
+                Ok(())
+            }
+            "strict-nametypes" | "strict_nametypes" => {
+                self.strict_nametypes = parse_bool(value)?;
+                Ok(())
+            }
             other => Err(Error::Config(format!(
                 "KDC option {other:?} is not implemented by this engine. \
                  Implemented: max_life, max_renewable_life, clockskew, require-preauth, \
                  allowed_enctypes, check-ticket-addresses, allow-null-ticket-addresses, \
-                 warn-ticket-addresses, transited-policy, transited-realms. Refusing rather than \
+                 warn-ticket-addresses, transited-policy, transited-realms, require-pac, \
+                 disable-pac, tgt-use-strongest-session-key, svc-use-strongest-session-key, \
+                 preauth-use-strongest-session-key, use-strongest-server-key, strict-nametypes. \
+                 Refusing rather than \
                  ignoring it: a KDC that silently \
                  does not do what its configuration says is worse than one that will not start."
             ))),
@@ -446,11 +569,71 @@ mod tests {
     #[test]
     fn an_unimplemented_option_is_refused_by_name() {
         let mut c = KdcConfig::new("R").unwrap();
-        let err = c.apply("require_pac", "true").unwrap_err().to_string();
-        assert!(err.contains("require_pac"), "{err}");
+        // `max-kdc-datagram-reply-length` is Heimdal's and is not implemented here yet, which is
+        // what this test is for: the refusal has to name the option, not just happen.
+        let err = c
+            .apply("max-kdc-datagram-reply-length", "1400")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max-kdc-datagram-reply-length"), "{err}");
         assert!(err.contains("not implemented"), "{err}");
         assert!(c.apply("enable-pkinit", "true").is_err());
         assert!(c.apply("enable_fast", "true").is_err());
+    }
+
+    /// Every option this engine understands, with its default and its non-default, so that a name
+    /// accepted by `apply` but wired to nothing is visible: the value has to change.
+    #[test]
+    fn every_accepted_option_changes_the_configuration() {
+        let mut c = KdcConfig::new("R").unwrap();
+        for (option, default, flipped, getter) in [
+            (
+                "require_pac",
+                false,
+                true,
+                KdcConfig::require_pac as fn(&KdcConfig) -> bool,
+            ),
+            ("disable-pac", false, true, KdcConfig::disable_pac),
+            (
+                "tgt-use-strongest-session-key",
+                false,
+                true,
+                KdcConfig::tgt_use_strongest_session_key,
+            ),
+            (
+                "svc-use-strongest-session-key",
+                false,
+                true,
+                KdcConfig::svc_use_strongest_session_key,
+            ),
+            (
+                "preauth-use-strongest-session-key",
+                false,
+                true,
+                KdcConfig::preauth_use_strongest_session_key,
+            ),
+            // The one whose default is the other way round: Heimdal seals a ticket with its own
+            // preference unless told not to.
+            (
+                "use-strongest-server-key",
+                true,
+                false,
+                KdcConfig::use_strongest_server_key,
+            ),
+            ("strict-nametypes", false, true, KdcConfig::strict_nametypes),
+        ] {
+            assert_eq!(getter(&c), default, "{option}: default is Heimdal's");
+            c.apply(option, if flipped { "true" } else { "false" })
+                .unwrap_or_else(|e| panic!("{option}: {e}"));
+            assert_eq!(
+                getter(&c),
+                flipped,
+                "{option}: the option has to do something"
+            );
+            c.apply(option, if flipped { "false" } else { "true" })
+                .unwrap();
+            assert_eq!(getter(&c), default, "{option}: and to be reversible");
+        }
     }
 
     #[test]

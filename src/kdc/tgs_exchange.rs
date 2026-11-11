@@ -486,6 +486,12 @@ impl Kdc {
         // with a cross-realm TGT toward the realm that may, and the client walks the chain itself.
         // That answer is a ticket to `krbtgt/HOP@OURREALM`, so it is a rewrite of the name the
         // rest of this exchange works with rather than a separate reply path.
+        if !super::name_type_ok(config, &sname) {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                text: format!("{sname} is not a service in this realm"),
+            });
+        }
         let server = match self.hdb().fetch_for_service(&sname)? {
             Some(server) => server,
             None => match self.referral(&sname, &proven, body)? {
@@ -553,7 +559,18 @@ impl Kdc {
         }
 
         // 6: the ticket.
-        let usable = super::usable_enctypes(config, &body.etypes, &server, Purpose::Ticket);
+        //
+        // The set is the same either way; the order is the option's choice, and Heimdal's default
+        // is the client's list (`tgt-use-strongest-session-key` off).
+        let usable = super::order_enctypes(
+            super::usable_enctypes(config, &body.etypes, &server, Purpose::Ticket),
+            &body.etypes,
+            if config.tgt_use_strongest_session_key() {
+                super::EnctypeOrder::KdcPreferred
+            } else {
+                super::EnctypeOrder::ClientPreferred
+            },
+        );
         let session_enctype = usable.first().copied().ok_or_else(|| {
             // The three-way intersection is empty, and which side caused it is the first thing
             // an operator needs: the enctype the client asked for, the enctypes this KDC
@@ -572,6 +589,28 @@ impl Kdc {
                 Error::UnsupportedEnctype(body.etypes.first().copied().unwrap_or(0))
             }
         })?;
+
+        // `require-pac`: a TGT without a PAC is one this realm would not have issued, and a
+        // realm that requires PACs treats it as revoked (Heimdal's `KRB5KDC_ERR_TGT_REVOKED`).
+        // Checked before anything is granted from it, including a renewal: the point of the
+        // setting is that such a ticket is not a credential here, and a renewal would be the
+        // cheapest way to launder one into a ticket that has a PAC.
+        if config.require_pac()
+            && !proven
+                .tgt
+                .authorization_data
+                .as_deref()
+                .is_some_and(super::pac::carries_pac)
+        {
+            return Err(Error::Kdc {
+                code: codes::KDC_ERR_TGT_REVOKED,
+                text: format!(
+                    "{}'s ticket-granting ticket for {} carries no authorization data, and \
+                     this realm requires a PAC",
+                    proven.tgt.crealm, proven.tgt.cname
+                ),
+            });
+        }
 
         let validate = body.kdc_options & kdc_options::VALIDATE != 0;
         let renew = body.kdc_options & kdc_options::RENEW != 0;
@@ -657,12 +696,10 @@ impl Kdc {
         let ticket_key = match self.user_to_user_key(body, &sname)? {
             Some((key, kvno)) => (key, kvno),
             None => {
-                // Same rule as the AS: the ticket is sealed in an enctype this KDC is
-                // allowed to issue and the service holds a key for, not in whichever
-                // key happens to be strongest.
-                let key = usable
-                    .iter()
-                    .find_map(|e| server.key_for(*e))
+                // Same rule as the AS: the ticket is sealed in an enctype this KDC is allowed to
+                // issue and the service holds a key for, not in whichever key happens to be
+                // strongest.
+                let key = super::sealing_key(config, &server, &usable)
                     .ok_or_else(|| Error::Hdb(format!("{sname} has no usable key")))?;
                 (key.key.clone(), Some(key.kvno))
             }
@@ -718,8 +755,17 @@ impl Kdc {
             caddr: body.addresses.clone(),
             // The PAC is rebuilt for this ticket rather than copied from the TGT: its
             // service checksum is keyed by *this* service's key, and the KDC signature
-            // is over the whole buffer, so a copied one would not verify.
-            authorization_data: self.pac_authorization_data(&client, &ticket_key.0, authtime)?,
+            // is over the whole buffer, so a copied one would not verify. Whether there is
+            // one at all is the realm's and the entries' decision.
+            authorization_data: if self.include_pac(
+                &server,
+                super::is_root_tgt(&server.principal),
+                super::pac_attributes(padata),
+            ) {
+                self.pac_authorization_data(&client, &ticket_key.0, authtime)?
+            } else {
+                None
+            },
         };
         let ticket = Ticket {
             realm: config.realm().to_owned(),

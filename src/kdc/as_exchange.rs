@@ -72,6 +72,56 @@ pub fn usable_enctypes(
         .collect()
 }
 
+/// Whose order decides which of the usable enctypes is first.
+///
+/// Heimdal's `_kdc_find_etype` has exactly two branches, and neither is "strongest" in any
+/// absolute sense: one walks this KDC's own list (its first acceptable entry wins), the other
+/// walks the client's `etype` list (its first acceptable entry wins). Which branch runs is what
+/// `*-use-strongest-session-key` and `use-strongest-server-key` choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnctypeOrder {
+    /// The client's list decides: RFC 4120 §3.1.3 as it reads, and Heimdal's default.
+    ClientPreferred,
+    /// This KDC's `allowed_enctypes` order decides: Heimdal's `*-use-strongest-*`.
+    KdcPreferred,
+}
+
+/// `usable`, reordered as `order` says.
+///
+/// The set is the same either way — the intersection of what the client asked for, what this KDC
+/// issues and what the entry has a key for — so the two orders can never disagree about *whether*
+/// an enctype is possible, only about which one comes first. An enctype the client did not list
+/// has no place in the client's order and is kept at the end rather than dropped, which is the
+/// difference between "the client's list ran out" and "there is nothing at all".
+pub fn order_enctypes(
+    usable: Vec<Enctype>,
+    requested: &[i32],
+    order: EnctypeOrder,
+) -> Vec<Enctype> {
+    match order {
+        EnctypeOrder::KdcPreferred => usable,
+        EnctypeOrder::ClientPreferred => {
+            let mut out = usable;
+            out.sort_by_key(|e| {
+                requested
+                    .iter()
+                    .position(|r| *r == e.id())
+                    .unwrap_or(usize::MAX)
+            });
+            out
+        }
+    }
+}
+
+/// Whether `p` is this realm's own ticket-granting ticket, `krbtgt/REALM@REALM`.
+///
+/// The distinction matters twice: a PAC is written into the root TGT whatever the service's
+/// `no-auth-data-reqd` says (nothing could revoke a TGT that never had one), and a cross-realm
+/// `krbtgt/OTHER@HERE` is the one `krbtgt` a PAC is *not* written into when its entry says so.
+pub(crate) fn is_root_tgt(p: &Principal) -> bool {
+    p.is_krbtgt() && p.components.get(1) == Some(&p.realm)
+}
+
 /// Whether the request names the well-known anonymous principal (RFC 6111, RFC 8062 §3).
 ///
 /// The identity is the name type and the components: `WELLKNOWN/ANONYMOUS` under any other
@@ -590,6 +640,9 @@ impl Kdc {
                 });
             }
         }
+        if !super::name_type_ok(config, &cname) {
+            return Err(Error::UnknownPrincipal(cname.to_string()));
+        }
         let client = self
             .hdb()
             .fetch(&cname)?
@@ -626,20 +679,42 @@ impl Kdc {
         }
 
         // 4. Enctypes.
+        //
+        // Two orders over one set: the enctype the client is asked to pre-authenticate with and
+        // the enctype of the session key it is granted are chosen by separate options in Heimdal,
+        // because a realm may want the first to be strong while leaving the second to the client.
         let usable = usable_enctypes(config, &body.etypes, &client, Purpose::Preauth);
         if usable.is_empty() {
             return Err(Error::UnsupportedEnctype(
                 body.etypes.first().copied().unwrap_or(0),
             ));
         }
-        let entries = etype_info2(&client, &usable);
+        let preauth_usable = order_enctypes(
+            usable.clone(),
+            &body.etypes,
+            if config.preauth_use_strongest_session_key() {
+                EnctypeOrder::KdcPreferred
+            } else {
+                EnctypeOrder::ClientPreferred
+            },
+        );
+        let session_usable = order_enctypes(
+            usable.clone(),
+            &body.etypes,
+            if config.svc_use_strongest_session_key() {
+                EnctypeOrder::KdcPreferred
+            } else {
+                EnctypeOrder::ClientPreferred
+            },
+        );
+        let entries = etype_info2(&client, &preauth_usable);
 
         // 4b. Multi-round pre-authentication (SPAKE, OTP).
         //
         // Run before the single-round methods because a mechanism decides the reply key
         // itself: under SPAKE it is derived from the exchange, not from the long-term key,
         // so the timestamp path could not compute it even in principle.
-        let longterm: Vec<Key> = usable
+        let longterm: Vec<Key> = preauth_usable
             .iter()
             .filter_map(|e| client.key_for(*e).map(|k| k.key.clone()))
             .collect();
@@ -700,7 +775,7 @@ impl Kdc {
             self.pkinit(),
         ) {
             (Some(value), Some(state)) => {
-                let server_key_enctype = usable[0];
+                let server_key_enctype = session_usable[0];
                 // The private exponent comes from the same source as the session keys. A
                 // failure there is a broken RNG and must not degrade into a predictable
                 // key, so it is a refusal rather than a retry.
@@ -803,7 +878,7 @@ impl Kdc {
             ));
         } else {
             client
-                .key_for(usable[0])
+                .key_for(session_usable[0])
                 .map(|k| k.key.clone())
                 .ok_or_else(|| preauth_failed(&cname, &entries, "no key for the session enctype"))?
         };
@@ -863,7 +938,7 @@ impl Kdc {
 
         // 7. One session key, written into both the ticket and the reply: two
         // keys would mean the client holds one the ticket does not accept.
-        let session_key = self.cipher().random(usable[0])?;
+        let session_key = self.cipher().random(session_usable[0])?;
         // The ticket is sealed in a key of an enctype the client asked for and this
         // KDC allows — not in the strongest key the entry happens to hold.
         //
@@ -898,11 +973,15 @@ impl Kdc {
             // A PAC, when this realm issues them: the client's identity from the
             // directory, signed with this ticket's service key and countersigned with
             // `krbtgt`'s.
-            authorization_data: self.pac_authorization_data(
-                &client.principal,
-                &server_key.key,
-                now,
-            )?,
+            authorization_data: if self.include_pac(
+                &server,
+                is_root_tgt(&server.principal),
+                super::pac_attributes(padata),
+            ) {
+                self.pac_authorization_data(&client.principal, &server_key.key, now)?
+            } else {
+                None
+            },
         };
         let ticket = Ticket {
             realm: config.realm().to_owned(),

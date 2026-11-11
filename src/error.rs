@@ -182,6 +182,12 @@ pub mod codes {
     pub const KDC_ERR_ETYPE_NOSUPP: i32 = 14;
     /// The account is locked, disabled or expired.
     pub const KDC_ERR_CLIENT_REVOKED: i32 = 18;
+
+    /// `KDC_ERR_TGT_REVOKED` (RFC 4120 §7.5.1): the presented ticket-granting ticket is one this
+    /// KDC would not have issued. Heimdal produces it when `require-pac` is set and the TGT
+    /// carries no PAC — a TGT from a realm that does not issue them, or one whose authorization
+    /// data was stripped, is a TGT this realm cannot vouch for.
+    pub const KDC_ERR_TGT_REVOKED: i32 = 20;
     /// Pre-authentication data did not verify.
     pub const KDC_ERR_PREAUTH_FAILED: i32 = 24;
     /// More pre-authentication is needed; `e-data` carries METHOD-DATA.

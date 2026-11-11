@@ -66,11 +66,95 @@ use std::sync::Arc;
 use std::net::IpAddr;
 
 use crate::address;
-use crate::crypto::Cipher;
+use crate::crypto::{Cipher, Enctype};
 use crate::error::{Error, codes};
-use crate::hdb::Hdb;
+use crate::hdb::{Hdb, HdbEntry, HdbKey};
 use crate::msg::KdcReq;
 use crate::name::Principal;
+
+/// `BOOLEAN` (universal tag 1), which `rrl-krb-common`'s decoder has no name for: `PA-PAC-REQUEST`
+/// is the second place in this crate that needs one.
+const BOOLEAN: u8 = 0x01;
+
+/// What a request says about wanting a PAC, as Heimdal's `get_pac_attributes`.
+///
+/// `PA-PAC-REQUEST ::= SEQUENCE { include-pac [0] BOOLEAN }`. Three outcomes, not two: absent means
+/// the client has never heard of it and gets a PAC anyway (`WAS_GIVEN_IMPLICITLY`), `TRUE` means it
+/// asked (`WAS_REQUESTED`), and `FALSE` means it asked not to have one — which is not the same as
+/// not caring, and is the only case that can take a PAC away from a service that allows one.
+/// A value the KDC cannot decode is treated as absent: refusing a login over an extension the
+/// client got wrong would be refusing a client for asking politely.
+pub(crate) fn pac_attributes(padata: &[(i32, Vec<u8>)]) -> u64 {
+    let Some((_, value)) = padata
+        .iter()
+        .find(|(t, _)| *t == crate::msg::PA_PAC_REQUEST)
+    else {
+        return pac::WAS_GIVEN_IMPLICITLY;
+    };
+    let mut reader = crate::der::Reader::new(value);
+    let Ok(content) = reader.expect_in("PA-PAC-REQUEST", crate::der::SEQUENCE) else {
+        return pac::WAS_GIVEN_IMPLICITLY;
+    };
+    let Ok(fields) = crate::der::Fields::parse("PA-PAC-REQUEST", content) else {
+        return pac::WAS_GIVEN_IMPLICITLY;
+    };
+    let include = match fields.opt_bytes(0) {
+        Some(tlv) => {
+            let mut r = crate::der::Reader::new(tlv);
+            matches!(r.expect_in("include-pac", BOOLEAN), Ok([0xFF]))
+        }
+        None => false,
+    };
+    if include { pac::WAS_REQUESTED } else { 0 }
+}
+
+/// Whether `principal` may be looked up under this configuration.
+///
+/// Heimdal's `name_type_ok` (`kdc/misc.c`), applied to every name the KDC fetches: a `krbtgt` name
+/// whose type is neither `NT-SRV-INST` nor `NT-UNKNOWN` is not this database's business when
+/// `strict-nametypes` is on, because Heimdal's `hdb` matches the type as part of the name. Names
+/// that are not `krbtgt` are unaffected — the rule exists for the cross-realm lookup, where
+/// `krbtgt/OTHER@HERE` sent as `NT-PRINCIPAL` would otherwise find a ticket-granting ticket the
+/// client did not name.
+///
+/// A refused name is reported as unknown rather than as a policy error: Heimdal's `_kdc_db_fetch`
+/// returns `HDB_ERR_NOENTRY`, and a KDC that distinguishes "there is an entry but you may not have
+/// it" from "there is none" tells an unauthenticated client which names exist.
+pub(crate) fn name_type_ok(config: &KdcConfig, principal: &Principal) -> bool {
+    if !principal.is_krbtgt() {
+        return true;
+    }
+    if principal.name_type == crate::name::NT_SRV_INST
+        || principal.name_type == crate::name::NT_UNKNOWN
+    {
+        return true;
+    }
+    !config.strict_nametypes()
+}
+
+/// The key a ticket for `server` is sealed in, out of `usable` — the enctypes this request may be
+/// answered in.
+///
+/// `use-strongest-server-key` (Heimdal's default is **on**) decides the rule: on, the first of
+/// `usable` the service holds a key for — `usable` is in this KDC's or the client's order, so the
+/// answer is "the strongest the two sides agree on"; off, the first key in the *entry's own*
+/// order, filtered by what this KDC may issue. The second exists for an entry whose key order was
+/// chosen on purpose, and it is the only case where the domain of the search is the entry rather
+/// than the request.
+pub(crate) fn sealing_key<'a>(
+    config: &KdcConfig,
+    server: &'a HdbEntry,
+    usable: &[Enctype],
+) -> Option<&'a HdbKey> {
+    if config.use_strongest_server_key() {
+        return usable.iter().find_map(|e| server.key_for(*e));
+    }
+    server
+        .keys
+        .iter()
+        .filter(|k| config.allowed_enctypes().contains(&k.key.enctype()))
+        .find(|k| usable.contains(&k.key.enctype()))
+}
 
 /// `renewable-ok` (RFC 4120 §5.4.1, bit 27): "give me a renewable ticket if you cannot give me
 /// one that lives as long as I asked".
@@ -81,8 +165,10 @@ use crate::name::Principal;
 pub const RENEWABLE_OK: u32 = 0x0000_0010;
 
 pub use as_exchange::Purpose;
+pub(crate) use as_exchange::is_root_tgt;
 pub use as_exchange::{
-    endtime, may_postdate, renew_till, starttime, ticket_flags, usable_enctypes,
+    EnctypeOrder, endtime, may_postdate, order_enctypes, renew_till, starttime, ticket_flags,
+    usable_enctypes,
 };
 pub use config::{KdcConfig, TransitedPolicy};
 
@@ -224,6 +310,42 @@ impl Kdc {
     /// Whether tickets carry a PAC.
     pub fn issues_pac(&self) -> bool {
         self.identities.is_some()
+    }
+
+    /// Whether a ticket for `server` carries a PAC, per Heimdal's `_kdc_include_pac_p`.
+    ///
+    /// The order is Heimdal's, and it is not the order one would guess:
+    ///
+    /// 1. a ticket-granting ticket almost always carries one — "almost" because a **non-root**
+    ///    `krbtgt/OTHER@HERE` with `no-auth-data-reqd` does not, which is the cross-realm case: a
+    ///    PAC this realm built may not be one the other realm can verify, and an entry says so;
+    /// 2. `no-auth-data-reqd` on the service then wins over everything below it;
+    /// 3. `auth-data-reqd` on the service wins over the realm's `disable-pac`;
+    /// 4. `disable-pac`;
+    /// 5. otherwise the client's `PA-PAC-REQUEST`: asking for one means yes, asking against it means
+    ///    no, and saying nothing means yes — `KRB5_PAC_WAS_GIVEN_IMPLICITLY`, because every client
+    ///    that has never heard of the extension still expects the tickets it always got.
+    pub(crate) fn include_pac(
+        &self,
+        server: &HdbEntry,
+        is_root_tgt: bool,
+        pac_attributes: u64,
+    ) -> bool {
+        if server.principal.is_krbtgt()
+            && (is_root_tgt || !server.has(super::hdb::flags::NO_AUTH_DATA_REQD))
+        {
+            return true;
+        }
+        if server.has(super::hdb::flags::NO_AUTH_DATA_REQD) {
+            return false;
+        }
+        if server.has(super::hdb::flags::AUTH_DATA_REQD) {
+            return true;
+        }
+        if self.config.disable_pac() {
+            return false;
+        }
+        pac_attributes & (pac::WAS_REQUESTED | pac::WAS_GIVEN_IMPLICITLY) != 0
     }
 
     /// The `AuthorizationData` a ticket for `client` carries, or `None` when this

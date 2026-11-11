@@ -200,6 +200,106 @@ fn a_stock_kadmin_client_creates_and_deletes_a_principal() {
     stand.kadmin_stand.stop();
 }
 
+/// `modprinc` over the wire, from the client that writes it.
+///
+/// The fields go through the record, the mask and the attribute word — three chances to be
+/// positional in the wrong place — so what is checked is that the entry the KDC then uses has what
+/// the client asked for.
+#[test]
+fn a_stock_kadmin_client_modifies_a_principal() {
+    let mut stand = stand_with(owner());
+    let before = stand.client.get_principal(&kp("alice")).expect("get");
+
+    // `modprinc -maxlife 10h -maxrenewlife 7d -expire 0`: a lifetime, a renewable lifetime, and an
+    // expiry of zero, which MIT spells "never" rather than the epoch.
+    // The struct is `non_exhaustive`, so it is filled in field by field: that is also what a
+    // caller outside the crate has to do.
+    let mut changes = krb5::kadmin::PrincipalChanges::default();
+    changes.max_life = Some(36_000);
+    changes.max_renewable_life = Some(604_800);
+    changes.princ_expire_time = Some(0);
+    // And one attribute on, one off, as `modprinc +requires_preauth -forwardable` words it.
+    changes = changes.with_attributes(
+        &before,
+        krb5::kadmin::attributes::REQUIRES_PRE_AUTH,
+        krb5::kadmin::attributes::DISALLOW_FORWARDABLE,
+    );
+    stand
+        .client
+        .modify_principal(&kp("alice"), &changes)
+        .expect("modify_principal must answer");
+
+    let after = stand.client.get_principal(&kp("alice")).expect("get");
+    assert_eq!(after.max_life, 36_000);
+    assert_eq!(after.max_renewable_life, 604_800);
+    assert_eq!(after.princ_expire_time, 0, "an expiry of zero is \"never\"");
+    assert_ne!(
+        after.attributes & krb5::kadmin::attributes::REQUIRES_PRE_AUTH,
+        0
+    );
+    assert_eq!(
+        after.attributes & krb5::kadmin::attributes::DISALLOW_FORWARDABLE,
+        0,
+        "the bit was cleared, and a cleared DISALLOW bit means forwardable is allowed"
+    );
+
+    // The other direction, so the word is shown to be reversible rather than merely writable: set
+    // the bit, and it comes back.
+    // Both edits in one call: `with_attributes` computes the whole word from the entry it is
+    // given, so two calls would have the second one undo the first.
+    let reverse = krb5::kadmin::PrincipalChanges::default().with_attributes(
+        &after,
+        krb5::kadmin::attributes::DISALLOW_FORWARDABLE,
+        krb5::kadmin::attributes::REQUIRES_PRE_AUTH,
+    );
+    stand
+        .client
+        .modify_principal(&kp("alice"), &reverse)
+        .expect("a second modify");
+    let reversed = stand.client.get_principal(&kp("alice")).expect("get");
+    assert_ne!(
+        reversed.attributes & krb5::kadmin::attributes::DISALLOW_FORWARDABLE,
+        0,
+        "setting the bit must forbid forwardable tickets"
+    );
+    assert_eq!(
+        reversed.attributes & krb5::kadmin::attributes::REQUIRES_PRE_AUTH,
+        0,
+        "and clearing the other must take pre-authentication off"
+    );
+    stand.kadmin_stand.stop();
+}
+
+/// `renprinc` over the wire: the client asks, and the principal the KDC then knows is the new one,
+/// with the same password.
+#[test]
+fn a_stock_kadmin_client_renames_a_principal() {
+    let mut stand = stand_with(owner());
+    stand
+        .client
+        .rename_principal(&kp("alice"), &kp("alicia"))
+        .expect("rename_principal must answer");
+
+    assert!(
+        stand.client.get_principal(&kp("alice")).is_err(),
+        "the old name must be gone"
+    );
+    let renamed = stand
+        .client
+        .get_principal(&kp("alicia"))
+        .expect("get the new name");
+    assert_eq!(renamed.kvno, 1, "the keys came with the name");
+
+    // And the KDC logs the principal in under the new name with the old password: a rename that
+    // moved the name but not the keys would answer every exchange afterwards.
+    let alicia = krb5::Principal::parse(&p("alicia").to_string()).unwrap();
+    stand
+        .kdc
+        .login_with_password(&alicia, ALICE_PASSWORD)
+        .expect("the renamed principal must still log in");
+    stand.kadmin_stand.stop();
+}
+
 #[test]
 fn a_stock_kadmin_client_changes_a_password() {
     let mut stand = stand_with(owner());

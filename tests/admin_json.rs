@@ -272,6 +272,7 @@ fn every_operation() -> Vec<AdminRequest> {
                     pw_end: Some(None),
                     max_life: Some(Some(86_400)),
                     ok_as_delegate: Some(true),
+                    ..Modify::default()
                 },
             },
         },
@@ -422,6 +423,7 @@ fn every_reply_serializes_with_its_own_tag_and_payload() {
         valid_end: Some(1_700_000_000),
         pw_end: None,
         max_life: Some(86_400),
+        max_renew: None,
     };
     let cases: Vec<(Reply, &str, &str)> = vec![
         (

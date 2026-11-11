@@ -122,12 +122,36 @@ impl<'de> Deserialize<'de> for Modify {
                 with = "double_option"
             )]
             max_life: Option<Option<i64>>,
+            #[serde(
+                default,
+                skip_serializing_if = "Option::is_none",
+                with = "double_option"
+            )]
+            max_renew: Option<Option<i64>>,
             #[serde(default)]
             invalid: Option<bool>,
             #[serde(default)]
             locked_out: Option<bool>,
             #[serde(default)]
             ok_as_delegate: Option<bool>,
+            #[serde(default)]
+            require_preauth: Option<bool>,
+            #[serde(default)]
+            require_hwauth: Option<bool>,
+            #[serde(default)]
+            allow_server: Option<bool>,
+            #[serde(default)]
+            change_password_service: Option<bool>,
+            #[serde(default)]
+            forwardable: Option<bool>,
+            #[serde(default)]
+            proxiable: Option<bool>,
+            #[serde(default)]
+            renewable: Option<bool>,
+            #[serde(default)]
+            postdated: Option<bool>,
+            #[serde(default)]
+            kvno: Option<u32>,
         }
         let fields = Fields::deserialize(deserializer)?;
         Ok(Modify {
@@ -136,7 +160,17 @@ impl<'de> Deserialize<'de> for Modify {
             valid_end: fields.valid_end,
             pw_end: fields.pw_end,
             max_life: fields.max_life,
+            max_renew: fields.max_renew,
             ok_as_delegate: fields.ok_as_delegate,
+            require_preauth: fields.require_preauth,
+            require_hwauth: fields.require_hwauth,
+            allow_server: fields.allow_server,
+            change_password_service: fields.change_password_service,
+            forwardable: fields.forwardable,
+            proxiable: fields.proxiable,
+            renewable: fields.renewable,
+            postdated: fields.postdated,
+            kvno: fields.kvno,
         })
     }
 }
@@ -166,6 +200,11 @@ impl Serialize for Operation {
                 out.serialize_field("operation", "modify")?;
                 out.serialize_field("principal", principal)?;
                 out.serialize_field("change", change)?;
+            }
+            Operation::Rename { from, to } => {
+                out.serialize_field("operation", "rename")?;
+                out.serialize_field("from", from)?;
+                out.serialize_field("to", to)?;
             }
             Operation::Delete { principal } => {
                 out.serialize_field("operation", "delete")?;
@@ -213,6 +252,10 @@ impl<'de> Deserialize<'de> for Operation {
                 principal: crate::name::Principal,
                 change: Modify,
             },
+            Rename {
+                from: crate::name::Principal,
+                to: crate::name::Principal,
+            },
             Delete {
                 principal: crate::name::Principal,
             },
@@ -244,6 +287,7 @@ impl<'de> Deserialize<'de> for Operation {
                 role,
             },
             Wire::Modify { principal, change } => Operation::Modify { principal, change },
+            Wire::Rename { from, to } => Operation::Rename { from, to },
             Wire::Delete { principal } => Operation::Delete { principal },
             Wire::SetPassword {
                 principal,
@@ -336,6 +380,11 @@ impl Serialize for Reply {
             Reply::Modified { entry } => {
                 map.serialize_entry("reply", "modified")?;
                 map.serialize_entry("entry", entry)?;
+            }
+            Reply::Renamed { from, to } => {
+                map.serialize_entry("reply", "renamed")?;
+                map.serialize_entry("from", from)?;
+                map.serialize_entry("to", to)?;
             }
             Reply::PasswordSet { kvno } => {
                 map.serialize_entry("reply", "password_set")?;

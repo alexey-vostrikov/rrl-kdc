@@ -204,6 +204,36 @@ impl Kadmin {
                 }
                 Ok(out.into_bytes())
             }
+            kadm5::MODIFY_PRINCIPAL => {
+                self.require(actor, Right::Modify)?;
+                let (principal, change) = kadm5::decode_modify(args).inspect_err(|status| {
+                    // The name is inside the record the decoder could not read, so all that can be
+                    // said is that a modify was refused before anything was applied.
+                    log_refusal(&format!("modify: the request was refused ({status})"));
+                })?;
+                self.admin.modify(&principal, change).map_err(|e| {
+                    log_refusal(&format!("modify {principal}: {e}"));
+                    // A value the field mask named and this server rejected — a kvno below the
+                    // keys, an expiry it cannot store — is a bad mask, not a server failure: the
+                    // operator named a field and gave it something it cannot hold.
+                    match e {
+                        crate::Error::Config(_) => kadm5::BAD_MASK,
+                        other => status_of(other),
+                    }
+                })?;
+                Ok(Vec::new())
+            }
+            kadm5::RENAME_PRINCIPAL => {
+                self.require(actor, Right::Modify)?;
+                let (from, to) = kadm5::decode_rename(args).inspect_err(|status| {
+                    log_refusal(&format!("rename: the request was refused ({status})"));
+                })?;
+                self.admin.rename(&from, &to).map_err(|e| {
+                    log_refusal(&format!("rename {from} to {to}: {e}"));
+                    status_of(e)
+                })?;
+                Ok(Vec::new())
+            }
             kadm5::CREATE_PRINCIPAL => {
                 self.require(actor, Right::Create)?;
                 let (entry, password) = kadm5::decode_create(args)?;

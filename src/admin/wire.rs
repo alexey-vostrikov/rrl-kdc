@@ -255,6 +255,13 @@ pub enum Operation {
         /// What to change.
         change: Modify,
     },
+    /// Rename a principal, its keys and its kvno travelling with it.
+    Rename {
+        /// The name it has now.
+        from: Principal,
+        /// The name it takes.
+        to: Principal,
+    },
     /// Remove a principal.
     Delete {
         /// Whose.
@@ -291,6 +298,9 @@ impl Operation {
             Operation::Get { principal } => (Right::Read, Some(principal)),
             Operation::Create { principal, .. } => (Right::Create, Some(principal)),
             Operation::Modify { principal, .. } => (Right::Modify, Some(principal)),
+            // The right is on the name the caller must be allowed to change; the target of the
+            // rename is the same principal afterwards, so one right covers both halves.
+            Operation::Rename { from, .. } => (Right::Modify, Some(from)),
             Operation::Delete { principal } => (Right::Delete, Some(principal)),
             Operation::SetPassword { principal, .. } => (Right::SetPassword, Some(principal)),
             Operation::PruneOldKeys { principal } => (Right::PruneKeys, Some(principal)),
@@ -335,6 +345,8 @@ pub struct EntryView {
     pub pw_end: Option<i64>,
     /// `max-life`, if set.
     pub max_life: Option<i64>,
+    /// `max-renewable-life`, if set.
+    pub max_renew: Option<i64>,
 }
 
 impl EntryView {
@@ -350,6 +362,7 @@ impl EntryView {
             valid_end: entry.valid_end,
             pw_end: entry.pw_end,
             max_life: entry.max_life,
+            max_renew: entry.max_renew,
         }
     }
 }
@@ -376,6 +389,13 @@ pub enum Reply {
     Modified {
         /// What it looks like now.
         entry: EntryView,
+    },
+    /// A principal was renamed.
+    Renamed {
+        /// The name it had.
+        from: Principal,
+        /// The name it has now.
+        to: Principal,
     },
     /// A password was set; the new keys are at `kvno`.
     PasswordSet {
@@ -477,6 +497,10 @@ impl Admin {
             Operation::Modify { principal, change } => Ok(Reply::Modified {
                 entry: EntryView::of(&self.modify(&principal, change)?),
             }),
+            Operation::Rename { from, to } => {
+                self.rename(&from, &to)?;
+                Ok(Reply::Renamed { from, to })
+            }
             Operation::Delete { principal } => Ok(Reply::Deleted {
                 existed: self.delete(&principal)?,
             }),

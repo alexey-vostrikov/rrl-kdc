@@ -235,6 +235,178 @@ fn the_whole_lifecycle_over_the_wire_vocabulary() {
     );
 }
 
+/// A rename over the wire vocabulary: the keys and the kvno travel with the name, and the old
+/// name stops resolving.
+#[test]
+fn a_rename_takes_the_keys_and_the_kvno_with_it() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+    let before = admin
+        .handle(request(
+            "admin",
+            Operation::Get {
+                principal: p("alice"),
+            },
+        ))
+        .unwrap();
+    let Reply::Entry { entry: before } = before else {
+        panic!("a get must answer with an entry");
+    };
+
+    let renamed = admin
+        .handle(request(
+            "admin",
+            Operation::Rename {
+                from: p("alice"),
+                to: p("alicia"),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(renamed, Reply::Renamed { .. }));
+
+    let after = admin
+        .handle(request(
+            "admin",
+            Operation::Get {
+                principal: p("alicia"),
+            },
+        ))
+        .unwrap();
+    let Reply::Entry { entry: after } = after else {
+        panic!("the new name must answer with the entry");
+    };
+    assert_eq!(after.kvno, before.kvno, "the kvno follows the name");
+    assert_eq!(after.key_count, before.key_count, "and so do the keys");
+    assert_eq!(after.flags, before.flags);
+    assert_eq!(after.principal, p("alicia"));
+
+    let gone = admin.handle(request(
+        "admin",
+        Operation::Get {
+            principal: p("alice"),
+        },
+    ));
+    assert!(
+        gone.is_err(),
+        "the old name must not answer after a rename: {gone:?}"
+    );
+}
+
+/// Two refusals that a rename cannot be allowed to skip.
+#[test]
+fn a_rename_onto_an_existing_name_is_refused() {
+    // A merge, not a rename: whose keys would win is a decision nobody asked this server to make.
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    for name in ["alice", "bob"] {
+        admin
+            .handle(request("admin", create(name, Role::Client)))
+            .unwrap();
+    }
+    let refused = admin.handle(request(
+        "admin",
+        Operation::Rename {
+            from: p("alice"),
+            to: p("bob"),
+        },
+    ));
+    assert!(refused.is_err(), "renaming onto an existing name must fail");
+    // And nothing moved: both principals are still there under their own names.
+    for name in ["alice", "bob"] {
+        admin
+            .handle(request("admin", Operation::Get { principal: p(name) }))
+            .unwrap_or_else(|e| panic!("{name} must still exist: {e:?}"));
+    }
+}
+
+/// `krbtgt` may not be renamed: a realm whose ticket-granting ticket changed its name cannot issue
+/// a ticket at all.
+#[test]
+fn the_realms_krbtgt_may_not_be_renamed() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    let refused = admin.handle(request(
+        "admin",
+        Operation::Rename {
+            from: Principal::krbtgt(REALM),
+            to: Principal::parse(&format!("krbtgt/OTHER@{REALM}")).unwrap(),
+        },
+    ));
+    assert!(refused.is_err(), "krbtgt must not be renamed");
+}
+
+/// The fields `modprinc` gained, applied together the way the wire sends them.
+#[test]
+fn a_modify_applies_every_field_it_was_given() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+    let modified = admin
+        .handle(request(
+            "admin",
+            Operation::Modify {
+                principal: p("alice"),
+                change: Modify {
+                    max_renew: Some(Some(604_800)),
+                    require_preauth: Some(true),
+                    forwardable: Some(false),
+                    allow_server: Some(true),
+                    kvno: Some(2),
+                    ..Modify::default()
+                },
+            },
+        ))
+        .unwrap();
+    let Reply::Modified { entry } = modified else {
+        panic!("a modify must answer with the entry");
+    };
+    assert_eq!(entry.max_renew, Some(604_800));
+    assert_ne!(entry.flags & entry_flags::REQUIRE_PREAUTH, 0);
+    assert_eq!(entry.flags & entry_flags::FORWARDABLE, 0);
+    assert_ne!(entry.flags & entry_flags::SERVER, 0);
+    assert_eq!(entry.kvno, 2);
+}
+
+/// A kvno below the keys is refused rather than written: an entry whose keys are newer than its
+/// version is an entry no keytab can be matched against.
+#[test]
+fn a_kvno_below_the_keys_is_refused() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+    // A new password puts the keys at kvno 2.
+    admin
+        .handle(request(
+            "admin",
+            Operation::SetPassword {
+                principal: p("alice"),
+                password: b"another password".to_vec(),
+            },
+        ))
+        .unwrap();
+    let refused = admin.handle(request(
+        "admin",
+        Operation::Modify {
+            principal: p("alice"),
+            change: Modify {
+                kvno: Some(1),
+                ..Modify::default()
+            },
+        },
+    ));
+    assert!(
+        refused.is_err(),
+        "kvno 1 is below the keys at 2: {refused:?}"
+    );
+}
+
 #[test]
 fn a_missing_principal_is_not_found_and_not_a_storage_failure() {
     // A transport answers 404 or 500 depending on this, so it must not be prose

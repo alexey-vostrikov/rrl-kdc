@@ -109,8 +109,42 @@ pub struct Modify {
     pub pw_end: Option<Option<i64>>,
     /// Set or clear `max-life`.
     pub max_life: Option<Option<i64>>,
+    /// Set or clear `max-renewable-life` — MIT's `KADM5_MAX_RLIFE`.
+    pub max_renew: Option<Option<i64>>,
     /// Set or clear `ok-as-delegate`.
     pub ok_as_delegate: Option<bool>,
+    /// Turn `require-preauth` on or off — MIT's `REQUIRES_PRE_AUTH`.
+    ///
+    /// Modelled separately from the rest of the attribute word because turning it *off* has a
+    /// consequence — a principal without pre-authentication is one whose password can be cracked
+    /// offline from a single captured reply — so it is an attribute an operator has to name rather
+    /// than one a shared mask toggles by accident.
+    pub require_preauth: Option<bool>,
+    /// Turn `require-hwauth` on or off — MIT's `REQUIRES_HW_AUTH`.
+    pub require_hwauth: Option<bool>,
+    /// Whether a ticket may be issued *for* the principal — MIT's `DISALLOW_SVR`, inverted.
+    pub allow_server: Option<bool>,
+    /// Turn the password-change service on or off — MIT's `PWCHANGE_SERVICE`.
+    pub change_password_service: Option<bool>,
+    /// The `DISALLOW_*` ticket attributes, inverted: whether a ticket may be forwardable,
+    /// proxiable, renewable or postdated.
+    ///
+    /// Four fields rather than one word because these are the four an operator actually sets, and
+    /// the KDC reads each of them separately (`hdb` flags `forwardable`, `proxiable`, `renewable`,
+    /// `postdate`).
+    pub forwardable: Option<bool>,
+    /// See [`Modify::forwardable`].
+    pub proxiable: Option<bool>,
+    /// See [`Modify::forwardable`].
+    pub renewable: Option<bool>,
+    /// See [`Modify::forwardable`].
+    pub postdated: Option<bool>,
+    /// The key version to set — MIT's `KADM5_KVNO`.
+    ///
+    /// Not the keys themselves: it renumbers what is there, which is what an operator does after
+    /// restoring keys from a backup. Zero, and a value below the highest key, are refused by
+    /// [`Admin::modify`], because neither names a state a keytab can be built from.
+    pub kvno: Option<u32>,
 }
 
 impl Modify {
@@ -268,6 +302,34 @@ impl Admin {
         self.hdb.remove(principal)
     }
 
+    /// Renames a principal, taking its keys, kvno and flags with it.
+    ///
+    /// Two refusals before anything moves, both MIT's and both for the same reason — a rename that
+    /// half happened loses either the keys or the name, and neither is recoverable from the other:
+    /// the source must exist, and the target must not. A name that already exists is a merge, and
+    /// merging two accounts is not a rename: it would silently decide whose keys win.
+    ///
+    /// `krbtgt` and `immutable` entries are refused as well, the same two that [`Admin::delete`]
+    /// refuses; renaming either leaves a realm that cannot issue a ticket.
+    pub fn rename(&self, from: &Principal, to: &Principal) -> Result<()> {
+        if from == to {
+            return Err(Error::Config(format!("{from} is already its own name")));
+        }
+        let entry = self.get(from)?;
+        if entry.has(entry_flags::IMMUTABLE) || from.is_krbtgt() {
+            return Err(Error::Kdc {
+                code: crate::error::codes::KDC_ERR_POLICY,
+                text: format!("{from} may not be renamed"),
+            });
+        }
+        if self.hdb.fetch(to)?.is_some() {
+            return Err(Error::Exists(format!(
+                "{to} already exists; a rename onto an existing principal would merge two accounts"
+            )));
+        }
+        self.hdb.rename(from, to)
+    }
+
     /// Applies `change` to an existing entry.
     pub fn modify(&self, principal: &Principal, change: Modify) -> Result<HdbEntry> {
         if change.is_empty() {
@@ -295,6 +357,42 @@ impl Admin {
         }
         if let Some(life) = change.max_life {
             entry.max_life = life;
+        }
+        if let Some(renew) = change.max_renew {
+            entry.max_renew = renew;
+        }
+        // Each attribute is applied on its own: the caller names the ones it means, and one it
+        // leaves out keeps whatever the entry had.
+        for (value, flag) in [
+            (change.require_preauth, entry_flags::REQUIRE_PREAUTH),
+            (change.require_hwauth, entry_flags::REQUIRE_HWAUTH),
+            (change.allow_server, entry_flags::SERVER),
+            (change.change_password_service, entry_flags::CHANGE_PW),
+            (change.forwardable, entry_flags::FORWARDABLE),
+            (change.proxiable, entry_flags::PROXIABLE),
+            (change.renewable, entry_flags::RENEWABLE),
+            (change.postdated, entry_flags::POSTDATE),
+        ] {
+            if let Some(on) = value {
+                entry.flags = set_flag(entry.flags, flag, on);
+            }
+        }
+        if let Some(kvno) = change.kvno {
+            // The keys keep their own versions; only the entry's moves, and only forward: an entry
+            // below its highest key is a state `HdbEntry::kvno` will not derive, and the backends
+            // report it rather than repair it.
+            if kvno == 0 {
+                return Err(Error::Config(
+                    "kvno 0: a principal at version zero has keys nothing can name".into(),
+                ));
+            }
+            if kvno < entry.kvno() {
+                return Err(Error::Config(format!(
+                    "kvno {kvno} is below the highest key version {}; an entry cannot go back",
+                    entry.kvno()
+                )));
+            }
+            entry.kvno = kvno;
         }
         self.hdb.store(entry.clone())?;
         Ok(entry)

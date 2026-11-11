@@ -10,6 +10,7 @@
 //! not model is still written, zeroed, because the decoder is positional: omitting
 //! one shifts every field after it.
 
+use crate::admin::Modify;
 use crate::hdb::HdbEntry;
 use crate::name::Principal;
 
@@ -44,12 +45,107 @@ pub mod proc_ {
     pub const CHPASS_PRINCIPAL: u32 = 6;
     /// `chrand_principal3`, random keys with `keepold`.
     pub const CHRAND_PRINCIPAL3: u32 = 20;
+    /// `modify_principal`.
+    pub const MODIFY_PRINCIPAL: u32 = 3;
+    /// `rename_principal`.
+    pub const RENAME_PRINCIPAL: u32 = 4;
 }
 
 pub use proc_::{
     CHPASS_PRINCIPAL, CHRAND_PRINCIPAL3, CREATE_PRINCIPAL, DELETE_PRINCIPAL, GET_PRINCIPAL,
-    GET_PRINCS, GET_PRIVS, INIT,
+    GET_PRINCS, GET_PRIVS, INIT, MODIFY_PRINCIPAL, RENAME_PRINCIPAL,
 };
+
+/// The field masks of a `kadm5_principal_ent_rec` (`kadm5/admin.h`).
+///
+/// The mask *is* the request: each bit says the caller means that field, and a bit this server
+/// cannot honour is refused rather than ignored — an operator who typed `modprinc -fail_auth_count 3`
+/// and was told "success" would believe an account had been locked out.
+pub mod mask {
+    /// The principal's own name.
+    pub const PRINCIPAL: u32 = 0x0000_0001;
+    /// `princ_expire_time`.
+    pub const PRINC_EXPIRE_TIME: u32 = 0x0000_0002;
+    /// `pw_expiration`.
+    pub const PW_EXPIRATION: u32 = 0x0000_0004;
+    /// The attribute word.
+    pub const ATTRIBUTES: u32 = 0x0000_0010;
+    /// `max_life`.
+    pub const MAX_LIFE: u32 = 0x0000_0020;
+    /// `kvno`.
+    pub const KVNO: u32 = 0x0000_0100;
+    /// `policy`.
+    pub const POLICY: u32 = 0x0000_0800;
+    /// `policy`, cleared.
+    pub const POLICY_CLR: u32 = 0x0000_1000;
+    /// `max_renewable_life`.
+    pub const MAX_RLIFE: u32 = 0x0000_2000;
+
+    /// The bits `modify_principal` honours here.
+    pub const MODIFY_SUPPORTED: u32 =
+        PRINCIPAL | PRINC_EXPIRE_TIME | PW_EXPIRATION | ATTRIBUTES | MAX_LIFE | KVNO | MAX_RLIFE;
+}
+
+/// The `KADM5_*` attribute bits of a principal (`kadm5/admin.h`).
+///
+/// Twelve switches. Ten map onto an `hdb` flag, two — `DISALLOW_TGT_BASED` and
+/// `DISALLOW_DUP_SKEY` — describe restrictions this KDC has no setting for, and setting one is
+/// refused rather than dropped. Clearing either is fine: it asks for the permissive behaviour,
+/// which is what a realm without the setting already has.
+pub mod attr {
+    /// `DISALLOW_POSTDATED`.
+    pub const DISALLOW_POSTDATED: u32 = 0x0000_0001;
+    /// `DISALLOW_FORWARDABLE`.
+    pub const DISALLOW_FORWARDABLE: u32 = 0x0000_0002;
+    /// `DISALLOW_TGT_BASED` — not modelled.
+    pub const DISALLOW_TGT_BASED: u32 = 0x0000_0004;
+    /// `DISALLOW_RENEWABLE`.
+    pub const DISALLOW_RENEWABLE: u32 = 0x0000_0008;
+    /// `DISALLOW_PROXIABLE`.
+    pub const DISALLOW_PROXIABLE: u32 = 0x0000_0010;
+    /// `DISALLOW_DUP_SKEY` — not modelled.
+    pub const DISALLOW_DUP_SKEY: u32 = 0x0000_0020;
+    /// `DISALLOW_ALL_TIX`.
+    pub const DISALLOW_ALL_TIX: u32 = 0x0000_0040;
+    /// `REQUIRES_PRE_AUTH`.
+    pub const REQUIRES_PRE_AUTH: u32 = 0x0000_0080;
+    /// `REQUIRES_HW_AUTH`.
+    pub const REQUIRES_HW_AUTH: u32 = 0x0000_0100;
+    /// `DISALLOW_SVR`.
+    pub const DISALLOW_SVR: u32 = 0x0000_1000;
+    /// `PWCHANGE_SERVICE`.
+    pub const PWCHANGE_SERVICE: u32 = 0x0000_2000;
+    /// `OK_AS_DELEGATE`.
+    pub const OK_AS_DELEGATE: u32 = 0x0010_0000;
+
+    /// The two bits with no `hdb` counterpart.
+    pub const UNMODELLED: u32 = DISALLOW_TGT_BASED | DISALLOW_DUP_SKEY;
+}
+
+/// The `Modify` an attribute word asks for.
+///
+/// A word is a *set*, not a delta: MIT's `modprinc -attrs +requires_preauth` sends a word with
+/// that bit and nothing else, so every switch this server models is written from the word — the
+/// absent bits become "allowed", which is what the operator asked for by leaving them out.
+pub fn modify_from_attributes(word: u32) -> std::result::Result<Modify, u32> {
+    if word & attr::UNMODELLED != 0 {
+        return Err(BAD_MASK);
+    }
+    let disallowed = |bit: u32| word & bit != 0;
+    Ok(Modify {
+        invalid: Some(disallowed(attr::DISALLOW_ALL_TIX)),
+        require_preauth: Some(disallowed(attr::REQUIRES_PRE_AUTH)),
+        require_hwauth: Some(disallowed(attr::REQUIRES_HW_AUTH)),
+        change_password_service: Some(disallowed(attr::PWCHANGE_SERVICE)),
+        ok_as_delegate: Some(disallowed(attr::OK_AS_DELEGATE)),
+        allow_server: Some(!disallowed(attr::DISALLOW_SVR)),
+        forwardable: Some(!disallowed(attr::DISALLOW_FORWARDABLE)),
+        proxiable: Some(!disallowed(attr::DISALLOW_PROXIABLE)),
+        renewable: Some(!disallowed(attr::DISALLOW_RENEWABLE)),
+        postdated: Some(!disallowed(attr::DISALLOW_POSTDATED)),
+        ..Modify::default()
+    })
+}
 
 /// `KADM5_ERROR_BASE`: every `kadm5` status is this plus its index in MIT's table.
 const BASE: u32 = 43_787_520;
@@ -151,36 +247,71 @@ fn attributes_of(entry: &HdbEntry) -> u32 {
     if entry.has(h::CHANGE_PW) {
         attributes |= 0x0000_2000; // PWCHANGE_SERVICE
     }
+    // The four `DISALLOW_*` trip attributes are emitted when the flag is *absent*, which is what
+    // makes the two vocabularies reversible: a principal the KDC will not issue a forwardable
+    // ticket for has to look that way to `kadmin getprinc`, or the operator and the KDC disagree
+    // about the same account.
+    if !entry.has(h::FORWARDABLE) {
+        attributes |= attr::DISALLOW_FORWARDABLE;
+    }
+    if !entry.has(h::PROXIABLE) {
+        attributes |= attr::DISALLOW_PROXIABLE;
+    }
+    if !entry.has(h::RENEWABLE) {
+        attributes |= attr::DISALLOW_RENEWABLE;
+    }
+    if !entry.has(h::POSTDATE) {
+        attributes |= attr::DISALLOW_POSTDATED;
+    }
     if entry.has(h::INVALID) || entry.has(h::LOCKED_OUT) {
         attributes |= 0x0000_0040; // DISALLOW_ALL_TIX
     }
     attributes
 }
 
-/// What `create_principal` carries, as far as this server reads it.
+/// `kadm5_principal_ent_rec`, as it arrives in a `create` or `modify` request.
 ///
-/// Returns the entry fields it understood and the password. The mask tells which
-/// fields the client meant; a field outside it is zero and must not be applied, or
-/// `addprinc` would set an expiry the operator never asked for.
-pub fn decode_create(args: &[u8]) -> std::result::Result<(HdbEntry, Vec<u8>), u32> {
-    let mut r = Reader::new(args);
-    let _version = r.u32().map_err(|_| BAD_MASK)?;
+/// One decoder for both because the shape is one: MIT sends the same record and follows it with a
+/// mask (and, for `create`, a password). A field this server has no column for is read and dropped
+/// — the record is positional, so skipping one shifts every field after it, and a decoder that
+/// guessed which ones to skip would read a principal's expiry out of its key version.
+pub struct EntryRec {
+    /// The name the record is about.
+    pub principal: Principal,
+    /// `princ_expire_time`: 0 means "never", which is MIT's spelling, not the epoch.
+    pub princ_expire: i64,
+    /// `pw_expiration`, 0 meaning "never".
+    pub pw_expiration: i64,
+    /// `max_life`.
+    pub max_life: i64,
+    /// `attributes`: the `KADM5_*` attribute word.
+    pub attributes: u32,
+    /// `kvno`.
+    pub kvno: u32,
+    /// `policy`.
+    pub policy: Option<String>,
+    /// `max_renewable_life`.
+    pub max_renew: i64,
+}
+
+/// Reads `_xdr_kadm5_principal_ent_rec` from `r`.
+pub fn decode_entry_rec(r: &mut Reader<'_>) -> std::result::Result<EntryRec, u32> {
     let name = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_PRINC)?;
     let principal = Principal::parse(&name).map_err(|_| UNK_PRINC)?;
     let princ_expire = r.i32().map_err(|_| BAD_MASK)?;
     let _last_pwd_change = r.i32().map_err(|_| BAD_MASK)?;
     let pw_expiration = r.i32().map_err(|_| BAD_MASK)?;
     let max_life = r.i32().map_err(|_| BAD_MASK)?;
-    // `mod_name` is a plain XDR bool followed by the name when present: TRUE
-    // means absent, which is MIT's `xdr_nulltype` and the inverse of intuition.
+    // `mod_name` is a plain XDR bool followed by the name when present: TRUE means absent, which
+    // is MIT's `xdr_nulltype` and the inverse of what the name suggests.
     if !r.bool().map_err(|_| BAD_MASK)? {
         let _ = r.nullstring().map_err(|_| BAD_MASK)?;
     }
     let _mod_date = r.i32().map_err(|_| BAD_MASK)?;
     let attributes = r.u32().map_err(|_| BAD_MASK)?;
-    let _kvno = r.u32().map_err(|_| BAD_MASK)?;
+    let kvno = r.u32().map_err(|_| BAD_MASK)?;
     let _mkvno = r.u32().map_err(|_| BAD_MASK)?;
-    let _policy = r.nullstring().map_err(|_| BAD_MASK)?;
+    let policy = r.nullstring().map_err(|_| BAD_MASK)?;
     let _aux = r.u32().map_err(|_| BAD_MASK)?;
     let max_renew = r.i32().map_err(|_| BAD_MASK)?;
     let _last_success = r.i32().map_err(|_| BAD_MASK)?;
@@ -201,9 +332,9 @@ pub fn decode_create(args: &[u8]) -> std::result::Result<(HdbEntry, Vec<u8>), u3
             r.skip_tl_data().map_err(|_| BAD_MASK)?;
         }
     }
-    // Then the key array's own count — a second field, distinct from
-    // `n_key_data`, and reading the mask here instead lands the password four
-    // octets early and silently produces a keyless principal.
+    // Then the key array's own count — a second field, distinct from `n_key_data`, and reading the
+    // mask here instead lands the password four octets early and silently produces a keyless
+    // principal.
     let n_keys = r.u32().map_err(|_| BAD_MASK)?;
     for _ in 0..n_keys {
         let _ = r.u32().map_err(|_| BAD_MASK)?;
@@ -215,40 +346,129 @@ pub fn decode_create(args: &[u8]) -> std::result::Result<(HdbEntry, Vec<u8>), u3
         let _ = r.opaque().map_err(|_| BAD_MASK)?;
         let _ = r.opaque().map_err(|_| BAD_MASK)?;
     }
+    Ok(EntryRec {
+        principal,
+        princ_expire: i64::from(princ_expire),
+        pw_expiration: i64::from(pw_expiration),
+        max_life: i64::from(max_life),
+        attributes,
+        kvno,
+        policy,
+        max_renew: i64::from(max_renew),
+    })
+}
+
+/// What `create_principal` carries, as far as this server reads it.
+///
+/// Returns the entry fields it understood and the password. The mask tells which
+/// fields the client meant; a field outside it is zero and must not be applied, or
+/// `addprinc` would set an expiry the operator never asked for.
+pub fn decode_create(args: &[u8]) -> std::result::Result<(HdbEntry, Vec<u8>), u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let rec = decode_entry_rec(&mut r)?;
     let mask = r.u32().map_err(|_| BAD_MASK)?;
     let password = r.nullstring().map_err(|_| BAD_MASK)?;
-    let mut entry = HdbEntry::user(principal);
-    if mask & 0x00_0020 != 0 && max_life != 0 {
-        entry.max_life = Some(i64::from(max_life));
+
+    let mut entry = HdbEntry::user(rec.principal);
+    if mask & mask::MAX_LIFE != 0 && rec.max_life != 0 {
+        entry.max_life = Some(rec.max_life);
     }
-    if mask & 0x00_2000 != 0 && max_renew != 0 {
-        entry.max_renew = Some(i64::from(max_renew));
+    if mask & mask::MAX_RLIFE != 0 && rec.max_renew != 0 {
+        entry.max_renew = Some(rec.max_renew);
     }
-    if mask & 0x00_0002 != 0 && princ_expire != 0 {
-        entry.valid_end = Some(i64::from(princ_expire));
+    if mask & mask::PRINC_EXPIRE_TIME != 0 && rec.princ_expire != 0 {
+        entry.valid_end = Some(rec.princ_expire);
     }
-    if mask & 0x00_0004 != 0 && pw_expiration != 0 {
-        entry.pw_end = Some(i64::from(pw_expiration));
+    if mask & mask::PW_EXPIRATION != 0 && rec.pw_expiration != 0 {
+        entry.pw_end = Some(rec.pw_expiration);
     }
-    if mask & 0x00_0010 != 0 {
-        // Only the bits this server models, and only downwards: a client that
-        // omitted `REQUIRES_PRE_AUTH` gets it anyway, because a principal with a
-        // password and no pre-authentication is an offline crack waiting.
-        if attributes & 0x0000_0040 != 0 {
+    if mask & mask::ATTRIBUTES != 0 {
+        // Only the bits this server models, and only downwards: a client that omitted
+        // `REQUIRES_PRE_AUTH` gets it anyway, because a principal with a password and no
+        // pre-authentication is an offline crack waiting.
+        if rec.attributes & attr::DISALLOW_ALL_TIX != 0 {
             entry.flags |= crate::hdb::flags::INVALID;
         }
-        if attributes & 0x0000_1000 == 0 {
+        if rec.attributes & attr::DISALLOW_SVR == 0 {
             entry.flags |= crate::hdb::flags::SERVER;
         }
-        if attributes & 0x0010_0000 != 0 {
+        if rec.attributes & attr::OK_AS_DELEGATE != 0 {
             entry.flags |= crate::hdb::flags::OK_AS_DELEGATE;
         }
-        if attributes & 0x0000_2000 != 0 {
+        if rec.attributes & attr::PWCHANGE_SERVICE != 0 {
             entry.flags |= crate::hdb::flags::CHANGE_PW;
         }
     }
     let _ = MASK_ALL;
     Ok((entry, password.unwrap_or_default().into_bytes()))
+}
+
+/// A `modify_principal` request: the entry record, the mask, and nothing else.
+///
+/// The mask is the request. A bit that is set names a field the caller means to change, and a bit
+/// this server cannot honour is refused by name rather than ignored — an operator who typed
+/// `modprinc -fail_auth_count 3` and got "success" would believe an account was locked out.
+pub fn decode_modify(args: &[u8]) -> std::result::Result<(Principal, Modify), u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let rec = decode_entry_rec(&mut r)?;
+    let mask = r.u32().map_err(|_| BAD_MASK)?;
+    if mask == 0 {
+        // MIT answers `KADM5_BAD_MASK` here, and so must this: a successful no-op is a change an
+        // operator believes happened.
+        return Err(BAD_MASK);
+    }
+    // A bit this server cannot honour is refused, not dropped. Policy bits land here too while
+    // policies are unmodelled: the mask names a field, and answering "success" for a field nobody
+    // stored is the failure mode this refuses.
+    if mask & !mask::MODIFY_SUPPORTED != 0 {
+        return Err(BAD_MASK);
+    }
+
+    let mut change = Modify::default();
+    if mask & mask::PRINC_EXPIRE_TIME != 0 {
+        // 0 is MIT's "never", not the epoch: `modprinc -expire 0` clears the expiry.
+        change.valid_end = Some((rec.princ_expire != 0).then_some(rec.princ_expire));
+    }
+    if mask & mask::PW_EXPIRATION != 0 {
+        change.pw_end = Some((rec.pw_expiration != 0).then_some(rec.pw_expiration));
+    }
+    if mask & mask::MAX_LIFE != 0 {
+        change.max_life = Some((rec.max_life != 0).then_some(rec.max_life));
+    }
+    if mask & mask::MAX_RLIFE != 0 {
+        change.max_renew = Some((rec.max_renew != 0).then_some(rec.max_renew));
+    }
+    if mask & mask::KVNO != 0 {
+        change.kvno = Some(rec.kvno);
+    }
+    if mask & mask::ATTRIBUTES != 0 {
+        // The attribute word replaces the switches, and `..` keeps the fields the mask did not
+        // name: a `modprinc -attrs` says nothing about the expiry.
+        let attributes = modify_from_attributes(rec.attributes)?;
+        change = Modify {
+            valid_end: change.valid_end,
+            pw_end: change.pw_end,
+            max_life: change.max_life,
+            max_renew: change.max_renew,
+            kvno: change.kvno,
+            ..attributes
+        };
+    }
+    Ok((rec.principal, change))
+}
+
+/// A `rename_principal` request: the old name and the new one.
+pub fn decode_rename(args: &[u8]) -> std::result::Result<(Principal, Principal), u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let from = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_PRINC)?;
+    let to = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_PRINC)?;
+    Ok((
+        Principal::parse(&from).map_err(|_| UNK_PRINC)?,
+        Principal::parse(&to).map_err(|_| UNK_PRINC)?,
+    ))
 }
 
 /// Encodes one key block for a `chrand_principal3` reply.
@@ -312,8 +532,9 @@ mod tests {
         assert_eq!(r.i32().unwrap(), 0, "mod_date");
         assert_eq!(
             r.u32().unwrap(),
-            0x80 | 0x1000,
-            "REQUIRES_PRE_AUTH, and DISALLOW_SVR because a user entry is not a server"
+            0x80 | 0x1000 | 0x1,
+            "REQUIRES_PRE_AUTH, DISALLOW_SVR because a user entry is not a server, and \
+             DISALLOW_POSTDATED because `HdbEntry::user` does not allow postdating"
         );
     }
 
@@ -358,6 +579,151 @@ mod tests {
         w.i32(0).i32(0).bool(true).u32(0);
         w.u32(mask).nullstring(Some("a password"));
         w.into_bytes()
+    }
+
+    /// A `modify` request: the same record `create` sends, then the mask and nothing else.
+    fn modify_args(mask: u32, attributes: u32, max_life: i32, expire: i32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(API_VERSION_2);
+        w.nullstring(Some("bob@R"));
+        w.i32(expire).i32(0).i32(0).i32(max_life);
+        w.bool(true).i32(0).i32(attributes as i32).u32(0).u32(0);
+        w.nullstring(None).i32(0);
+        w.i32(0).i32(0).i32(0).u32(0);
+        w.i32(0).i32(0).bool(true).u32(0);
+        w.u32(mask);
+        w.into_bytes()
+    }
+
+    #[test]
+    fn a_modify_carries_only_the_fields_its_mask_names() {
+        let (principal, change) = decode_modify(&modify_args(
+            mask::MAX_LIFE | mask::PRINC_EXPIRE_TIME,
+            0,
+            36_000,
+            1_700_000_000,
+        ))
+        .unwrap();
+        assert_eq!(principal.to_string(), "bob@R");
+        assert_eq!(change.max_life, Some(Some(36_000)));
+        assert_eq!(change.valid_end, Some(Some(1_700_000_000)));
+        // A field the mask did not name is not a change, even though the record carries a zero
+        // for it: applying that zero would clear an expiry the operator never mentioned.
+        assert_eq!(change.pw_end, None);
+        assert_eq!(change.max_renew, None);
+        assert_eq!(change.kvno, None);
+        assert!(!change.is_empty());
+    }
+
+    /// `modprinc -expire 0` means "never", not "the epoch": MIT spells the absence of an expiry as
+    /// zero, and a server that stored 1970 would refuse every ticket for the principal.
+    #[test]
+    fn a_zero_expiry_in_a_modify_clears_it() {
+        let (_, change) = decode_modify(&modify_args(mask::PRINC_EXPIRE_TIME, 0, 0, 0)).unwrap();
+        assert_eq!(change.valid_end, Some(None));
+    }
+
+    /// An empty mask is an error, not a successful no-op: an operator who ran `modprinc` with no
+    /// options has to be told that nothing happened.
+    #[test]
+    fn a_modify_with_no_fields_is_refused() {
+        assert_eq!(
+            decode_modify(&modify_args(0, 0, 0, 0)).unwrap_err(),
+            BAD_MASK
+        );
+    }
+
+    /// A mask bit this server cannot honour is refused by name rather than ignored — including the
+    /// policy bits, while policies are unmodelled.
+    #[test]
+    fn a_mask_bit_this_server_cannot_honour_is_refused() {
+        for bit in [
+            mask::POLICY,
+            mask::POLICY_CLR,
+            0x0000_0008, // LAST_PWD_CHANGE
+            0x0000_0040, // MOD_TIME
+            0x0001_0000, // FAIL_AUTH_COUNT
+            0x0002_0000, // KEY_DATA
+        ] {
+            assert_eq!(
+                decode_modify(&modify_args(bit | mask::MAX_LIFE, 0, 3600, 0)).unwrap_err(),
+                BAD_MASK,
+                "mask bit {bit:#x} must be refused"
+            );
+        }
+    }
+
+    /// The attribute word is a set, and every switch this server models is written from it — the
+    /// absent bits mean "allowed", which is what leaving them out asks for.
+    #[test]
+    fn the_attribute_word_sets_every_switch_it_models() {
+        use crate::hdb::flags as h;
+        let (_, change) = decode_modify(&modify_args(
+            mask::ATTRIBUTES,
+            attr::REQUIRES_PRE_AUTH | attr::OK_AS_DELEGATE,
+            0,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(change.require_preauth, Some(true));
+        assert_eq!(change.ok_as_delegate, Some(true));
+        assert_eq!(
+            change.forwardable,
+            Some(true),
+            "DISALLOW_FORWARDABLE absent"
+        );
+        assert_eq!(change.allow_server, Some(true), "DISALLOW_SVR absent");
+        assert_eq!(change.invalid, Some(false));
+        assert_eq!(change.change_password_service, Some(false));
+
+        // And with the disallow bits set, the same switches go the other way.
+        let (_, change) = decode_modify(&modify_args(
+            mask::ATTRIBUTES,
+            attr::DISALLOW_ALL_TIX
+                | attr::DISALLOW_SVR
+                | attr::DISALLOW_FORWARDABLE
+                | attr::PWCHANGE_SERVICE,
+            0,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(change.invalid, Some(true));
+        assert_eq!(change.allow_server, Some(false));
+        assert_eq!(change.forwardable, Some(false));
+        assert_eq!(change.change_password_service, Some(true));
+        assert_eq!(change.require_preauth, Some(false));
+        let _ = h::SERVER;
+    }
+
+    /// The two attribute bits with no `hdb` counterpart are refused when set: dropping them would
+    /// answer "success" for a restriction nobody stored.
+    #[test]
+    fn an_attribute_this_server_cannot_store_is_refused() {
+        for bit in [attr::DISALLOW_TGT_BASED, attr::DISALLOW_DUP_SKEY] {
+            assert_eq!(
+                decode_modify(&modify_args(mask::ATTRIBUTES, bit, 0, 0)).unwrap_err(),
+                BAD_MASK,
+                "attribute {bit:#x} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rename_carries_two_names() {
+        let mut w = Writer::new();
+        w.u32(API_VERSION_2);
+        w.nullstring(Some("bob@R"));
+        w.nullstring(Some("robert@R"));
+        let (from, to) = decode_rename(&w.into_bytes()).unwrap();
+        assert_eq!(from.to_string(), "bob@R");
+        assert_eq!(to.to_string(), "robert@R");
+
+        // A missing name is a malformed request, not a rename to "nothing".
+        let mut w = Writer::new();
+        w.u32(API_VERSION_2)
+            .nullstring(Some("bob@R"))
+            .nullstring(None);
+        assert_eq!(decode_rename(&w.into_bytes()).unwrap_err(), UNK_PRINC);
     }
 
     #[test]

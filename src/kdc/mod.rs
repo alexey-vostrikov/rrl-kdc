@@ -72,8 +72,18 @@ use crate::hdb::Hdb;
 use crate::msg::KdcReq;
 use crate::name::Principal;
 
+/// `renewable-ok` (RFC 4120 §5.4.1, bit 27): "give me a renewable ticket if you cannot give me
+/// one that lives as long as I asked".
+///
+/// Not in `rrl-krb-common`'s `kdc_options`, which is where every other option mask lives and where
+/// a table test pins each to its bit. A constant here keeps this change to one repository; it
+/// belongs there, and the bit is what the rule says: bit 27 is `1 << (31 - 27)`.
+pub const RENEWABLE_OK: u32 = 0x0000_0010;
+
 pub use as_exchange::Purpose;
-pub use as_exchange::{endtime, renew_till, starttime, ticket_flags, usable_enctypes};
+pub use as_exchange::{
+    endtime, may_postdate, renew_till, starttime, ticket_flags, usable_enctypes,
+};
 pub use config::{KdcConfig, TransitedPolicy};
 
 /// Who may change whose password (RFC 3244 §2: the service is told, not told

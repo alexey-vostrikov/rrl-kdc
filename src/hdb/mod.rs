@@ -75,6 +75,53 @@ pub mod flags {
     pub const LOCKED_OUT: u32 = 0x0000_4000;
     /// `require-pwchange`.
     pub const REQUIRE_PWCHANGE: u32 = 0x0000_2000;
+
+    // Bits 19 to 24 and 30 to 31 are Heimdal's, below the ones above in the BIT STRING and after
+    // them in the ASN.1: `hdb.asn1` lists 0–18, then 19–24, then jumps to 30. The gap is real —
+    // 25 to 29 are unassigned — and reading the list as if it were contiguous would put every
+    // flag from here on in the wrong place.
+    /// `materialize` — store the entry even inside a virtual namespace.
+    pub const MATERIALIZE: u32 = 0x0000_1000;
+    /// `virtual-keys` — the entry is stored, but its keys are mostly derived.
+    pub const VIRTUAL_KEYS: u32 = 0x0000_0800;
+    /// `virtual` — the entry is not stored; its keys are always derived.
+    pub const VIRTUAL: u32 = 0x0000_0400;
+    /// `synthetic` — a principal that exists for PKINIT only.
+    pub const SYNTHETIC: u32 = 0x0000_0200;
+    /// `no-auth-data-reqd` — omit the PAC from tickets for this service.
+    pub const NO_AUTH_DATA_REQD: u32 = 0x0000_0100;
+    /// `auth-data-reqd` — include the PAC in tickets for this service.
+    ///
+    /// These two are the pair Active Directory writes as
+    /// `msDS-SecondaryKrb5UserAccountControl` bits: a service can say "never send me
+    /// authorization data" or "always", and saying neither is what every entry does by default.
+    pub const AUTH_DATA_REQD: u32 = 0x0000_0080;
+
+    /// `force-canonicalize` — return the entry's own name in the reply whatever the
+    /// `canonicalize` KDC option says.
+    ///
+    /// RFC 6806 §6 forbids a KDC from changing a name in a TGS reply, and Heimdal honours that by
+    /// ignoring `canonicalize` there — except for this flag, which exists for the deployments that
+    /// depend on the old behaviour (a directory that publishes `servicePrincipalName`s and wants
+    /// the canonical account name back). `hdb.asn1` forbids storing it, so an entry read from a
+    /// backend that sets it is a decision the operator made on purpose.
+    pub const FORCE_CANONICALIZE: u32 = 0x0000_0002;
+    /// `do-not-store` — never write this entry back.
+    pub const DO_NOT_STORE: u32 = 0x0000_0001;
+}
+
+/// `HDB-Ext-Aliases` (`hdb.asn1`): the other names a principal answers to.
+///
+/// Heimdal keeps aliases in an extension rather than in the entry's principal because an alias is
+/// a *name*, not an identity: one account, several names clients may ask for, one set of keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Aliases {
+    /// `case-insensitive [0] BOOLEAN`: compare names without regard to case.
+    pub case_insensitive: bool,
+    /// `aliases [1] SEQUENCE OF Principal`: **all** the names, the primary one included, as
+    /// Heimdal writes it. A record that lists only the others is accepted too — the primary is
+    /// skipped when matching, so a list that omits it behaves the same.
+    pub names: Vec<Principal>,
 }
 
 /// One key of an entry: the material, the kvno it belongs to, and the salt it
@@ -148,6 +195,13 @@ pub struct HdbEntry {
     /// delegate to itself in either case (MS-SFU §3.1.4 — a service holding a ticket in its own
     /// name needs no permission to keep it).
     pub constrained_delegation: Option<Vec<Principal>>,
+    /// `HDB-Ext-Aliases`: the other names this principal answers to.
+    ///
+    /// `None` is "no extension at all", which is not the same as an empty list of names: the
+    /// extension also carries the case-insensitivity switch, so an entry with
+    /// `Some(Aliases { case_insensitive: true, names: vec![] })` still matches
+    /// `ALICE@REALM` for `alice@realm` while one with `None` does not.
+    pub aliases: Option<Aliases>,
 }
 
 impl HdbEntry {
@@ -173,7 +227,58 @@ impl HdbEntry {
             etypes: None,
             modified: 0,
             constrained_delegation: None,
+            aliases: None,
         }
+    }
+
+    /// Whether `name` is this entry's own name or one of its aliases.
+    ///
+    /// The comparison follows `HDB-Ext-Aliases`: the names are compared as principals (name type,
+    /// components and realm), and when the extension says `case-insensitive` the components and
+    /// the realm are folded to lower case first. The entry's own principal is always matched, even
+    /// when the alias list omits it — Heimdal writes the primary into the list, an entry from
+    /// another tool may not, and a lookup that depended on that would be a lookup that works only
+    /// for records written by one implementation.
+    pub fn matches_name(&self, name: &Principal) -> bool {
+        if &self.principal == name {
+            return true;
+        }
+        let Some(aliases) = &self.aliases else {
+            return false;
+        };
+        let folded = |p: &Principal| {
+            if aliases.case_insensitive {
+                Some(fold(p))
+            } else {
+                None
+            }
+        };
+        let wanted = folded(name);
+        aliases.names.iter().any(|alias| {
+            if alias == name {
+                return true;
+            }
+            match (&wanted, folded(alias)) {
+                (Some(a), Some(b)) => *a == b,
+                _ => false,
+            }
+        })
+    }
+
+    /// The names this entry answers to, its own first: what an operator sees when asking why a
+    /// request for one name found another principal.
+    pub fn names(&self) -> Vec<Principal> {
+        let mut out = vec![self.principal.clone()];
+        if let Some(aliases) = &self.aliases {
+            out.extend(
+                aliases
+                    .names
+                    .iter()
+                    .filter(|a| **a != self.principal)
+                    .cloned(),
+            );
+        }
+        out
     }
 
     /// A service principal: `server`, and by default not a client.
@@ -191,6 +296,7 @@ impl HdbEntry {
             etypes: None,
             modified: 0,
             constrained_delegation: None,
+            aliases: None,
         }
     }
 
@@ -210,6 +316,7 @@ impl HdbEntry {
             etypes: None,
             modified: 0,
             constrained_delegation: None,
+            aliases: None,
         }
     }
 
@@ -377,11 +484,26 @@ pub trait Hdb: Send + Sync + std::fmt::Debug {
     fn next(&self, after: &Principal) -> Result<Option<Principal>>;
 }
 
+/// `p` with every component and its realm in lower case: how a case-insensitive alias is
+/// compared. Name types are left alone — `NT-SRV-INST` and `NT-PRINCIPAL` are different kinds of
+/// name, not different spellings of one.
+fn fold(p: &Principal) -> Principal {
+    Principal::new(
+        p.name_type,
+        p.components.iter().map(|c| c.to_lowercase()),
+        p.realm.to_lowercase(),
+    )
+}
+
 /// A database in memory: what the tests use, and what an in-process KDC can
 /// start from before it has storage of its own.
 #[derive(Debug, Default)]
 pub struct MemoryHdb {
     entries: RwLock<BTreeMap<Principal, HdbEntry>>,
+    /// alias → the principal whose entry answers to it, kept so that an alias lookup costs one
+    /// map probe rather than a walk over every entry. Rebuilt for one entry on every store,
+    /// remove and rename; `case-insensitive` aliases are entered in both spellings.
+    aliases: RwLock<BTreeMap<Principal, Principal>>,
 }
 
 impl MemoryHdb {
@@ -411,17 +533,67 @@ impl MemoryHdb {
     }
 }
 
-impl Hdb for MemoryHdb {
-    fn fetch(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
-        Ok(self
+impl MemoryHdb {
+    /// Replaces the alias entries that point at `principal` with the ones `entry` declares.
+    fn reindex_aliases(
+        aliases: &mut BTreeMap<Principal, Principal>,
+        entry: &HdbEntry,
+    ) -> Result<()> {
+        aliases.retain(|_, target| target != &entry.principal);
+        let case_insensitive = entry.aliases.as_ref().is_some_and(|a| a.case_insensitive);
+        for name in entry.names() {
+            if name != entry.principal {
+                // A name that is itself a stored principal is that principal, not an alias of
+                // this one: which entry wins would otherwise depend on insertion order.
+                aliases.insert(name.clone(), entry.principal.clone());
+            }
+            if case_insensitive {
+                aliases.insert(fold(&name), entry.principal.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// `principal`, or the entry whose alias list names it.
+    fn resolve(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
+        let entries = self
             .entries
             .read()
-            .map_err(|_| Error::Hdb("lock poisoned".into()))?
+            .map_err(|_| Error::Hdb("lock poisoned".into()))?;
+        if let Some(entry) = entries.get(principal) {
+            return Ok(Some(entry.clone()));
+        }
+        let aliases = self
+            .aliases
+            .read()
+            .map_err(|_| Error::Hdb("lock poisoned".into()))?;
+        let Some(target) = aliases
             .get(principal)
-            .cloned())
+            .or_else(|| aliases.get(&fold(principal)))
+        else {
+            return Ok(None);
+        };
+        // The alias map only ever points at stored principals; a value whose entry was removed
+        // between the two reads resolves to nothing rather than to a stale entry.
+        Ok(entries.get(target).cloned())
+    }
+}
+
+impl Hdb for MemoryHdb {
+    fn fetch(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
+        self.resolve(principal)
+    }
+
+    fn fetch_for_service(&self, service: &Principal) -> Result<Option<HdbEntry>> {
+        self.resolve(service)
     }
 
     fn store(&self, entry: HdbEntry) -> Result<()> {
+        let mut aliases = self
+            .aliases
+            .write()
+            .map_err(|_| Error::Hdb("lock poisoned".into()))?;
+        Self::reindex_aliases(&mut aliases, &entry)?;
         let mut guard = self
             .entries
             .write()
@@ -431,12 +603,18 @@ impl Hdb for MemoryHdb {
     }
 
     fn remove(&self, principal: &Principal) -> Result<bool> {
-        Ok(self
+        let mut guard = self
             .entries
             .write()
-            .map_err(|_| Error::Hdb("lock poisoned".into()))?
-            .remove(principal)
-            .is_some())
+            .map_err(|_| Error::Hdb("lock poisoned".into()))?;
+        let removed = guard.remove(principal);
+        if removed.is_some() {
+            self.aliases
+                .write()
+                .map_err(|_| Error::Hdb("lock poisoned".into()))?
+                .retain(|_, target| target != principal);
+        }
+        Ok(removed.is_some())
     }
 
     fn rename(&self, from: &Principal, to: &Principal) -> Result<()> {
@@ -448,7 +626,13 @@ impl Hdb for MemoryHdb {
             .remove(from)
             .ok_or_else(|| Error::Hdb(format!("cannot rename {from}: no such principal")))?;
         entry.principal = to.clone();
-        guard.insert(to.clone(), entry);
+        guard.insert(to.clone(), entry.clone());
+        drop(guard);
+        let mut aliases = self
+            .aliases
+            .write()
+            .map_err(|_| Error::Hdb("lock poisoned".into()))?;
+        Self::reindex_aliases(&mut aliases, &entry)?;
         Ok(())
     }
 
@@ -488,6 +672,55 @@ mod tests {
             .unwrap();
         db.insert(krbtgt).unwrap();
         db
+    }
+
+    /// Every `HDBFlags` bit against the ASN.1 that defines it, written out here rather than read
+    /// from the constants: a table that reads the constant agrees with itself whatever the constant
+    /// says, which is how a mask for bit 26 sat in this file named after bit 15.
+    ///
+    /// The list is `lib/hdb/hdb.asn1`, in BIT STRING order, including the jump from 24 to 30 —
+    /// 25 to 29 are unassigned, and reading the list as contiguous puts every flag after the gap
+    /// in the wrong place.
+    #[test]
+    fn every_flag_is_the_bit_hdb_asn1_names() {
+        let bits: [(u32, u32, &str); 27] = [
+            (flags::INITIAL, 0, "initial"),
+            (flags::FORWARDABLE, 1, "forwardable"),
+            (flags::PROXIABLE, 2, "proxiable"),
+            (flags::RENEWABLE, 3, "renewable"),
+            (flags::POSTDATE, 4, "postdate"),
+            (flags::SERVER, 5, "server"),
+            (flags::CLIENT, 6, "client"),
+            (flags::INVALID, 7, "invalid"),
+            (flags::REQUIRE_PREAUTH, 8, "require-preauth"),
+            (flags::CHANGE_PW, 9, "change-pw"),
+            (flags::REQUIRE_HWAUTH, 10, "require-hwauth"),
+            (flags::OK_AS_DELEGATE, 11, "ok-as-delegate"),
+            (flags::USER_TO_USER, 12, "user-to-user"),
+            (flags::IMMUTABLE, 13, "immutable"),
+            (flags::TRUSTED_FOR_DELEGATION, 14, "trusted-for-delegation"),
+            (flags::ALLOW_KERBEROS4, 15, "allow-kerberos4"),
+            (flags::ALLOW_DIGEST, 16, "allow-digest"),
+            (flags::LOCKED_OUT, 17, "locked-out"),
+            (flags::REQUIRE_PWCHANGE, 18, "require-pwchange"),
+            (flags::MATERIALIZE, 19, "materialize"),
+            (flags::VIRTUAL_KEYS, 20, "virtual-keys"),
+            (flags::VIRTUAL, 21, "virtual"),
+            (flags::SYNTHETIC, 22, "synthetic"),
+            (flags::NO_AUTH_DATA_REQD, 23, "no-auth-data-reqd"),
+            (flags::AUTH_DATA_REQD, 24, "auth-data-reqd"),
+            (flags::FORCE_CANONICALIZE, 30, "force-canonicalize"),
+            (flags::DO_NOT_STORE, 31, "do-not-store"),
+        ];
+        for (constant, bit, name) in bits {
+            assert_eq!(constant, 1 << (31 - bit), "{name} is bit {bit}");
+        }
+        // No two flags share a bit: a copy-paste that repeated one would still match its own row.
+        let mut seen = 0u32;
+        for (constant, _, name) in bits {
+            assert_eq!(seen & constant, 0, "{name} collides with an earlier flag");
+            seen |= constant;
+        }
     }
 
     #[test]

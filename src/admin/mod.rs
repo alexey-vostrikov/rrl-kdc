@@ -225,6 +225,9 @@ impl Admin {
             // Delegation limits are an HDB extension a directory cannot hold; a principal
             // created through the admin interface delegates nowhere but itself.
             constrained_delegation: None,
+            // Nor does a new principal have other names; `rename` and `alias` are separate
+            // operations, and an alias list invented here would be one nobody asked for.
+            aliases: None,
         };
 
         let enctypes = if new.enctypes.is_empty() {

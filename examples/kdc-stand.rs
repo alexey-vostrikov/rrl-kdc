@@ -124,6 +124,7 @@ fn main() {
         etypes: None,
         modified: 0,
         constrained_delegation: None,
+        aliases: None,
     };
     for enctype in Enctype::ALL {
         machine_entry

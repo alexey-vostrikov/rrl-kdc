@@ -22,20 +22,27 @@
 //!   principal may be issued |
 //! | 10 | `kvno` | `INTEGER` — the entry's key version. Absent in records
 //!   written before it was stored, which decode to the highest key instead |
+//! | 13 | `extensions` | `SEQUENCE OF HDB-extension`; this crate reads and writes
+//!   two of them — `allowed-to-delegate-to [2]` and `aliases [6]` — and skips the rest |
 //!
-//! What is *not* here yet, and is not pretended otherwise: Heimdal's
-//! `HDB-extension` (`[9]`), `mkvno` on a key, generated and virtual keys, and
-//! key rotation. A record written without them decodes to exactly what was
-//! written; a record carrying them is refused rather than silently truncated,
-//! because an entry whose unknown fields were dropped is an entry whose keys
-//! stopped working.
+//! What is *not* here yet, and is not pretended otherwise: `mkvno` on a key,
+//! generated and virtual keys, key rotation, and the other `HDB-extension`s. An
+//! extension this crate does not know is skipped rather than refused, because a
+//! record written by a foreign tool would otherwise be unreadable for a field
+//! this KDC has no use for; an entry whose *known* fields were dropped would be
+//! an entry whose keys stopped working, and none are.
 
 use crate::crypto::{Enctype, Key};
 use crate::der::{self, Fields, Reader};
 use crate::error::{Error, Result};
 use crate::name::Principal;
 
-use super::{HdbEntry, HdbKey};
+use super::{Aliases, HdbEntry, HdbKey};
+
+/// `BOOLEAN` (universal tag 1). `rrl-krb-common`'s decoder names the tags Kerberos messages use,
+/// and none of them is a bare `BOOLEAN`; Heimdal's `HDB-Ext-Aliases` is the first place in this
+/// crate that needs one.
+const BOOLEAN: u8 = 0x01;
 
 /// The field that names a record in any backend that keys by principal.
 ///
@@ -134,26 +141,61 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
         ));
     }
     parts.push(der::field(10, der::int(entry.kvno as i64)));
+    // `extensions [13] HDB-extensions`: a SEQUENCE OF `HDB-extension`, one per extension this
+    // crate understands. `mandatory` is false on every one of them on purpose: a KDC that does not
+    // know an extension denies what it guards (delegation, alias resolution), and denying is the
+    // safe direction — marking it mandatory would make every older KDC reject the whole entry
+    // instead of one thing inside it.
+    let mut extensions = Vec::new();
     if let Some(acl) = &entry.constrained_delegation {
-        // `extensions [13] HDB-extensions`: a SEQUENCE OF `HDB-extension`, and this crate
-        // writes the one extension it understands. `mandatory` is false on purpose: a KDC that
-        // does not know this extension denies delegation, and denying is the safe direction —
-        // marking it mandatory would make every older KDC reject the whole entry instead.
-        parts.push(der::field(
-            13,
-            der::seq(&[der::seq(&[
-                der::field(0, der::int(0)),
-                // `data [1]` holds a CHOICE, whose `allowed-to-delegate-to [2]` alternative is
-                // `SEQUENCE OF Principal`.
-                der::field(
-                    1,
-                    der::seq(&[der::field(
-                        2,
-                        der::seq(&acl.iter().map(|p| p.encode_name()).collect::<Vec<_>>()),
-                    )]),
-                ),
-            ])]),
-        ));
+        // `data [1]` holds a CHOICE, whose `allowed-to-delegate-to [2]` alternative is
+        // `SEQUENCE OF Principal`.
+        extensions.push(der::seq(&[
+            der::field(0, der::int(0)),
+            der::field(
+                1,
+                der::seq(&[der::field(
+                    2,
+                    der::seq(&acl.iter().map(|p| p.encode_name()).collect::<Vec<_>>()),
+                )]),
+            ),
+        ]));
+    }
+    if let Some(aliases) = &entry.aliases {
+        // `HDB-Ext-Aliases ::= SEQUENCE { case-insensitive [0] BOOLEAN, aliases [1]
+        // SEQUENCE OF Principal }`. The boolean is written even when false: it is not DEFAULT in
+        // the ASN.1, so omitting it would be a different encoding of the same intent.
+        extensions.push(der::seq(&[
+            der::field(0, der::int(0)),
+            der::field(
+                1,
+                der::seq(&[der::field(
+                    6,
+                    der::seq(&[
+                        der::field(
+                            0,
+                            der::tlv(
+                                BOOLEAN,
+                                &[if aliases.case_insensitive { 0xFF } else { 0x00 }],
+                            ),
+                        ),
+                        der::field(
+                            1,
+                            der::seq(
+                                &aliases
+                                    .names
+                                    .iter()
+                                    .map(|p| p.encode_name())
+                                    .collect::<Vec<_>>(),
+                            ),
+                        ),
+                    ]),
+                )]),
+            ),
+        ]));
+    }
+    if !extensions.is_empty() {
+        parts.push(der::field(13, der::seq(&extensions)));
     }
     der::seq(&parts)
 }
@@ -250,12 +292,13 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
 
     // Read before the struct is built: `principal` takes ownership of the realm, and the ACL's
     // principals are named in it.
-    let delegation_acl = constrained_delegation(&f, ctx, &principal.realm)?;
+    let (delegation_acl, aliases) = read_extensions(&f, ctx, &principal.realm)?;
 
     Ok(HdbEntry {
         principal,
         keys,
         constrained_delegation: delegation_acl,
+        aliases,
         flags: f.flags32(2, ctx)?,
         valid_start: time_field(3)?,
         valid_end: time_field(4)?,
@@ -275,54 +318,88 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
     })
 }
 
-/// `allowed-to-delegate-to` out of `extensions [13]`, when the record carries one.
+/// What the record's `extensions [13]` say, for the extensions this crate understands.
 ///
-/// The extension is optional and the list may legitimately be empty, so three outcomes are
-/// kept apart: absent (no restriction was ever set), present and empty (an administrator said
-/// "nobody"), present with names.
-fn constrained_delegation(
+/// Heimdal's `HDB-extension` is `{ mandatory [0] BOOLEAN, data [1] CHOICE { … } }`, and the
+/// choice is numbered by what it holds: `allowed-to-delegate-to [2]`, `aliases [6]`, and a dozen
+/// more this crate has no use for. Every extension is read in **one** pass, because a record can
+/// carry several and returning on the first one found would silently drop the rest — which is
+/// exactly what the delegation-only reader did before aliases existed.
+///
+/// An extension this crate does not know is skipped rather than refused, as before: a record
+/// written by a foreign tool must stay readable for the fields this KDC does use.
+fn read_extensions(
     f: &Fields<'_>,
     ctx: &'static str,
     realm: &str,
-) -> Result<Option<Vec<Principal>>> {
+) -> Result<(Option<Vec<Principal>>, Option<Aliases>)> {
+    let mut delegation = None;
+    let mut aliases = None;
     if f.opt_bytes(13).is_none() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let mut r = Reader::new(f.bytes(13, ctx)?);
     let mut list = Reader::new(r.expect_in(ctx, der::SEQUENCE)?);
     while !list.is_empty() {
         let ef = Fields::parse(ctx, list.expect_in(ctx, der::SEQUENCE)?)?;
-        // The other extensions (PKINIT's, password, aliases) are not decoded here and are
-        // skipped rather than refused: an entry written by a foreign tool would otherwise be
-        // unreadable for a field this KDC has no use for.
         let Some(_) = ef.opt_bytes(1) else { continue };
         let mut dr = Reader::new(ef.bytes(1, ctx)?);
         let choice = Fields::parse(ctx, dr.expect_in(ctx, der::SEQUENCE)?)?;
-        let Some(_) = choice.opt_bytes(2) else {
-            continue;
-        };
-        let mut ar = Reader::new(choice.bytes(2, ctx)?);
-        let mut acl = Reader::new(ar.expect_in(ctx, der::SEQUENCE)?);
-        let mut out = Vec::new();
-        while !acl.is_empty() {
-            // `Principal` in `krb5.asn1` carries no realm: a delegation target is named in this
-            // entry's own realm, which is also what Heimdal's ACLs mean.
-            out.push(Principal::decode(
-                ctx,
-                acl.expect_in(ctx, der::SEQUENCE)?,
-                realm,
-            )?);
+
+        if choice.opt_bytes(2).is_some() {
+            let mut ar = Reader::new(choice.bytes(2, ctx)?);
+            let mut acl = Reader::new(ar.expect_in(ctx, der::SEQUENCE)?);
+            let mut out = Vec::new();
+            while !acl.is_empty() {
+                // `Principal` in `krb5.asn1` carries no realm: a delegation target is named in
+                // this entry's own realm, which is also what Heimdal's ACLs mean.
+                out.push(Principal::decode(
+                    ctx,
+                    acl.expect_in(ctx, der::SEQUENCE)?,
+                    realm,
+                )?);
+            }
+            delegation = Some(out);
         }
-        return Ok(Some(out));
+
+        if choice.opt_bytes(6).is_some() {
+            // `HDB-Ext-Aliases ::= SEQUENCE { case-insensitive [0] BOOLEAN, aliases [1]
+            // SEQUENCE OF Principal }`, with the principals realm-less like the ACL's.
+            let mut ar = Reader::new(choice.bytes(6, ctx)?);
+            let af = Fields::parse(ctx, ar.expect_in(ctx, der::SEQUENCE)?)?;
+            // `opt_bytes(0)` is the content of the `[0]` wrapper, which is the `BOOLEAN` TLV
+            // itself — tag and length included. Reading the first octet of that would read 0x01,
+            // the boolean's tag, and call every entry case-insensitive.
+            let case_insensitive = match af.opt_bytes(0) {
+                Some(v) => matches!(Reader::new(v).expect_in(ctx, BOOLEAN)?, [0xFF]),
+                None => false,
+            };
+            let mut names = Vec::new();
+            if af.opt_bytes(1).is_some() {
+                let mut nr = Reader::new(af.bytes(1, ctx)?);
+                let mut ns = Reader::new(nr.expect_in(ctx, der::SEQUENCE)?);
+                while !ns.is_empty() {
+                    names.push(Principal::decode(
+                        ctx,
+                        ns.expect_in(ctx, der::SEQUENCE)?,
+                        realm,
+                    )?);
+                }
+            }
+            aliases = Some(Aliases {
+                case_insensitive,
+                names,
+            });
+        }
     }
-    Ok(None)
+    Ok((delegation, aliases))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::OwnCipher;
-    use crate::hdb::flags;
+    use crate::hdb::{Aliases, flags};
 
     fn entry() -> HdbEntry {
         let cipher = OwnCipher;
@@ -339,6 +416,56 @@ mod tests {
         e.max_renew = Some(604_800);
         e.modified = 1_700_000_000;
         e
+    }
+
+    /// Aliases survive the record, including the case-insensitivity switch: both are what a
+    /// lookup consults, and a backend that dropped either would answer for a name nobody meant.
+    #[test]
+    fn aliases_round_trip_with_the_case_switch() {
+        let mut e = entry();
+        e.aliases = Some(Aliases {
+            case_insensitive: true,
+            names: vec![
+                e.principal.clone(),
+                Principal::parse("a.vostrikov@EXAMPLE.COM").unwrap(),
+            ],
+        });
+        let back = decode(&encode(&e)).unwrap();
+        assert!(back.matches_name(&Principal::parse("A.Vostrikov@example.com").unwrap()));
+        let aliases = back.aliases.clone().expect("the extension survives");
+        assert!(aliases.case_insensitive);
+        assert_eq!(aliases.names.len(), 2);
+        assert_eq!(aliases.names[1].to_string(), "a.vostrikov@EXAMPLE.COM");
+    }
+
+    /// The delegation list and the alias list are two extensions in one `SEQUENCE OF`, and a
+    /// reader that returned on the first one it recognised dropped the other.
+    #[test]
+    fn delegation_and_aliases_are_both_read_from_one_record() {
+        let mut e = entry();
+        e.constrained_delegation = Some(vec![Principal::parse("cifs/files@EXAMPLE.COM").unwrap()]);
+        e.aliases = Some(Aliases {
+            case_insensitive: false,
+            names: vec![Principal::parse("alias@EXAMPLE.COM").unwrap()],
+        });
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(
+            back.constrained_delegation,
+            Some(vec![Principal::parse("cifs/files@EXAMPLE.COM").unwrap()])
+        );
+        assert_eq!(
+            back.aliases.map(|a| a.names),
+            Some(vec![Principal::parse("alias@EXAMPLE.COM").unwrap()])
+        );
+    }
+
+    /// An entry with no aliases writes no extension, and one that writes none reads back as
+    /// `None` rather than as an empty list: the two differ, because the extension also carries
+    /// the case switch.
+    #[test]
+    fn an_entry_without_aliases_has_no_extension() {
+        let back = decode(&encode(&entry())).unwrap();
+        assert!(back.aliases.is_none());
     }
 
     #[test]

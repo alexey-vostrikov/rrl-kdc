@@ -37,8 +37,10 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `crypto::nfold` — RFC 3961 §5.1 n-fold | done, in `rrl-crypto` |
 | `time` — `KerberosTime` | done |
 | `msg` — KDC-REQ decode, KDC-REP / EncASRepPart / EncTGSRepPart encode | done |
-| `hdb` — principal records after Heimdal's `lib/hdb/hdb.asn1` | done: memory and redb backends, keytab read/write |
+| `hdb` — principal records after Heimdal's `lib/hdb/hdb.asn1` | done: memory and redb backends, keytab read/write, every `HDBFlags` bit from `initial` to `do-not-store` (including the jump from 24 to 30), and the `allowed-to-delegate-to` and `aliases` extensions |
+| `hdb::aliases` — `HDB-Ext-Aliases` | done: one account under several names, `case-insensitive` included; an alias resolves to the entry and its keys, the TGS reply names the alias as asked (RFC 6806 §6), and `force-canonicalize` on the service returns the entry's own name |
 | `kdc` — AS-REQ → AS-REP, TGS-REQ → TGS-REP | done, including user-to-user tickets |
+| `kdc::times` — postdating and `renewable-ok` | done: `may-postdate` needs both entries and is refused with `KDC_ERR_POLICY` otherwise; a postdated ticket starts at `from` and carries `invalid`; `renewable-ok` yields a renewable ticket only where the lifetime had to be cut |
 | `kdc::kpasswd` — RFC 3244 change-password | done: set-password, with a pluggable authorization policy |
 | `acl` — who may change whose password | done: rules in a store, not a file |
 | `admin` — create, delete, modify, re-key, export a keytab | done |

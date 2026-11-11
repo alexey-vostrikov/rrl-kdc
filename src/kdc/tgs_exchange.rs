@@ -233,8 +233,18 @@ fn service_plan(
             text: "the TGT expires before the ticket would start".into(),
         });
     }
-    let renew_till = (body.kdc_options & kdc_options::RENEWABLE != 0).then(|| {
+    // `renewable-ok`: the client would rather have a renewable ticket than a short one. Heimdal
+    // honours it here only when the TGT is renewable — a request that could not be renewed is not
+    // made renewable by asking, since the client would be handed a flag its TGT does not support.
+    let renewable_ok = body.kdc_options & super::RENEWABLE_OK != 0
+        && tgt_flags & tkt_flags::RENEWABLE != 0
+        && endtime < super::till_of(body);
+    let renewable = body.kdc_options & kdc_options::RENEWABLE != 0 || renewable_ok;
+    let renew_till = renewable.then(|| {
         let asked = match body.rtime {
+            // With `renewable-ok` no `rtime` was sent: the client asked for the lifetime it wanted
+            // in `till`, and that is what the renewable ticket has to reach.
+            None | Some(0) if renewable_ok => super::till_of(body),
             None | Some(0) => now.saturating_add(config.max_renewable_life()),
             Some(rtime) => rtime,
         };
@@ -497,6 +507,21 @@ impl Kdc {
                 text: format!("{sname} may not be issued a ticket"),
             });
         }
+        // RFC 6806 §6: a TGS reply must not change the name the client asked for, so
+        // `canonicalize` does not. Heimdal makes one exception, for deployments that depend on the
+        // old behaviour: a service whose entry carries `force-canonicalize` gets the entry's own
+        // name back, which is how a directory that publishes `servicePrincipalName`s asks to be
+        // answered with the account it actually stores.
+        //
+        // This is also where an alias stops being an alias: `fetch_for_service` finds an entry by
+        // any of its names and hands back the entry as stored, so a ticket names the alias unless
+        // the flag says otherwise. A hard alias in Heimdal rewrites the fetched entry's principal
+        // to the alias instead; spelling the rule here keeps the stored entry immutable and gives
+        // the same ticket for everything but that combination.
+        if server.has(entry_flags::FORCE_CANONICALIZE) {
+            sname = server.principal.clone();
+        }
+
         // Heimdal's `hdb` flag `initial`: a ticket for this service must come
         // from an AS-REQ. `kadmin/changepw` is the reason it exists — a password
         // that could be changed with any stolen TGT is a password an attacker

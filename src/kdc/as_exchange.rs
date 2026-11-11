@@ -147,6 +147,27 @@ fn padata_value(padata: &[(i32, Vec<u8>)], pa_type: i32) -> Option<&[u8]> {
         .map(|(_, v)| v.as_slice())
 }
 
+/// `may-postdate`: may this ticket be postdated, and is it?
+///
+/// Heimdal writes `may_postdate` only when the client asked for `allow-postdate` **and** both
+/// entries allow postdating, and refuses the request with `KDC_ERR_POLICY` when it was asked for
+/// and not allowed — a client told "yes" by a flag and "no" by the ticket would have no way to
+/// notice. The ticket itself is marked `invalid` and `postdated` when the client asked for a
+/// postdated one and said when it starts; `starttime` answers that part.
+pub fn may_postdate(body: &KdcReqBody, client: &HdbEntry, server: &HdbEntry) -> Result<bool> {
+    if body.kdc_options & kdc_options::ALLOW_POSTDATE == 0 {
+        return Ok(false);
+    }
+    if client.has(entry_flags::POSTDATE) && server.has(entry_flags::POSTDATE) {
+        Ok(true)
+    } else {
+        Err(Error::Kdc {
+            code: codes::KDC_ERR_POLICY,
+            text: "the ticket may not be postdated".into(),
+        })
+    }
+}
+
 /// `from`, when the request asks for a postdated ticket and the client is
 /// allowed one. A `from` on a request that did not ask for `postdated` is
 /// ignored, as MIT ignores it.
@@ -219,8 +240,18 @@ pub fn ticket_flags(
     server: &HdbEntry,
     preauthenticated: bool,
     renewable: bool,
+    may_postdate: bool,
+    postdated_start: Option<i64>,
 ) -> u32 {
     let mut flags = tkt_flags::INITIAL;
+    if may_postdate {
+        flags |= tkt_flags::MAY_POSTDATE;
+    }
+    if postdated_start.is_some() {
+        // RFC 4120 §2.4: a postdated ticket is not usable until `starttime`, and `invalid` is
+        // what makes an acceptor refuse it before then. `VALIDATE` clears the flag.
+        flags |= tkt_flags::POSTDATED | tkt_flags::INVALID;
+    }
     if preauthenticated {
         flags |= tkt_flags::PRE_AUTHENT;
     }
@@ -778,6 +809,7 @@ impl Kdc {
         };
 
         // 6. Flags and times.
+        let may_postdate = may_postdate(body, &client, &server)?;
         let start = starttime(body, &client);
         let effective_start = start.unwrap_or(now);
         let endtime = endtime(config, body, &client, &server, effective_start);
@@ -787,7 +819,31 @@ impl Kdc {
                 text: "the requested lifetime ends before it starts".into(),
             });
         }
-        let renew_till = renew_till(config, body, &client, &server, effective_start);
+        // `renewable-ok`: the client said "a renewable one is better than a short one". Heimdal
+        // reads it as: if the granted lifetime stops short of what was asked for, hand back a
+        // renewable ticket whose renew-till reaches the original request. Only then — a client that
+        // got the lifetime it asked for did not ask for renewability, and giving it anyway would
+        // make the flag mean "always renewable" (RFC 4120 §5.4.1).
+        let mut renewable = body.kdc_options & kdc_options::RENEWABLE != 0;
+        let mut renew_till = renew_till(config, body, &client, &server, effective_start);
+        if !renewable
+            && body.kdc_options & super::RENEWABLE_OK != 0
+            && endtime < super::till_of(body)
+        {
+            renewable = true;
+            renew_till = Some({
+                let asked = super::till_of(body);
+                let mut till =
+                    asked.min(effective_start.saturating_add(config.max_renewable_life()));
+                if let Some(max) = client.max_renew {
+                    till = till.min(effective_start.saturating_add(max));
+                }
+                if let Some(max) = server.max_renew {
+                    till = till.min(effective_start.saturating_add(max));
+                }
+                till
+            });
+        }
         // RFC 6806 §11: the flag and the checksum move together — a client reads the flag to
         // decide whether to look for the checksum, so one without the other is a reply it
         // rejects as modified.
@@ -797,7 +853,9 @@ impl Kdc {
             &client,
             &server,
             preauthenticated,
-            renew_till.is_some(),
+            renewable && renew_till.is_some(),
+            may_postdate,
+            start,
         );
         if wants_enc_pa_rep {
             flags |= tkt_flags::ENC_PA_REP;

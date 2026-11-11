@@ -39,6 +39,12 @@ const ENTRIES: TableDefinition<'_, &'static str, &'static [u8]> =
 /// no way to notice until they try.
 const ACL: TableDefinition<'_, &'static str, &'static [u8]> = TableDefinition::new("hdb_acl");
 
+/// `alias key` → `the entry's key`, so that a name one entry answers to finds that entry
+/// without walking the whole database. An alias is a name, not an identity: the entry keeps its
+/// own principal and its own keys, and this table only says which entry to fetch.
+const ALIASES: TableDefinition<'_, &'static str, &'static str> =
+    TableDefinition::new("hdb_aliases");
+
 /// The `hdb` interface over a redb file.
 #[derive(Debug)]
 pub struct RedbHdb {
@@ -59,6 +65,7 @@ impl RedbHdb {
         {
             txn.open_table(ENTRIES).map_err(store_err)?;
             txn.open_table(ACL).map_err(store_err)?;
+            txn.open_table(ALIASES).map_err(store_err)?;
         }
         txn.commit().map_err(store_err)?;
         Ok(RedbHdb { db, path })
@@ -74,26 +81,75 @@ fn store_err(e: impl std::fmt::Display) -> Error {
     Error::Hdb(format!("redb: {e}"))
 }
 
-impl Hdb for RedbHdb {
-    fn fetch(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
+impl RedbHdb {
+    /// `principal`, or the entry an alias of it names.
+    ///
+    /// The alias table is consulted only after the entry table missed, so a stored principal is
+    /// never shadowed by an alias that happens to spell the same name.
+    fn resolve(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
         let k = record::key(principal);
         let txn = self.db.begin_read().map_err(store_err)?;
-        let table = txn.open_table(ENTRIES).map_err(store_err)?;
-        match table.get(k.as_str()).map_err(store_err)? {
+        let entries = txn.open_table(ENTRIES).map_err(store_err)?;
+        if let Some(value) = entries.get(k.as_str()).map_err(store_err)? {
+            return Ok(Some(record::decode(value.value())?));
+        }
+        let aliases = txn.open_table(ALIASES).map_err(store_err)?;
+        let Some(target) = aliases.get(k.as_str()).map_err(store_err)? else {
+            return Ok(None);
+        };
+        let target = target.value().to_owned();
+        match entries.get(target.as_str()).map_err(store_err)? {
             None => Ok(None),
             Some(value) => Ok(Some(record::decode(value.value())?)),
         }
+    }
+}
+
+impl Hdb for RedbHdb {
+    fn fetch(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
+        self.resolve(principal)
+    }
+
+    fn fetch_for_service(&self, service: &Principal) -> Result<Option<HdbEntry>> {
+        self.resolve(service)
     }
 
     fn store(&self, entry: HdbEntry) -> Result<()> {
         let k = record::key(&entry.principal);
         let bytes = record::encode(&entry);
+        // Every alias this entry used to answer to and no longer does has to go: an alias row
+        // left behind would send a request for an old name to an entry that no longer claims it.
+        let wanted: Vec<String> = entry
+            .names()
+            .into_iter()
+            .filter(|n| n != &entry.principal)
+            .map(|n| record::key(&n))
+            .collect();
         let txn = self.db.begin_write().map_err(store_err)?;
         {
             let mut table = txn.open_table(ENTRIES).map_err(store_err)?;
             table
                 .insert(k.as_str(), bytes.as_slice())
                 .map_err(store_err)?;
+        }
+        {
+            let mut aliases = txn.open_table(ALIASES).map_err(store_err)?;
+            let stale: Vec<String> = aliases
+                .iter()
+                .map_err(store_err)?
+                .filter_map(|row| {
+                    let (alias, target) = row.ok()?;
+                    (target.value() == k).then(|| alias.value().to_owned())
+                })
+                .collect();
+            for alias in stale {
+                aliases.remove(alias.as_str()).map_err(store_err)?;
+            }
+            for alias in &wanted {
+                aliases
+                    .insert(alias.as_str(), k.as_str())
+                    .map_err(store_err)?;
+            }
         }
         txn.commit().map_err(store_err)?;
         Ok(())
@@ -107,6 +163,20 @@ impl Hdb for RedbHdb {
             let old = table.remove(k.as_str()).map_err(store_err)?;
             old.is_some()
         };
+        {
+            let mut aliases = txn.open_table(ALIASES).map_err(store_err)?;
+            let stale: Vec<String> = aliases
+                .iter()
+                .map_err(store_err)?
+                .filter_map(|row| {
+                    let (alias, target) = row.ok()?;
+                    (target.value() == k).then(|| alias.value().to_owned())
+                })
+                .collect();
+            for alias in stale {
+                aliases.remove(alias.as_str()).map_err(store_err)?;
+            }
+        }
         txn.commit().map_err(store_err)?;
         Ok(removed)
     }
@@ -136,6 +206,24 @@ impl Hdb for RedbHdb {
             table
                 .insert(to_key.as_str(), encoded.as_slice())
                 .map_err(store_err)?;
+        }
+        // The entry's aliases travel with it, so the rows that pointed at the old key have to
+        // point at the new one: a rename that left them behind would resolve an alias to nothing.
+        {
+            let mut aliases = txn.open_table(ALIASES).map_err(store_err)?;
+            let moved: Vec<String> = aliases
+                .iter()
+                .map_err(store_err)?
+                .filter_map(|row| {
+                    let (alias, target) = row.ok()?;
+                    (target.value() == from_key).then(|| alias.value().to_owned())
+                })
+                .collect();
+            for alias in moved {
+                aliases
+                    .insert(alias.as_str(), to_key.as_str())
+                    .map_err(store_err)?;
+            }
         }
         txn.commit().map_err(store_err)?;
         Ok(())

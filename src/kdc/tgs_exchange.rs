@@ -746,6 +746,13 @@ impl Kdc {
             ticket,
             enc_part,
         };
+        // CONTROL: answer without the FAST wrapper, to tell whether the wrapper or the
+        // EncTGSRepPart inside it is what the client refuses.
+        let armor = if std::env::var_os("KDC_NO_ARMOR").is_some() {
+            None
+        } else {
+            armor
+        };
         if let Some(key) = armor {
             let finish = super::fast::finished(
                 self.cipher(),

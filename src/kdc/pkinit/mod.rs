@@ -44,6 +44,10 @@ use crate::Result;
 
 #[cfg(feature = "pkinit")]
 pub mod dh;
+// Curves are the `pkinit` feature's, like the rest of the exchange: a password-only build has no
+// use for an ECDH key pair, and the three curve crates should not be compiled for it.
+#[cfg(feature = "pkinit")]
+pub mod ec;
 // The whole reply half needs the X.509 stack and RSA signing, so it travels with the
 // feature rather than being half-present in a password-only build.
 #[cfg(feature = "pkinit")]
@@ -73,13 +77,19 @@ pub const ID_PKINIT_KP_CLIENT_AUTH: &str = "1.3.6.1.5.2.3.4";
 pub const ID_PKINIT_SAN: &str = "1.3.6.1.5.2.2";
 
 const ID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
+// The four below are the CMS and digest identifiers only the trusted path names, so they travel
+// with the feature: a password-only build has no envelope to parse and no digest to name.
 /// `id-sha256`, the digest CMS and X.509 both name.
+#[cfg(feature = "pkinit")]
 const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
 /// `id-sha384`.
+#[cfg(feature = "pkinit")]
 const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
 /// `contentType`, the signed attribute naming what the signature is over.
+#[cfg(feature = "pkinit")]
 const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 /// `messageDigest`, the signed attribute carrying the content's digest.
+#[cfg(feature = "pkinit")]
 const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 /// `rsaEncryption`: PKCS#1 v1.5, with the hash named beside it. A `SignerInfo` uses this
 /// where a certificate uses `sha256WithRSAEncryption`.
@@ -1101,8 +1111,8 @@ pub(super) fn parse_certificate(
 #[cfg(not(feature = "pkinit"))]
 mod untrusted {
     // Without the feature there is no X.509 stack, so no certificate can be trusted and
-    // the only honest answer to a PKINIT request is that this build cannot make one.
-    use super::*;
+    // the only honest answer to a PKINIT request is that this build cannot make one. Nothing from
+    // `super` is needed: the type below exists only so that a caller's signature compiles.
 
     /// Present so that callers compile without the feature; it trusts nothing.
     #[derive(Debug, Clone, Default)]

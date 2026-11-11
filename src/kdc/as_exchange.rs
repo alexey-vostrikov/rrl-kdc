@@ -899,16 +899,18 @@ impl Kdc {
         let may_postdate = may_postdate(body, &client, &server)?;
         let start = starttime(body, &client);
         let effective_start = start.unwrap_or(now);
-        let mut endtime = endtime(config, body, &client, &server, effective_start);
+        let endtime = endtime(config, body, &client, &server, effective_start);
         // `pkinit_max_life_bound`: Heimdal lets a realm cap what a certificate login buys, and it
         // is a cap on this exchange only — a password login is bounded by the policy above. The
         // bound never extends a lifetime, only shortens one.
+        //
+        // Shadowed rather than mutated, so that a build without the feature compiles without a
+        // `mut` that nothing there needs.
         #[cfg(feature = "pkinit")]
-        if pkinit_answer.is_some()
-            && let Some(bound) = config.pkinit_policy().max_life
-        {
-            endtime = endtime.min(effective_start.saturating_add(bound));
-        }
+        let endtime = match (pkinit_answer.is_some(), config.pkinit_policy().max_life) {
+            (true, Some(bound)) => endtime.min(effective_start.saturating_add(bound)),
+            _ => endtime,
+        };
         if endtime <= effective_start {
             return Err(Error::Kdc {
                 code: codes::KDC_ERR_NEVER_VALID,

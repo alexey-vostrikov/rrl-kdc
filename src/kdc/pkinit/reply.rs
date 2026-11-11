@@ -691,12 +691,28 @@ pub fn answer(
     let Some(value) = pack.client_public_value.as_deref() else {
         return answer_key_transport(state, &identity, as_req_der, enctype, rng);
     };
-    let (group, peer) = parse_client_public_value(value)?;
-    check_group(group, &state.policy)?;
+    let client_key = parse_client_public_value(value)?;
 
-    // 4. Our own value, and the shared secret.
-    let ours = super::dh::KeyPair::generate(group, rng)?;
-    let z = ours.agree(&peer)?;
+    // 4. Our own value, and the shared secret. The branch is the client's: it named a group in the
+    //    one form or the other, and answering with the other form would derive a secret nobody
+    //    else computes.
+    let (ours, z, bits) = match client_key {
+        ClientKey::Modp(group, peer) => {
+            check_group(group, &state.policy)?;
+            let ours = super::dh::KeyPair::generate(group, rng)?;
+            let z = ours.agree(&peer)?;
+            (PublicValue::Modp(ours.public_bytes()), z, group.bits())
+        }
+        ClientKey::Ec(curve, peer) => {
+            // No `dh_min_bits` here, deliberately: that number is a MODP group size, and 2048
+            // applied to a curve would refuse all three. P-256 is roughly as strong as a 3072-bit
+            // MODP group, so every curve this KDC implements is above any floor the option can
+            // express — a check would be a check that always passes or always fails.
+            let ours = super::ec::KeyPair::generate(curve, rng)?;
+            let z = ours.agree(&peer)?;
+            (PublicValue::Ec(ours.point().to_vec()), z, curve.bits())
+        }
+    };
 
     // 5. The reply key. Unknown KDFs are refused, not replaced by the legacy one: a client
     //    that named a KDF is going to derive with it, and a silent fallback would produce a
@@ -714,7 +730,7 @@ pub fn answer(
     // The signature covers the `KDCDHKeyInfo`, so it is built before the reply key: the
     // KDF binds `pk-as-rep` into its context, and that has to be the octets the client will
     // see rather than a placeholder.
-    let info = kdcdh_key_info(&ours.public_bytes(), pack.pk_authenticator.nonce);
+    let info = kdcdh_key_info(ours.bytes(), pack.pk_authenticator.nonce);
     let signed = state
         .identity
         .signed_data(super::ID_PKINIT_DH_KEY_DATA, &info)?;
@@ -727,7 +743,7 @@ pub fn answer(
     Ok(Answer {
         reply_key,
         pa_pk_as_rep,
-        client_group_bits: group.bits(),
+        client_group_bits: bits,
         pa_pkinit_kx: None,
         session_key: None,
     })
@@ -826,10 +842,19 @@ pub fn answer_anonymous(
                 .into(),
         )
     })?;
-    let (group, peer) = parse_client_public_value(value)?;
-
-    let ours = super::dh::KeyPair::generate(group, rng)?;
-    let z = ours.agree(&peer)?;
+    let (public, z, bits) = match parse_client_public_value(value)? {
+        ClientKey::Modp(group, peer) => {
+            check_group(group, &state.policy)?;
+            let ours = super::dh::KeyPair::generate(group, rng)?;
+            let z = ours.agree(&peer)?;
+            (PublicValue::Modp(ours.public_bytes()), z, group.bits())
+        }
+        ClientKey::Ec(curve, peer) => {
+            let ours = super::ec::KeyPair::generate(curve, rng)?;
+            let z = ours.agree(&peer)?;
+            (PublicValue::Ec(ours.point().to_vec()), z, curve.bits())
+        }
+    };
 
     let kdf = match pack.supported_kdfs.is_empty() {
         true => None,
@@ -841,7 +866,7 @@ pub fn answer_anonymous(
         })?),
     };
 
-    let info = kdcdh_key_info(&ours.public_bytes(), pack.pk_authenticator.nonce);
+    let info = kdcdh_key_info(public.bytes(), pack.pk_authenticator.nonce);
     // Signed by the KDC even though the request was not signed by anybody: the client has to
     // be able to tell a real KDC from a relay, and this signature is the only thing that says
     // so. §4.1 allows an unsigned reply from a KDC with no key pair; this one has one and
@@ -888,10 +913,43 @@ pub fn answer_anonymous(
     Ok(Answer {
         reply_key,
         pa_pk_as_rep,
-        client_group_bits: group.bits(),
+        client_group_bits: bits,
         pa_pkinit_kx: Some(pa_pkinit_kx),
         session_key: Some(session_key),
     })
+}
+
+/// What a client's `clientPublicValue` holds: a MODP group and its value, or a curve and its point.
+///
+/// The two are one field on the wire and two decisions here, which is why the parse returns a choice
+/// rather than a pair of options: a caller that got `None` for the curve and `None` for the group
+/// would have to invent the third case, "neither", which the parser has already ruled out.
+#[cfg(feature = "pkinit")]
+pub enum ClientKey {
+    /// `dhpublicnumber`: a finite-field group and the client's value in it.
+    Modp(super::dh::Group, Vec<u8>),
+    /// `id-ecPublicKey`: a named curve and the client's SEC1 point.
+    Ec(super::ec::Curve, Vec<u8>),
+}
+
+/// The public value the KDC's reply carries, in the one field `KDCDHKeyInfo` has for it.
+///
+/// A DH value is a raw integer and an EC point is a raw SEC1 point; both go into the BIT STRING
+/// as-is, and neither is wrapped in a `SubjectPublicKeyInfo` (RFC 4556 §3.2.3, RFC 5349 §2.2).
+pub enum PublicValue {
+    /// A MODP group element.
+    Modp(Vec<u8>),
+    /// A SEC1 uncompressed point.
+    Ec(Vec<u8>),
+}
+
+impl PublicValue {
+    /// The octets the BIT STRING holds.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            PublicValue::Modp(v) | PublicValue::Ec(v) => v,
+        }
+    }
 }
 
 /// The group and the public value out of `clientPublicValue`.
@@ -900,7 +958,7 @@ pub fn answer_anonymous(
 /// BIT STRING }`, where the algorithm is `dhpublicnumber` with the domain parameters as its
 /// parameters, and the bit string holds the DH value big-endian.
 #[cfg(feature = "pkinit")]
-fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>), PkinitError> {
+fn parse_client_public_value(value: &[u8]) -> Result<ClientKey, PkinitError> {
     let mut r = der::Reader::new(value);
     let spki = r
         .next_tlv("clientPublicValue")
@@ -923,39 +981,53 @@ fn parse_client_public_value(value: &[u8]) -> Result<(super::dh::Group, Vec<u8>)
         ));
     }
 
-    // The algorithm must be `dhpublicnumber`; an ECDH or RSA key here would be a mode this
-    // KDC does not implement, and guessing would derive a key nobody else computes.
+    // `dhpublicnumber` (finite-field DH) or `id-ecPublicKey` (RFC 5349). Anything else is a mode
+    // this KDC does not implement, and guessing would derive a key nobody else computes.
     let mut ar = der::Reader::new(alg.content);
     let oid = ar
         .next_tlv("algorithm")
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
     let name = der::decode_oid("algorithm", oid.content)
         .map_err(|e| PkinitError::Malformed(e.to_string()))?;
-    if name != super::dh::DH_PUBLIC_NUMBER {
-        return Err(PkinitError::Unsupported(format!(
-            "clientPublicValue uses {name}; this KDC implements finite-field DH \
-             (dhpublicnumber) only"
-        )));
-    }
-    let params = ar.next_tlv("DomainParameters").map_err(|_| {
-        PkinitError::Malformed(
-            "dhpublicnumber without domain parameters: the group cannot be inferred".into(),
-        )
-    })?;
-    let group = super::dh::Group::from_domain_parameters(&der::tlv(der::SEQUENCE, params.content))?;
+    let params = ar.next_tlv("parameters").ok();
 
     if bits.content.is_empty() {
         return Err(PkinitError::Malformed("subjectPublicKey is empty".into()));
     }
-    // The first octet is the unused-bit count, which must be zero for a DH value: a
-    // non-zero count means the client sent something that is not whole octets.
+    // The first octet is the unused-bit count, which must be zero for a key: a non-zero count
+    // means the client sent something that is not whole octets.
     if bits.content[0] != 0 {
         return Err(PkinitError::Malformed(format!(
             "subjectPublicKey has {} unused bits",
             bits.content[0]
         )));
     }
-    Ok((group, bits.content[1..].to_vec()))
+    let key = bits.content[1..].to_vec();
+
+    if name == super::dh::DH_PUBLIC_NUMBER {
+        let params = params.ok_or_else(|| {
+            PkinitError::Malformed(
+                "dhpublicnumber without domain parameters: the group cannot be inferred".into(),
+            )
+        })?;
+        let group =
+            super::dh::Group::from_domain_parameters(&der::tlv(der::SEQUENCE, params.content))?;
+        return Ok(ClientKey::Modp(group, key));
+    }
+    if name == super::ec::ID_EC_PUBLIC_KEY {
+        // `from_params` takes an encoded TLV, like every other reader here: the parameters are a
+        // named curve's OID, and handing it the content alone would make it read the OID's own
+        // tags as lengths.
+        let params = params
+            .map(|t| der::tlv(t.tag, t.content))
+            .ok_or_else(|| PkinitError::Malformed("id-ecPublicKey without a named curve".into()))?;
+        let curve = super::ec::Curve::from_params(Some(&params))?;
+        return Ok(ClientKey::Ec(curve, key));
+    }
+    Err(PkinitError::Unsupported(format!(
+        "clientPublicValue uses {name}; this KDC implements finite-field DH (dhpublicnumber) \
+         and elliptic-curve DH (id-ecPublicKey) on P-256, P-384 and P-521"
+    )))
 }
 
 /// An OID's content octets, the inverse of `der::decode_oid`.

@@ -695,12 +695,17 @@ impl Kdc {
         } else {
             (None, proven.reply_key.clone())
         };
+        let plaintext = rep_part.encode(msg::ENC_TGS_REP_PART);
+        // TEMP-DIAG: the plaintext the client has to parse once it has opened the reply.
+        if std::env::var_os("KDC_DUMP").is_some() {
+            let _ = std::fs::write("/tmp/kdc-enctgsrep.der", &plaintext);
+        }
         let enc_part = EncryptedData::seal(
             self.cipher(),
             &sealed_with,
             proven.reply_usage,
             None,
-            &rep_part.encode(msg::ENC_TGS_REP_PART),
+            &plaintext,
         )?;
 
         // RFC 6113 §5.4.2.6: an armored TGS request is answered inside the armor, with a

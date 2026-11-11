@@ -47,6 +47,10 @@ rskrb5 = { version = "0.2", default-features = false, optional = true }
 # hence `num-bigint`.
 x509-parser = { version = "0.18", default-features = false, optional = true }
 rsa = { version = "0.9", optional = true }
+# AES-256-CBC for the content of a transported PKINIT reply key (RFC 4556 §3.2.3.2). Only the
+# block cipher: the CBC and PKCS #7 layers are twenty lines in `kdc::pkinit::reply`, and a mode
+# crate for one call site would be a dependency nobody reviews.
+aes = { version = "0.9", optional = true }
 num-bigint = { version = "0.4", default-features = false, optional = true }
 # The curve arithmetic for SPAKE (RFC 9588). Not a Kerberos profile: unlike RFC 3961, where
 # this crate owns every octet, edwards25519 multiplication fails subtly rather than loudly when
@@ -99,7 +103,7 @@ crypto-rskrb5 = ["rrl-crypto/crypto-rskrb5"]
 # PKINIT (RFC 4556): certificate parsing, CMS, and the public-key arithmetic the
 # exchange needs. Off by default because it pulls in an X.509 stack, which a realm
 # that authenticates with passwords never touches.
-pkinit = ["dep:x509-parser", "dep:rsa", "dep:num-bigint", "dep:num-traits", "dep:rsa-sha2"]
+pkinit = ["dep:x509-parser", "dep:rsa", "dep:num-bigint", "dep:num-traits", "dep:rsa-sha2", "dep:aes"]
 
 # An example that needs a feature is declared with `required-features`, so that a
 # default build does not compile it. Without this, `cargo test` builds every example

@@ -304,6 +304,12 @@ pub struct Identity {
     pub principal: Principal,
     /// The subject DN of the signing certificate, as text, for the audit log.
     pub subject: String,
+    /// The signing certificate itself, DER.
+    ///
+    /// Kept because the reply needs the same certificate's public key: RFC 4556 §3.2.3.2's key
+    /// transport encrypts the reply key to *the certificate that signed the request*, and looking
+    /// it up again from the envelope would be a second parse of the same thing.
+    pub cert: Vec<u8>,
 }
 
 impl Request {
@@ -899,6 +905,7 @@ mod trusted {
             Ok(Identity {
                 principal,
                 subject: leaf.subject().to_string(),
+                cert: signer_cert.clone(),
             })
         }
     }

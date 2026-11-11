@@ -234,6 +234,230 @@ pub fn dh_rep_info(signed_data: Vec<u8>) -> Vec<u8> {
     der::tlv(der::ctx(0), &rep)
 }
 
+/// RFC 4556 §3.2.3.2: the key usage of the checksum inside a `ReplyKeyPack`.
+///
+/// Six, not one: the checksum is keyed with the *reply key* and covers the whole AS-REQ, which is
+/// what binds the transported key to this exchange rather than to any exchange.
+pub const KU_PA_PK_AS_REQ: u32 = 6;
+
+/// `EncryptionKey ::= SEQUENCE { keytype [0] Int32, keyvalue [1] OCTET STRING }` (RFC 4556
+/// §3.2.3.2).
+pub fn encryption_key(enctype: Enctype, key: &[u8]) -> Vec<u8> {
+    der::seq(&[
+        der::field(0, der::int(i64::from(enctype.id()))),
+        der::field(1, der::octets(key)),
+    ])
+}
+
+/// `ReplyKeyPack ::= SEQUENCE { replyKey [0] EncryptionKey, asChecksum [1] Checksum }`.
+///
+/// `Checksum ::= SEQUENCE { cksumtype [0] Int32, checksum [1] OCTET STRING }`, and the type is the
+/// enctype's own keyed checksum — a client that finds a different number rejects the pack rather
+/// than computing a checksum it was not told to compute.
+pub fn reply_key_pack(
+    enctype: Enctype,
+    key: &[u8],
+    checksum_type: i32,
+    checksum: &[u8],
+) -> Vec<u8> {
+    der::seq(&[
+        der::field(0, encryption_key(enctype, key)),
+        der::field(
+            1,
+            der::seq(&[
+                der::field(0, der::int(i64::from(checksum_type))),
+                der::field(1, der::octets(checksum)),
+            ]),
+        ),
+    ])
+}
+
+/// The checksum a `ReplyKeyPack` carries: the enctype's keyed checksum over the whole AS-REQ, with
+/// the key usage prepended.
+///
+/// The usage is part of the message, not a parameter the checksum function knows about
+/// (RFC 3961 §5.3): `HMAC(K, usage_be || data)`. Passing the whole AS-REQ matters — a checksum
+/// over the body alone would be satisfied by a reply to a different request that asked the same
+/// thing of a different realm.
+pub fn as_checksum(
+    enctype: Enctype,
+    reply_key: &[u8],
+    as_req: &[u8],
+) -> Result<Vec<u8>, PkinitError> {
+    let usage = KU_PA_PK_AS_REQ.to_be_bytes();
+    crate::crypto::profile::checksum_parts(enctype, reply_key, &[&usage, as_req])
+        .map_err(|e| PkinitError::Malformed(format!("the checksum over the AS-REQ: {e}")))
+}
+
+/// `PA-PK-AS-REP` in its key-transport form: `encKeyPack [1] IMPLICIT OCTET STRING`.
+///
+/// The tag is primitive (`0x81`), not constructed: `encKeyPack` is an `OCTET STRING`, so the value
+/// is the octets with no inner TLV. A constructed `[1]` is what a decoder written from the CHOICE
+/// alone produces, and every client reads it as a malformed reply.
+pub fn enckey_rep_info(enveloped: Vec<u8>) -> Vec<u8> {
+    der::tlv(0x81, &enveloped)
+}
+
+/// The bare `SignedData` inside the `ContentInfo` that [`Identity::signed_data`] returns.
+///
+/// `EnvelopedData`'s `eContent` is the *value* of the type it names (RFC 5652 §5.1), so the
+/// `ContentInfo` wrapper has to come off before it is encrypted. Heimdal sends exactly this
+/// shape, and a client that expects the wrapper inside the envelope sees one `SEQUENCE` too many.
+fn unwrap_content_info(ci: &[u8]) -> Result<Vec<u8>, PkinitError> {
+    let mut r = crate::der::Reader::new(ci);
+    let outer = r
+        .next_tlv("ContentInfo")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    let mut inner = crate::der::Reader::new(outer.content);
+    let _oid = inner
+        .next_tlv("contentType")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    let wrapped = inner
+        .next_tlv("content")
+        .map_err(|e| PkinitError::Malformed(e.to_string()))?;
+    Ok(wrapped.content.to_vec())
+}
+
+/// `aes256-CBC`, the content encryption Heimdal and MIT both use for `encKeyPack`
+/// (`2.16.840.1.101.3.4.1.42`).
+const AES256_CBC: &str = "2.16.840.1.101.3.4.1.42";
+
+/// AES-256-CBC with PKCS #7 padding, the one content cipher a transported reply key needs.
+fn aes256_cbc_encrypt(key: &[u8], iv: &[u8; 16], input: &[u8]) -> Result<Vec<u8>, PkinitError> {
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+    let cipher = aes::Aes256::new_from_slice(key)
+        .map_err(|_| PkinitError::Malformed("the content-encryption key".into()))?;
+    let pad = 16 - input.len() % 16;
+    let mut data = input.to_vec();
+    data.extend(std::iter::repeat_n(pad as u8, pad));
+    let mut prev = *iv;
+    for chunk in data.chunks_mut(16) {
+        for (byte, p) in chunk.iter_mut().zip(prev.iter()) {
+            *byte ^= *p;
+        }
+        let block: &mut [u8; 16] = chunk
+            .try_into()
+            .map_err(|_| PkinitError::Malformed("a partial AES block".into()))?;
+        cipher.encrypt_block(block.into());
+        prev = *block;
+    }
+    Ok(data)
+}
+
+/// `EnvelopedData` around `content`, encrypted to the RSA public key of `cert_der`.
+///
+/// Written by hand rather than through a CMS library, for the reason the rest of this module is:
+/// the shape is what a client reads, and every field here is one a client has an opinion about —
+/// `KeyTransRecipientInfo` named by issuer and serial, `rsaEncryption` with `NULL` parameters, and
+/// the content type naming `SignedData` because that is what the ciphertext holds.
+fn enveloped_data(
+    content_type: &str,
+    content: &[u8],
+    cert_der: &[u8],
+    rng: &dyn Fn(usize) -> Vec<u8>,
+) -> Result<Vec<u8>, PkinitError> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pkcs1v15::Pkcs1v15Encrypt;
+
+    // The recipient key comes from the certificate that signed the request: anything else would
+    // hand the reply key to somebody who did not ask for it.
+    let leaf = super::parse_certificate(cert_der)?;
+    let spki = &leaf.public_key().subject_public_key.data;
+    let public = rsa::RsaPublicKey::from_pkcs1_der(spki)
+        .map_err(|e| PkinitError::Unsupported(format!("the client's RSA public key: {e}")))?;
+
+    // A fresh content-encryption key per reply: it is wrapped for exactly one recipient, and
+    // reusing one would make every reply openable by whoever captured any of them.
+    let cek = rng(32);
+    if cek.len() != 32 {
+        return Err(PkinitError::Malformed(
+            "the content-encryption key is not 32 octets".into(),
+        ));
+    }
+    let iv_bytes = rng(16);
+    if iv_bytes.len() != 16 {
+        return Err(PkinitError::Malformed("the IV is not 16 octets".into()));
+    }
+    let iv: [u8; 16] = iv_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| PkinitError::Malformed("the IV is not 16 octets".into()))?;
+    let encrypted = aes256_cbc_encrypt(&cek, &iv, content)?;
+
+    let wrapped = public
+        .encrypt(&mut FnRng(rng), Pkcs1v15Encrypt, &cek)
+        .map_err(|e| PkinitError::Malformed(format!("the content-encryption key: {e}")))?;
+
+    let (issuer, serial) = issuer_and_serial(cert_der)?;
+    let ktri = der::seq(&[
+        der::int(0), // version: IssuerAndSerialNumber
+        // `rid [0] IssuerAndSerialNumber`: EXPLICIT, so the SEQUENCE keeps its own tag inside.
+        der::field(0, der::seq(&[issuer, der::tlv(der::INTEGER, &serial)])),
+        der::seq(&[
+            der::tlv(der::OBJECT_IDENTIFIER, &encode_oid(super::RSA_ENCRYPTION)),
+            der::tlv(0x05, &[]),
+        ]),
+        der::octets(&wrapped),
+    ]);
+
+    let encrypted_content_info = der::seq(&[
+        der::tlv(der::OBJECT_IDENTIFIER, &encode_oid(content_type)),
+        der::seq(&[
+            der::tlv(der::OBJECT_IDENTIFIER, &encode_oid(AES256_CBC)),
+            der::octets(&iv),
+        ]),
+        // `encryptedContent [0] IMPLICIT OCTET STRING`, primitive: `0x80`, not the constructed
+        // `0xa0` a `[0]`-tagged SEQUENCE would use. Both forms decode in some clients and only
+        // the primitive one decodes in all of them.
+        der::tlv(0x80, &encrypted),
+    ]);
+
+    Ok(der::seq(&[
+        der::int(0),              // version
+        der::cons(0x31, &[ktri]), // recipientInfos
+        encrypted_content_info,
+    ]))
+}
+
+/// A `CryptoRngCore` over this module's `Fn(usize) -> Vec<u8>` generator.
+///
+/// The generator is a parameter so that a test can make an exchange reproducible; the `rsa` crate
+/// wants a trait object it can pull bytes from, so the two are bridged here rather than by
+/// changing either.
+struct FnRng<'a>(&'a dyn Fn(usize) -> Vec<u8>);
+
+impl rsa::rand_core::RngCore for FnRng<'_> {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let bytes = (self.0)(dest.len());
+        // A short generator would silently leave the tail zeroed, which for a PKCS#1 padding
+        // string is a padding of zeros — so it is refused rather than padded.
+        dest.copy_from_slice(&bytes[..dest.len()]);
+    }
+
+    fn try_fill_bytes(
+        &mut self,
+        dest: &mut [u8],
+    ) -> std::result::Result<(), rsa::rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rsa::rand_core::CryptoRng for FnRng<'_> {}
+
 /// The reply key from the shared secret: RFC 8636's KDF when the client offered one, else
 /// RFC 4556's `octetstring2key`.
 ///
@@ -346,12 +570,12 @@ pub fn answer(
     let pack = request.auth_pack()?;
     super::check_body(&pack, body_der)?;
 
-    // 3. The client's public value, and the group it is in.
-    let value = pack.client_public_value.as_deref().ok_or_else(|| {
-        PkinitError::Unsupported(
-            "the request carries no clientPublicValue: RSA key transport is not implemented".into(),
-        )
-    })?;
+    // 3. Which branch. No `clientPublicValue` is not a malformed request: it is the other
+    //    branch of RFC 4556 §3.2.3.2, where the KDC picks the reply key and hands it over
+    //    encrypted to the certificate that signed this request.
+    let Some(value) = pack.client_public_value.as_deref() else {
+        return answer_key_transport(state, &identity, as_req_der, enctype, rng);
+    };
     let (group, peer) = parse_client_public_value(value)?;
 
     // 4. Our own value, and the shared secret.
@@ -388,6 +612,54 @@ pub fn answer(
         reply_key,
         pa_pk_as_rep,
         client_group_bits: group.bits(),
+        pa_pkinit_kx: None,
+        session_key: None,
+    })
+}
+
+/// Runs the KDC's half of PKINIT's **RSA key transport** branch (RFC 4556 §3.2.3.2).
+///
+/// The client named no ephemeral public value, so there is no agreement to make: the KDC chooses
+/// the reply key, binds it to this request with a checksum keyed by that key, signs the pack with
+/// its own key, and encrypts the result to the certificate that signed the request. The client can
+/// open it because it holds the matching private key; nobody else can, which is the whole security
+/// argument — and it is why the recipient is taken from the *verified* certificate and not from
+/// anything the request says about itself.
+///
+/// `supportedKDFs` is ignored on this branch, deliberately: RFC 8636's KDFs describe how to derive
+/// a key from a Diffie-Hellman secret, and there is no secret here. A client that sends both is
+/// asking for an exchange whose halves cannot be combined; Heimdal answers the transport form and
+/// so does this.
+fn answer_key_transport(
+    state: &State,
+    identity: &super::Identity,
+    as_req_der: &[u8],
+    enctype: Enctype,
+    rng: &dyn Fn(usize) -> Vec<u8>,
+) -> Result<Answer, PkinitError> {
+    use crate::crypto::Cipher;
+
+    let cipher = crate::crypto::OwnCipher;
+    let reply = cipher
+        .random(enctype)
+        .map_err(|e| PkinitError::Malformed(format!("the reply key: {e}")))?;
+
+    let checksum = as_checksum(enctype, reply.bytes(), as_req_der)?;
+    let pack = reply_key_pack(enctype, reply.bytes(), enctype.checksum_type(), &checksum);
+
+    // Signed, then encrypted: the signature is what says the key came from this KDC, and it has to
+    // be inside the envelope, because an outer signature over ciphertext would say nothing about
+    // the key a client ends up using.
+    let signed = state.identity.signed_data(ID_PKINIT_RKEY_DATA, &pack)?;
+    let inner = unwrap_content_info(&signed)?;
+    let enveloped = enveloped_data(super::ID_SIGNED_DATA, &inner, &identity.cert, rng)?;
+
+    Ok(Answer {
+        reply_key: reply,
+        pa_pk_as_rep: enckey_rep_info(enveloped),
+        // No Diffie-Hellman took place, so there is no group to report: zero is "none", not
+        // "a group of zero bits".
+        client_group_bits: 0,
         pa_pkinit_kx: None,
         session_key: None,
     })

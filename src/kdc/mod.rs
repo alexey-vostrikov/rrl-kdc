@@ -365,6 +365,21 @@ impl Kdc {
                 Err(address::refused())
             }
         };
+        // TEMP-DIAG: the reply octets, for a client that says only that it could not read them.
+        if std::env::var_os("KDC_DUMP").is_some()
+            && let Ok(reply) = &outcome
+        {
+            let path = format!("/tmp/kdc-reply-{}.der", req.msg_type);
+            let _ = std::fs::write(&path, reply);
+            if std::env::var_os("KDC_DUMP_HEX").is_some() {
+                let hex: String = reply.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!(
+                    "kdc-dump: msg={} len={} hex={hex}",
+                    req.msg_type,
+                    reply.len()
+                );
+            }
+        }
         match outcome {
             Ok(reply) => reply,
             Err(err) => self.error(Some(&req), &err, now),

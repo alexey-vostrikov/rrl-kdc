@@ -660,9 +660,23 @@ impl Kdc {
         // authenticator's subkey (usage 9). Using the wrong usage produces a
         // reply the client cannot read, which reads as a broken KDC rather than
         // as a wrong number.
+        //
+        // An armored exchange strengthens that key with a random secret, and the secret travels
+        // only inside the armor (RFC 6113 §5.4.4.2). Strengthening is not optional company for the
+        // armor: a client that armored its request reconstructs the reply key from the `strengthen`
+        // value it is handed, and a reply sealed in the unstrengthened key is one it cannot open -
+        // measured as `Failed to decode encpart in ticket` from Samba's client, which armors where
+        // MIT's `kvno` does not, so the same KDC answered MIT and not Samba.
+        let (strengthen_key, sealed_with) = if armor.is_some() {
+            let (strength, strengthened) =
+                super::fast::strengthen(self.cipher(), &proven.reply_key)?;
+            (Some(strength), strengthened)
+        } else {
+            (None, proven.reply_key.clone())
+        };
         let enc_part = EncryptedData::seal(
             self.cipher(),
-            &proven.reply_key,
+            &sealed_with,
             proven.reply_usage,
             None,
             &rep_part.encode(msg::ENC_TGS_REP_PART),
@@ -701,7 +715,14 @@ impl Kdc {
             )?;
             padata_out.push((
                 super::fast::PA_FX_FAST_REPLY,
-                super::fast::wrap_reply(key, &[], None, Some(finish), body.nonce, self.cipher())?,
+                super::fast::wrap_reply(
+                    key,
+                    &[],
+                    strengthen_key.as_ref(),
+                    Some(finish),
+                    body.nonce,
+                    self.cipher(),
+                )?,
             ));
         }
         Ok(KdcRep {

@@ -55,6 +55,35 @@ struct Received<'a> {
     raw: &'a [u8],
 }
 
+/// The armour a TGS request arrived in, and what the reply must do about it.
+///
+/// Three facts that always travel together and are read in one place each: whether there is an
+/// armor key at all (which decides whether the reply is strengthened and wrapped), whether the
+/// client presented an armor *ticket* rather than relying on the implicit key, and whether
+/// `hide-client-names` asks the reply to name nobody. They were three parameters of `tgs_answer`
+/// until the count reached the point clippy objects to; as a struct they are one thing, which is
+/// also how the code reads them.
+struct Armor<'a> {
+    /// The reply key, when the exchange is armored (RFC 6113 §5.4.1). `None` for a plain request.
+    key: Option<&'a Key>,
+    /// Whether the armor was explicit: an `armor` AP-REQ presenting a TGT of this realm, rather
+    /// than the implicit key derived from `PA-TGS-REQ`'s subkey.
+    explicit: bool,
+    /// `hide-client-names`: the reply names `WELLKNOWN/ANONYMOUS` instead of the client.
+    hide: bool,
+}
+
+impl Armor<'_> {
+    /// No armour: the request arrived as it was written.
+    fn none() -> Self {
+        Armor {
+            key: None,
+            explicit: false,
+            hide: false,
+        }
+    }
+}
+
 /// What a constrained delegation decided.
 ///
 /// The client comes from the evidence ticket, and so does `authtime`: the user authenticated
@@ -358,7 +387,7 @@ impl Kdc {
                 padata: &req.padata,
                 raw,
             };
-            return self.tgs_answer(&req.body, proven, now, None, false, false, received);
+            return self.tgs_answer(&req.body, proven, now, Armor::none(), received);
         };
 
         let armored = super::fast::ArmoredRequest::decode(fast_bytes)?;
@@ -430,9 +459,11 @@ impl Kdc {
             &body,
             proven,
             now,
-            Some(&armor_key),
-            explicit_armor,
-            hide,
+            Armor {
+                key: Some(&armor_key),
+                explicit: explicit_armor,
+                hide,
+            },
             received,
         )
     }
@@ -444,9 +475,7 @@ impl Kdc {
         body: &KdcReqBody,
         proven: Proven,
         now: i64,
-        armor: Option<&Key>,
-        explicit_armor: bool,
-        hide: bool,
+        armor: Armor<'_>,
         received: Received<'_>,
     ) -> Result<Vec<u8>> {
         // The PA-DATA a reply may answer: the inner one under FAST, the outer one otherwise.
@@ -837,7 +866,7 @@ impl Kdc {
         // is no FAST state, so an unarmored exchange is never strengthened; and the subkey branch
         // opens the reply with the subkey directly, so an armored one that sent a subkey is not
         // strengthened either.
-        let strengthen = armor.is_some();
+        let strengthen = armor.key.is_some();
         let (strengthen_key, sealed_with) = if strengthen {
             let (strength, strengthened) =
                 super::fast::strengthen(self.cipher(), &proven.reply_key)?;
@@ -858,7 +887,7 @@ impl Kdc {
             eprintln!(
                 "tgs-diag: sname={sname} armor={} subkey={:?} reply_usage={} strengthened={} \
                  sealed_key={:?} plaintext={}",
-                if explicit_armor {
+                if armor.explicit {
                     "explicit"
                 } else {
                     "implicit"
@@ -885,7 +914,7 @@ impl Kdc {
         // RFC 6113 §5.4.2.6: an armored TGS request is answered inside the armor, with a
         // `finished` checksum over the ticket so the client can tell it is the answer to
         // this request and not a substituted one.
-        let (crealm, cname) = if hide {
+        let (crealm, cname) = if armor.hide {
             let anonymous = super::fast::anonymous_principal();
             (anonymous.realm.clone(), anonymous)
         } else {
@@ -906,12 +935,12 @@ impl Kdc {
         };
         // CONTROL: answer without the FAST wrapper, to tell whether the wrapper or the
         // EncTGSRepPart inside it is what the client refuses.
-        let armor = if std::env::var_os("KDC_NO_ARMOR").is_some() {
+        let armor_key = if std::env::var_os("KDC_NO_ARMOR").is_some() {
             None
         } else {
-            armor
+            armor.key
         };
-        if let Some(key) = armor {
+        if let Some(key) = armor_key {
             let finish = super::fast::finished(
                 self.cipher(),
                 key,

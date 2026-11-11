@@ -13,8 +13,9 @@
 #   ~/DevOps/rrl-kdc/docker/toolchain.Dockerfile              (rrl-kdc)
 #   ~/DevOps/rrl-crypto/docker/toolchain.Dockerfile           (rrl-crypto)
 #   ~/DevOps/rrl-krb-common/docker/toolchain.Dockerfile       (rrl-krb-common)
+#   ~/DevOps/3part/rrl-krb5/docker/toolchain.Dockerfile       (rrl-krb5)
+#   ~/DevOps/3part/rrl-smb/docker/toolchain.Dockerfile        (rrl-smb, the rust-smb-server fork)
 #   ~/DevOps/3part/rust-rest-ldap/docker/toolchain.Dockerfile (rust-rest-ldap)
-#   ~/DevOps/3part/rust-smb-server/docker/toolchain.Dockerfile (rust-smb-server)
 #
 # One image name, so the assembly must be one text: whoever builds first decides what everyone
 # else gets. Two copies that differ are two toolchains and a build that works in one repository

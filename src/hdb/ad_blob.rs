@@ -321,6 +321,15 @@ pub struct AdCredential {
     pub salt: Option<Vec<u8>>,
 }
 
+/// The account's NT hash, as `supplementalCredentials` holds it.
+///
+/// `Err` when the blob carries no such property: an account written before the hash was stored, or
+/// one whose blob was replaced by a writer that knew only about Kerberos keys. The caller decides
+/// what to do with that, and there is exactly one honest answer - refuse the channel.
+pub fn nt_hash(blob: &[u8]) -> Result<Vec<u8>, AdBlobError> {
+    unhex(property_value(blob, PROPERTY_NT_HASH)?)
+}
+
 /// The keys `supplementalCredentials` holds.
 ///
 /// The blob carries no key version — `KERB_STORED_CREDENTIAL_NEW` has no field

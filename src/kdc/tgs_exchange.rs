@@ -687,7 +687,7 @@ impl Kdc {
         // is no FAST state, so an unarmored exchange is never strengthened; and the subkey branch
         // opens the reply with the subkey directly, so an armored one that sent a subkey is not
         // strengthened either.
-        let strengthen = armor.is_some() && proven.subkey.is_none();
+        let strengthen = armor.is_some();
         let (strengthen_key, sealed_with) = if strengthen {
             let (strength, strengthened) =
                 super::fast::strengthen(self.cipher(), &proven.reply_key)?;

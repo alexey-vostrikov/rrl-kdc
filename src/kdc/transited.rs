@@ -223,16 +223,121 @@ pub fn with_transit(
     existing: &[u8],
     client_realm: &str,
     server_realm: &str,
-    tgt_realm: &str,
+    tgt_issuer: &str,
 ) -> Result<Vec<u8>> {
-    if tgt_realm == client_realm || tgt_realm == server_realm {
-        return Ok(existing.to_vec());
+    Ok(encode(path_with_transit(
+        existing,
+        client_realm,
+        server_realm,
+        tgt_issuer,
+    )?))
+}
+
+/// The same rule as [`with_transit`], but as the expanded list of realms.
+///
+/// Split out because the check in [`accept`] needs the realms, not their encoding: a policy that
+/// compares realms has to see `EDU.MIT.EDU`, not `EDU.`.
+pub fn path_with_transit(
+    existing: &[u8],
+    client_realm: &str,
+    server_realm: &str,
+    tgt_issuer: &str,
+) -> Result<Vec<String>> {
+    if tgt_issuer == client_realm || tgt_issuer == server_realm {
+        return decode(existing, client_realm, server_realm);
     }
     let mut realms = decode(existing, client_realm, server_realm)?;
-    if !realms.iter().any(|r| r == tgt_realm) {
-        realms.push(tgt_realm.to_owned());
+    if !realms.iter().any(|r| r == tgt_issuer) {
+        realms.push(tgt_issuer.to_owned());
     }
-    Ok(encode(realms))
+    Ok(realms)
+}
+
+/// The realms on the DNS hierarchy between `from` and `to`, endpoints excluded.
+///
+/// Walks up from the client to the common suffix and then down to the server, which is the path
+/// Heimdal's `hier_init`/`hier_next` walk (`lib/krb5/transited.c`): `B.EXAMPLE.COM` to
+/// `OTHER.EXAMPLE.COM` gives `EXAMPLE.COM`, and `A.EXAMPLE.COM` to `B.EXAMPLE.COM` gives
+/// `EXAMPLE.COM` too. A pair with no common suffix (`B.REALM.A` to `REALM.C`) has no hierarchy
+/// here, and saying so is better than inventing one — an operator who has such a trust lists the
+/// transit realms by hand.
+pub fn hierarchical_path(from: &str, to: &str) -> Result<Vec<String>> {
+    if from == to {
+        return Ok(Vec::new());
+    }
+    let a: Vec<&str> = from.split('.').collect();
+    let b: Vec<&str> = to.split('.').collect();
+
+    // The common suffix, comparing labels from the right.
+    let mut common = 0;
+    while common < a.len() && common < b.len() && a[a.len() - 1 - common] == b[b.len() - 1 - common]
+    {
+        common += 1;
+    }
+    if common == 0 {
+        return Err(Error::Protocol(format!(
+            "transited: {from} and {to} share no realm hierarchy; list the transit realms \
+             explicitly if the path is real"
+        )));
+    }
+
+    let mut out = Vec::new();
+    // Up from the client: `B.EXAMPLE.COM` -> `EXAMPLE.COM`.
+    for take in (common..a.len()).rev() {
+        let realm = a[a.len() - take..].join(".");
+        if realm != from {
+            out.push(realm);
+        }
+    }
+    // Down to the server: `EXAMPLE.COM` -> `C.EXAMPLE.COM`.
+    for take in (common + 1..=b.len()).rev() {
+        let realm = b[b.len() - take..].join(".");
+        if realm != to {
+            out.push(realm);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a cross-realm path may be accepted, given the realms an operator listed.
+///
+/// RFC 4120 §3.3.3: "an untrusted KDC may have fabricated the list", so each realm on the path
+/// is a claim to check rather than a fact. Two sources are admissible, and the second is what
+/// Heimdal falls back to when `[capaths]` has no entry for the pair:
+///
+/// * the realms named in the configuration, and
+/// * the realms on the DNS hierarchy between the client's and the server's.
+///
+/// `KDC_ERR_PATH_NOT_ACCEPTED` names the realm that failed and the whole path, because an operator
+/// reading only "policy rejects the path" has to guess which realm to add.
+pub fn accept(
+    path: &[String],
+    client_realm: &str,
+    server_realm: &str,
+    allowed: Option<&[String]>,
+) -> Result<()> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    // `Err` means the two realms share no hierarchy, so nothing beyond an explicit list can be
+    // admitted — the same conclusion an empty vector states, which is why this is not a `match`
+    // that names the error and then discards it.
+    let on_path = hierarchical_path(client_realm, server_realm).unwrap_or_default();
+    for realm in path {
+        let listed = allowed.is_some_and(|list| list.iter().any(|r| r == realm));
+        if listed || on_path.iter().any(|r| r == realm) {
+            continue;
+        }
+        return Err(Error::Kdc {
+            code: crate::error::codes::KDC_ERR_PATH_NOT_ACCEPTED,
+            text: format!(
+                "the transited path from {client_realm} to {server_realm} passes through {realm}, \
+                 which this realm does not accept; the path the ticket claims is [{}]",
+                path.join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -363,5 +468,63 @@ mod tests {
         assert_eq!(with_transit(b"B", "A", "D", "C").unwrap(), b"B,C".to_vec());
         // A realm already on the path is not repeated.
         assert_eq!(with_transit(b"B", "A", "D", "B").unwrap(), b"B".to_vec());
+    }
+
+    /// The hierarchy walk: up from the client to the common suffix, then down to the server. Both
+    /// halves matter — a path admitted by looking only upwards would accept a realm below the
+    /// server's own parent.
+    #[test]
+    fn the_hierarchy_walks_up_and_then_down() {
+        assert_eq!(
+            hierarchical_path("B.EXAMPLE.COM", "OTHER.EXAMPLE.COM").unwrap(),
+            vec!["EXAMPLE.COM"]
+        );
+        assert_eq!(
+            hierarchical_path("A.B.EXAMPLE.COM", "OTHER.EXAMPLE.COM").unwrap(),
+            vec!["B.EXAMPLE.COM", "EXAMPLE.COM"]
+        );
+        // A parent and a child are adjacent: nothing between them.
+        assert_eq!(
+            hierarchical_path("EXAMPLE.COM", "A.EXAMPLE.COM").unwrap(),
+            Vec::<String>::new()
+        );
+        // The same realm has no path.
+        assert_eq!(
+            hierarchical_path("EXAMPLE.COM", "EXAMPLE.COM").unwrap(),
+            Vec::<String>::new()
+        );
+        // Unrelated names have no hierarchy, and that is an error rather than an empty path: an
+        // empty path would read as "acceptable".
+        assert!(hierarchical_path("B.REALM.A", "REALM.C").is_err());
+    }
+
+    /// What the policy admits: realms on the hierarchy, plus the realms an operator listed. A realm
+    /// that is neither is refused, and the refusal names it.
+    #[test]
+    fn a_path_is_accepted_only_on_the_hierarchy_or_by_name() {
+        let hierarchy = vec!["EXAMPLE.COM".to_owned()];
+        assert!(accept(&hierarchy, "B.EXAMPLE.COM", "OTHER.EXAMPLE.COM", None).is_ok());
+
+        let forged = vec!["FOREIGN.REALM".to_owned()];
+        let err = accept(&forged, "B.EXAMPLE.COM", "OTHER.EXAMPLE.COM", None).unwrap_err();
+        assert_eq!(code_of_error(&err), 28, "KDC_ERR_PATH_NOT_ACCEPTED");
+        assert!(err.to_string().contains("FOREIGN.REALM"), "{err}");
+
+        // Listed by the operator: accepted even with no hierarchy in common.
+        let listed = vec!["FOREIGN.REALM".to_owned()];
+        assert!(
+            accept(&forged, "B.REALM.A", "REALM.C", Some(&listed)).is_ok(),
+            "an explicit list is the only way to admit a path with no DNS relationship"
+        );
+
+        // An empty path is always acceptable: a single-realm ticket has nothing to admit.
+        assert!(accept(&[], "A", "B", None).is_ok());
+    }
+
+    fn code_of_error(e: &Error) -> i32 {
+        match e {
+            Error::Kdc { code, .. } => *code,
+            other => panic!("expected a KDC error, got {other}"),
+        }
     }
 }

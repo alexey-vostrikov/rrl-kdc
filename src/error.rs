@@ -193,6 +193,15 @@ pub mod codes {
     pub const KDC_ERR_SERVER_NOMATCH: i32 = 26;
     /// The service requires a user-to-user ticket.
     pub const KDC_ERR_MUST_USE_USER2USER: i32 = 27;
+    /// RFC 4120 §7.5.1: the `transited` field is of a type this KDC cannot read, or of type 0
+    /// with contents (RFC 4120 defines only `DOMAIN-X500-COMPRESS`; a type-0 ticket is
+    /// Microsoft's, and theirs is empty). Heimdal answers exactly this from
+    /// `fix_transited_encoding` (`kdc/krb5tgs.c`).
+    pub const KDC_ERR_TRTYPE_NOSUPP: i32 = 17;
+    /// RFC 4120 §7.5.1: the realm's policy does not accept the transited path. A refusal rather
+    /// than a silent acceptance: the path names the realms that authenticated the client, and a
+    /// KDC that issues the ticket anyway hands the service a claim it cannot check.
+    pub const KDC_ERR_PATH_NOT_ACCEPTED: i32 = 28;
     /// This KDC cannot answer; the client should try another.
     pub const KDC_ERR_SVC_UNAVAILABLE: i32 = 29;
     /// The reply does not fit in a datagram; the client should retry over TCP.
@@ -480,6 +489,12 @@ mod tests {
                 "KDC_ERR_PREAUTH_REQUIRED",
             ),
             (codes::KDC_ERR_SERVER_NOMATCH, 26, "KDC_ERR_SERVER_NOMATCH"),
+            (codes::KDC_ERR_TRTYPE_NOSUPP, 17, "KDC_ERR_TRTYPE_NOSUPP"),
+            (
+                codes::KDC_ERR_PATH_NOT_ACCEPTED,
+                28,
+                "KDC_ERR_PATH_NOT_ACCEPTED",
+            ),
             (
                 codes::KDC_ERR_RESPONSE_TOO_BIG,
                 52,

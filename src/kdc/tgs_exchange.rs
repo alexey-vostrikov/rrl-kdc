@@ -35,6 +35,7 @@ use crate::msg::{
 use crate::name::Principal;
 
 use super::as_exchange::Purpose;
+use super::config::TransitedPolicy;
 use super::transited;
 use super::{Kdc, wrong_realm};
 
@@ -91,12 +92,16 @@ pub(super) struct Proven {
     /// implicit FAST armor key from this and the TGT's session key, so it has to survive
     /// the check rather than being folded into `reply_key`.
     pub(super) subkey: Option<Key>,
-    /// The realm the presented TGT is addressed to — the second component of `krbtgt/X`.
+    /// The realm that issued the presented TGT — the `realm` field of the `Ticket`.
     ///
-    /// It is what decides whether a realm is a *transit* realm: Heimdal compares it against the
-    /// client's and the server's realms, and only when it is neither does it belong in
-    /// `transited`.
-    pub(super) tgt_realm: String,
+    /// It is what decides whether a realm is a *transit* realm: RFC 4120 §3.3.3.2 says the
+    /// issuer "will be added to the transited field of the ticket to be issued", and Heimdal
+    /// compares exactly this against the client's and the server's realms (`tgt_realm` in
+    /// `kdc/krb5tgs.c`, taken from the `krbtgt/X@ISSUER` entry it decrypted with). The
+    /// second component of `krbtgt/X` is *our* realm, not the issuer, and using it here would
+    /// add the realm doing the work instead of the one before it — a three-realm hop would
+    /// then reach the last KDC with an empty path.
+    pub(super) tgt_issuer: String,
 }
 
 /// The extra ticket flags `forwarded` and `proxy` ask for (RFC 4120 §3.3.3), or a refusal.
@@ -170,6 +175,27 @@ fn badoption(why: &str) -> Error {
     Error::Kdc {
         code: codes::KDC_ERR_BADOPTION,
         text: why.into(),
+    }
+}
+
+/// The `transited` field of the presented TGT, before its contents are read.
+///
+/// RFC 4120 §3.3.3: "If the transited field needs to be updated, but the transited type is not
+/// supported, the `KDC_ERR_TRTYPE_NOSUPP` error is returned". Type 0 is admitted only when it is
+/// empty — that is what Microsoft's TGTs carry, and Heimdal's `fix_transited_encoding` makes the
+/// same exception (`kdc/krb5tgs.c`). Anything else is refused by name rather than parsed with a
+/// reader that would produce a path nobody wrote.
+fn check_transited_type(tgt: &EncTicketPart) -> Result<()> {
+    match tgt.transited_type {
+        transited::DOMAIN_X500_COMPRESS => Ok(()),
+        0 if tgt.transited.is_empty() => Ok(()),
+        other => Err(Error::Kdc {
+            code: codes::KDC_ERR_TRTYPE_NOSUPP,
+            text: format!(
+                "the presented ticket carries transited type {other}, and this KDC reads only \
+                 DOMAIN-X500-COMPRESS (1), or type 0 with an empty field"
+            ),
+        }),
     }
 }
 
@@ -582,18 +608,40 @@ impl Kdc {
         };
 
         // The realms this ticket has passed through. Heimdal's rule, from
-        // `fix_transited_encoding`: the realm of the presented TGT is a transit realm only when it
+        // `fix_transited_encoding`: the issuer of the presented TGT is a transit realm only when it
         // is neither the client's nor the server's, so an ordinary ticket in this realm carries an
         // empty path and a ticket from A to B through C carries `C`.
         //
-        // Type 0 with empty contents stays for the empty case, which is what Microsoft's TGTs
-        // carry and what this KDC produced before it could write a path at all.
-        let transited = transited::with_transit(
+        // The type is checked before the contents are read: RFC 4120 defines one type
+        // (`DOMAIN-X500-COMPRESS`), and type 0 is admitted only when it is empty, which is what
+        // Microsoft's TGTs carry. Heimdal answers `TRTYPE_NOSUPP` for anything else rather than
+        // guessing at an encoding it does not know — a path read wrongly is a ticket accepted on a
+        // route that never existed.
+        check_transited_type(&proven.tgt)?;
+        let path = transited::path_with_transit(
             &proven.tgt.transited,
             &crealm,
             &sname.realm,
-            &proven.tgt_realm,
+            &proven.tgt_issuer,
         )?;
+
+        // Whether the path is checked at all is the realm's policy (Heimdal's `transited-policy`),
+        // and a client may waive the check only when the policy says its request is honoured. A
+        // ticket issued without the check says so by leaving `TRANSITED-POLICY-CHECKED` clear, and
+        // the service then checks the path itself (RFC 4120 §2.7) — refusing the request instead
+        // would let a client break its own logon by setting a bit.
+        let check = match config.transited_policy() {
+            TransitedPolicy::AlwaysCheck | TransitedPolicy::AllowPerPrincipal => true,
+            TransitedPolicy::AlwaysHonourRequest => {
+                body.kdc_options & kdc_options::DISABLE_TRANSITED_CHECK == 0
+            }
+        };
+        if check {
+            transited::accept(&path, &crealm, &sname.realm, config.transited_realms())?;
+            flags |= tkt_flags::TRANSITED_POLICY_CHECKED;
+        }
+
+        let transited = transited::encode(&path);
         let (transited_type, transited) = if transited.is_empty() {
             (0, Vec::new())
         } else {
@@ -1284,7 +1332,9 @@ impl Kdc {
             reply_key,
             reply_usage,
             subkey: authenticator.subkey.clone(),
-            tgt_realm,
+            // The issuer, not `tgt_realm`: that one is the component validated above, which is
+            // this KDC's own realm by construction.
+            tgt_issuer: ticket.realm.clone(),
         })
     }
 

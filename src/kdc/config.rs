@@ -19,6 +19,26 @@ pub const DEFAULT_MAX_RENEWABLE_LIFE: i64 = 604_800;
 /// Heimdal's `clockskew` default.
 pub const DEFAULT_CLOCKSKEW: i64 = 300;
 
+/// Heimdal's `[kdc] transited-policy` (`kdc/default_config.c`), which decides whether the path
+/// in a presented ticket is checked before a ticket is issued on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitedPolicy {
+    /// Check on every request. Heimdal's default.
+    AlwaysCheck,
+    /// Heimdal's `allow-per-principal`. Both per-principal hooks are compiled out there
+    /// (`PRINCIPAL_FORCE_TRANSITED_CHECK` and `PRINCIPAL_ALLOW_DISABLE_TRANSITED_CHECK` are
+    /// `0` in `kdc/krb5tgs.c`), so the value reduces to `always-check`; accepting it is what
+    /// makes a Heimdal configuration readable here, and inventing a per-principal database
+    /// field that Heimdal does not have would be a different feature.
+    AllowPerPrincipal,
+    /// Honour the client's `disable-transited-check` (RFC 4120 §5.4.1, bit 26), which is
+    /// what Heimdal's `always-honour-request` does. A ticket issued without the check says so
+    /// by leaving `TRANSITED-POLICY-CHECKED` clear, and the service then checks the path
+    /// itself — refusing the request instead would let a client break its own logon by
+    /// setting a bit, and accepting it silently would hide the fact that nobody checked.
+    AlwaysHonourRequest,
+}
+
 /// What a KDC needs to know about itself.
 #[derive(Clone, Debug)]
 pub struct KdcConfig {
@@ -41,6 +61,17 @@ pub struct KdcConfig {
     /// The address policy: `check-ticket-addresses`,
     /// `allow-null-ticket-addresses`, `warn-ticket-addresses`.
     addresses: crate::address::AddressPolicy,
+    /// Whether the path in a presented ticket is checked.
+    transited_policy: TransitedPolicy,
+    /// The realms this KDC accepts as transit realms, `None` when the DNS hierarchy between
+    /// the two endpoints decides.
+    ///
+    /// Heimdal takes this list from `[capaths]` in `krb5.conf` and, when a pair of realms has
+    /// no entry there, walks the DNS tree (`_krb5_find_capath` with `use_hierarchical`).
+    /// This crate's KDC has no `krb5.conf` reader — it is a library and the embedder owns
+    /// configuration — so the explicit list is an option here and the hierarchy is the
+    /// default.
+    transited_realms: Option<Vec<String>>,
 }
 
 impl KdcConfig {
@@ -71,6 +102,8 @@ impl KdcConfig {
             anonymous_pkinit: false,
             allowed_enctypes: Enctype::ALL.to_vec(),
             addresses: crate::address::AddressPolicy::default(),
+            transited_policy: TransitedPolicy::AlwaysCheck,
+            transited_realms: None,
         })
     }
 
@@ -178,6 +211,39 @@ impl KdcConfig {
         self
     }
 
+    /// `transited-policy`.
+    pub fn transited_policy(&self) -> TransitedPolicy {
+        self.transited_policy
+    }
+
+    /// Sets `transited-policy`.
+    pub fn with_transited_policy(mut self, policy: TransitedPolicy) -> Self {
+        self.transited_policy = policy;
+        self
+    }
+
+    /// The realms this KDC accepts as transit realms, when an operator listed them. `None`
+    /// means the DNS hierarchy between the endpoints decides.
+    pub fn transited_realms(&self) -> Option<&[String]> {
+        self.transited_realms.as_deref()
+    }
+
+    /// Sets the accepted transit realms. An empty list is refused: it reads as "none", but a
+    /// KDC whose every cross-realm request fails with `PATH_NOT_ACCEPTED` is a deployment that
+    /// will be debugged for an hour, and the honest spelling of "none" is a one-element list
+    /// that names a realm nobody uses, if that is really wanted.
+    pub fn with_transited_realms(mut self, realms: Vec<String>) -> Result<Self> {
+        if realms.is_empty() {
+            return Err(Error::Config(
+                "transited-realms names no realm; remove the option to let the DNS hierarchy \
+                 decide instead of listing nothing"
+                    .into(),
+            ));
+        }
+        self.transited_realms = Some(realms);
+        Ok(self)
+    }
+
     /// Sets `allowed_enctypes` from names, as `krb5.conf` writes them.
     pub fn with_enctypes(mut self, names: &[&str]) -> Result<Self> {
         let parsed = Enctype::parse_list(names)?;
@@ -260,11 +326,42 @@ impl KdcConfig {
                 self.allowed_enctypes = parsed;
                 Ok(())
             }
+            "transited-policy" | "transited_policy" => {
+                self.transited_policy = match value.trim().to_ascii_lowercase().as_str() {
+                    "always-check" => TransitedPolicy::AlwaysCheck,
+                    // Heimdal's per-principal hooks are compiled out, so this is `always-check`
+                    // there too; accepting the name keeps a Heimdal configuration readable.
+                    "allow-per-principal" => TransitedPolicy::AllowPerPrincipal,
+                    "always-honour-request" => TransitedPolicy::AlwaysHonourRequest,
+                    other => {
+                        return Err(Error::Config(format!(
+                            "option {name}: {other:?} is not a transited policy; \
+                             expected always-check, allow-per-principal or always-honour-request"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "transited-realms" | "transited_realms" => {
+                let realms: Vec<String> = value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if realms.is_empty() {
+                    return Err(Error::Config(format!(
+                        "option {name} names no realm; remove it to let the DNS hierarchy decide"
+                    )));
+                }
+                self.transited_realms = Some(realms);
+                Ok(())
+            }
             other => Err(Error::Config(format!(
                 "KDC option {other:?} is not implemented by this engine. \
                  Implemented: max_life, max_renewable_life, clockskew, require-preauth, \
                  allowed_enctypes, check-ticket-addresses, allow-null-ticket-addresses, \
-                 warn-ticket-addresses. Refusing rather than ignoring it: a KDC that silently \
+                 warn-ticket-addresses, transited-policy, transited-realms. Refusing rather than \
+                 ignoring it: a KDC that silently \
                  does not do what its configuration says is worse than one that will not start."
             ))),
         }

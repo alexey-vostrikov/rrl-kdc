@@ -74,7 +74,7 @@ use crate::name::Principal;
 
 pub use as_exchange::Purpose;
 pub use as_exchange::{endtime, renew_till, starttime, ticket_flags, usable_enctypes};
-pub use config::KdcConfig;
+pub use config::{KdcConfig, TransitedPolicy};
 
 /// Who may change whose password (RFC 3244 §2: the service is told, not told
 /// what to decide).

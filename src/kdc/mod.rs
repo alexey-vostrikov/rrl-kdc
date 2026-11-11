@@ -43,6 +43,7 @@ pub mod req_enc_pa_rep;
 pub mod s4u;
 #[cfg(feature = "spake")]
 pub mod spake;
+pub mod transited; // DOMAIN-X500-COMPRESS: the realms a cross-realm ticket passed through
 
 /// The `till` a request asks for, with RFC 4120 §5.4.1's zero read as "as long as you allow".
 ///

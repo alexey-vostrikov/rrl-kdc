@@ -35,6 +35,7 @@ use crate::msg::{
 use crate::name::Principal;
 
 use super::as_exchange::Purpose;
+use super::transited;
 use super::{Kdc, wrong_realm};
 
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
@@ -90,6 +91,12 @@ pub(super) struct Proven {
     /// implicit FAST armor key from this and the TGT's session key, so it has to survive
     /// the check rather than being folded into `reply_key`.
     pub(super) subkey: Option<Key>,
+    /// The realm the presented TGT is addressed to — the second component of `krbtgt/X`.
+    ///
+    /// It is what decides whether a realm is a *transit* realm: Heimdal compares it against the
+    /// client's and the server's realms, and only when it is neither does it belong in
+    /// `transited`.
+    pub(super) tgt_realm: String,
 }
 
 /// The extra ticket flags `forwarded` and `proxy` ask for (RFC 4120 §3.3.3), or a refusal.
@@ -564,15 +571,32 @@ impl Kdc {
             }
         };
 
+        // The realms this ticket has passed through. Heimdal's rule, from
+        // `fix_transited_encoding`: the realm of the presented TGT is a transit realm only when it
+        // is neither the client's nor the server's, so an ordinary ticket in this realm carries an
+        // empty path and a ticket from A to B through C carries `C`.
+        //
+        // Type 0 with empty contents stays for the empty case, which is what Microsoft's TGTs
+        // carry and what this KDC produced before it could write a path at all.
+        let transited = transited::with_transit(
+            &proven.tgt.transited,
+            &crealm,
+            &sname.realm,
+            &proven.tgt_realm,
+        )?;
+        let (transited_type, transited) = if transited.is_empty() {
+            (0, Vec::new())
+        } else {
+            (transited::DOMAIN_X500_COMPRESS, transited)
+        };
+
         let ticket_part = EncTicketPart {
             flags,
             session_key: session_key.clone(),
             crealm: crealm.clone(),
             cname: client.clone(),
-            // No realm has been traversed: the ticket came from the realm that
-            // names it. Cross-realm `transited` is step 3.
-            transited_type: 0,
-            transited: Vec::new(),
+            transited_type,
+            transited,
             authtime,
             starttime,
             endtime,
@@ -1005,20 +1029,52 @@ impl Kdc {
         let ticket = ap_req.ticket()?;
 
         // 2. The ticket must be ours and must decrypt under krbtgt's key.
+        //
+        // "Ours" means its second component is our realm, not that we issued it: a cross-realm
+        // TGT `krbtgt/B@A` was issued by A and is addressed to us, and refusing it here is why a
+        // client from another realm could not get a service ticket. What decides the key is the
+        // issuing realm — the one in the ticket's `realm` — because that is the realm whose
+        // `krbtgt` we share.
         let krbtgt = Principal::krbtgt(config.realm());
-        if ticket.sname != krbtgt {
+        let tgt_realm = ticket
+            .sname
+            .components
+            .get(1)
+            .filter(|_| ticket.sname.is_krbtgt())
+            .ok_or_else(|| Error::Kdc {
+                code: codes::KRB_AP_ERR_MODIFIED,
+                text: format!(
+                    "PA-TGS-REQ presents a ticket for {}, which is not a ticket-granting ticket",
+                    ticket.sname
+                ),
+            })?
+            .clone();
+        if tgt_realm != config.realm() {
             return Err(Error::Kdc {
                 code: codes::KRB_AP_ERR_MODIFIED,
                 text: format!(
-                    "PA-TGS-REQ presents a ticket for {}, not {krbtgt}",
-                    ticket.sname
+                    "PA-TGS-REQ presents a ticket for {}, and this KDC serves {}",
+                    ticket.sname,
+                    config.realm()
                 ),
             });
         }
-        let krbtgt_entry = self
-            .hdb()
-            .fetch(&krbtgt)?
-            .ok_or_else(|| Error::Hdb("the krbtgt entry is missing from the database".into()))?;
+        // A ticket issued by this realm is sealed in our own `krbtgt`; one issued by another is
+        // sealed in the shared key, which we hold under the mirror image of its name.
+        let key_entry = if ticket.realm == config.realm() {
+            krbtgt.clone()
+        } else {
+            Principal {
+                name_type: crate::name::NT_SRV_INST,
+                components: vec!["krbtgt".to_owned(), ticket.realm.clone()],
+                realm: config.realm().to_owned(),
+            }
+        };
+        let krbtgt_entry = self.hdb().fetch(&key_entry)?.ok_or_else(|| {
+            Error::Hdb(format!(
+                "the {key_entry} entry is missing from the database"
+            ))
+        })?;
         let ticket_part = self.decrypt_ticket(&ticket, &krbtgt_entry)?;
 
         // Expiry before anything else: an expired TGT makes the authenticator
@@ -1109,6 +1165,7 @@ impl Kdc {
             reply_key,
             reply_usage,
             subkey: authenticator.subkey.clone(),
+            tgt_realm,
         })
     }
 

@@ -1,5 +1,6 @@
 /target
-Cargo.lock
+# Cargo.lock is committed. A KDC is a service and not only a library: the revision CI
+# resolves has to be the revision an operator gets.
 *.swp
 /.vscode
 /.idea

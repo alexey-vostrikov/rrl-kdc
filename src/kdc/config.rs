@@ -117,6 +117,17 @@ pub struct KdcConfig {
     /// it, because a fragmented Kerberos datagram is one that some middlebox drops silently and the
     /// client then waits for a timeout instead of retrying over TCP.
     max_datagram_reply_length: usize,
+    /// `pkinit_dh_min_bits`: the smallest Diffie-Hellman group a certificate login may use.
+    ///
+    /// A number rather than a file: the certificate and its anchors come from a
+    /// `PkinitSource`, while "how weak a group will this realm accept" is a policy the operator
+    /// states once.
+    pkinit_dh_min_bits: u32,
+    /// `pkinit_max_life_bound`: the longest ticket a certificate login may produce, if bounded.
+    pkinit_max_life: Option<i64>,
+    /// `pkinit_principal_in_certificate`: whether the certificate must name the principal asked
+    /// for, rather than merely authenticate somebody.
+    pkinit_principal_in_certificate: bool,
     /// `strict-nametypes`: refuse a `krbtgt` name whose name type is neither `NT-SRV-INST` nor
     /// `NT-UNKNOWN`.
     ///
@@ -156,6 +167,11 @@ impl KdcConfig {
             // opening nobody configured is a surprise rather than a convenience.
             anonymous_pkinit: false,
             allowed_enctypes: Enctype::ALL.to_vec(),
+            // Heimdal's `kdc/default_config.c`: a 2048-bit floor, no cap on what a certificate
+            // login buys, and the certificate itself has to name the principal.
+            pkinit_dh_min_bits: 2048,
+            pkinit_max_life: None,
+            pkinit_principal_in_certificate: true,
             addresses: crate::address::AddressPolicy::default(),
             transited_policy: TransitedPolicy::AlwaysCheck,
             transited_realms: None,
@@ -330,6 +346,20 @@ impl KdcConfig {
         self.max_datagram_reply_length
     }
 
+    /// Whatever this realm says about PKINIT, in the shape the reply half reads.
+    ///
+    /// Two of the options live here and the identity lives in a source, deliberately: an operator
+    /// changing `pkinit_dh_min_bits` changes one thing in one file, and a certificate that rotates
+    /// does not have to touch the configuration to do it.
+    #[cfg(feature = "pkinit")]
+    pub fn pkinit_policy(&self) -> crate::kdc::pkinit::reply::PkinitPolicy {
+        crate::kdc::pkinit::reply::PkinitPolicy {
+            dh_min_bits: self.pkinit_dh_min_bits,
+            max_life: self.pkinit_max_life,
+            principal_in_certificate: self.pkinit_principal_in_certificate,
+        }
+    }
+
     /// The realms this KDC accepts as transit realms, when an operator listed them. `None`
     /// means the DNS hierarchy between the endpoints decides.
     pub fn transited_realms(&self) -> Option<&[String]> {
@@ -492,6 +522,44 @@ impl KdcConfig {
                 self.strict_nametypes = parse_bool(value)?;
                 Ok(())
             }
+            "pkinit_dh_min_bits" | "pkinit-dh-min-bits" => {
+                let bits: u32 = value.trim().parse().map_err(|_| {
+                    Error::Config(format!("option {name}: {value:?} is not a bit count"))
+                })?;
+                // Below 2048 the group is one a laptop can break, and Heimdal refuses to offer
+                // one; above 8192 no client generates a key in reasonable time, so a number that
+                // large is a typo rather than a policy. 0 would mean "any group", which is the
+                // setting an operator who typed it almost certainly did not intend.
+                if !(2048..=8192).contains(&bits) {
+                    return Err(Error::Config(format!(
+                        "option {name}: {bits} is outside 2048..=8192; a smaller group is \
+                         breakable and a larger one no client uses"
+                    )));
+                }
+                self.pkinit_dh_min_bits = bits;
+                Ok(())
+            }
+            "pkinit_max_life_bound" | "pkinit-max-life-bound" => {
+                let secs = parse_secs(value)?;
+                if secs <= 0 {
+                    return Err(Error::Config(format!("option {name} must be positive")));
+                }
+                self.pkinit_max_life = Some(secs);
+                Ok(())
+            }
+            "pkinit_max_life_from_cert" | "pkinit-max-life-from-cert" => {
+                // The certificate is a `PkinitSource`'s and is only seen per request, so a
+                // configuration flag that says "read the lifetime from it" would decide nothing
+                // here. Refused by name, like every other option this build cannot honour.
+                Err(Error::Config(format!(
+                    "option {name} is not implemented: the certificate comes from a \
+                     PkinitSource and is seen per request, not at configuration time"
+                )))
+            }
+            "pkinit_principal_in_certificate" | "pkinit-principal-in-certificate" => {
+                self.pkinit_principal_in_certificate = parse_bool(value)?;
+                Ok(())
+            }
             "max-kdc-datagram-reply-length" | "max_kdc_datagram_reply_length" => {
                 // A UDP datagram cannot exceed 65507 octets of payload (65535 minus the IP and UDP
                 // headers), so a larger value is not a policy this KDC can honour. Refusing at
@@ -619,6 +687,55 @@ mod tests {
         assert!(err.contains("not implemented"), "{err}");
         assert!(c.apply("enable-pkinit", "true").is_err());
         assert!(c.apply("enable_fast", "true").is_err());
+    }
+
+    /// The PKINIT options: Heimdal's defaults, both spellings of each name, and the two ends
+    /// refused where refusing is the only honest answer.
+    #[test]
+    fn the_pkinit_options_take_heimdals_defaults_and_are_bounded() {
+        let mut c = KdcConfig::new("R").unwrap();
+        assert_eq!(c.pkinit_dh_min_bits, 2048, "Heimdal's floor");
+        assert_eq!(c.pkinit_max_life, None, "no cap by default");
+        assert!(c.pkinit_principal_in_certificate);
+
+        c.apply("pkinit_dh_min_bits", "4096").unwrap();
+        assert_eq!(c.pkinit_dh_min_bits, 4096);
+        c.apply("pkinit-dh-min-bits", "3072").unwrap();
+        assert_eq!(c.pkinit_dh_min_bits, 3072);
+        // A group below 2048 is one a laptop breaks; a floor above 8192 is a typo, because no
+        // client generates a key that large. Zero would read as "any group".
+        for bad in [
+            "1024",
+            "0",
+            "8192"
+                .parse::<u32>()
+                .map(|v| (v + 1).to_string())
+                .unwrap()
+                .as_str(),
+            "big",
+        ] {
+            assert!(
+                c.apply("pkinit_dh_min_bits", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        c.apply("pkinit_max_life_bound", "1h").unwrap();
+        assert_eq!(c.pkinit_max_life, Some(3600));
+        assert!(c.apply("pkinit_max_life_bound", "0").is_err());
+
+        c.apply("pkinit_principal_in_certificate", "false").unwrap();
+        assert!(!c.pkinit_principal_in_certificate);
+
+        // `pkinit_max_life_from_cert` decides at request time, when the certificate is seen, so a
+        // configuration flag cannot honour it; it is refused by name rather than accepted and
+        // ignored.
+        let err = c
+            .apply("pkinit-max-life-from-cert", "true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pkinit-max-life-from-cert"), "{err}");
+        assert!(err.contains("not implemented"), "{err}");
     }
 
     /// `max-kdc-datagram-reply-length`: the default is Heimdal's 1400, a value is honoured, and

@@ -70,6 +70,7 @@ fn state() -> reply::State {
     reply::State {
         identity: kdc_identity(),
         anchors,
+        policy: Default::default(),
     }
 }
 

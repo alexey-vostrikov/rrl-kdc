@@ -38,11 +38,16 @@ pub const ID_PKINIT_RKEY_DATA: &str = "1.3.6.1.5.2.3.3";
 /// opinion about where a key comes from. An embedder that reads a PEM file decodes it and
 /// hands the octets here.
 #[cfg(feature = "pkinit")]
+#[derive(Clone)]
 pub struct Identity {
     /// The certificate sent alongside the signature, DER.
     pub cert: Vec<u8>,
     /// The RSA key that signs.
-    pub key: rsa::RsaPrivateKey,
+    ///
+    /// Behind an `Arc` so that handing the same identity to every request is a pointer copy: an
+    /// `RsaPrivateKey` is not `Clone` cheaply, and a source that rebuilt one per login would spend
+    /// more time parsing DER than signing.
+    pub key: std::sync::Arc<rsa::RsaPrivateKey>,
 }
 
 #[cfg(feature = "pkinit")]
@@ -75,7 +80,7 @@ impl Identity {
             .map_err(|e| PkinitError::Malformed(format!("the KDC's private key: {e}")))?;
         Ok(Self {
             cert: cert.to_vec(),
-            key,
+            key: std::sync::Arc::new(key),
         })
     }
 
@@ -205,6 +210,27 @@ fn issuer_and_serial(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PkinitError>
         der::tlv(der::SEQUENCE, issuer.content),
         serial.content.to_vec(),
     ))
+}
+
+/// Refuses a Diffie-Hellman group smaller than the realm allows.
+///
+/// Before any key is made, because after that the damage is done quietly: the exchange completes,
+/// the ticket is issued, and the shared secret is one an attacker with a laptop recovers. A refusal
+/// here is a client with something to fix, which is the answer that leads somewhere.
+///
+/// Its own function so that the rule can be exercised without building a `SubjectPublicKeyInfo` for
+/// a group nobody's client sends: the parser that produces a `Group` is tested by the live PKINIT
+/// suite against MIT, and this is the policy on top of it.
+fn check_group(group: super::dh::Group, policy: &PkinitPolicy) -> Result<(), PkinitError> {
+    if group.bits() < policy.dh_min_bits {
+        return Err(PkinitError::Unsupported(format!(
+            "the client's Diffie-Hellman group is {} bits, and this realm requires at least {} \
+             (pkinit_dh_min_bits)",
+            group.bits(),
+            policy.dh_min_bits
+        )));
+    }
+    Ok(())
 }
 
 /// `KDCDHKeyInfo ::= SEQUENCE { subjectPublicKey [0] BIT STRING, nonce [1] INTEGER,
@@ -499,6 +525,39 @@ pub fn choose_kdf(offered: &[String]) -> Option<&'static str> {
         .find(|kdf| offered.iter().any(|o| o == kdf))
 }
 
+/// What a realm's policy says about PKINIT, as opposed to what its certificate is.
+///
+/// Numbers and switches only: the certificate and the anchors are a [`PkinitSource`]'s business,
+/// so that a crate which deliberately has no opinion about files does not grow one here.
+#[cfg(feature = "pkinit")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PkinitPolicy {
+    /// The smallest Diffie-Hellman group a client may ask for (`pkinit_dh_min_bits`).
+    ///
+    /// A 512-bit MODP group is a group an attacker with a laptop can break, and a client that
+    /// asks for one is either old or hostile. Heimdal's default is 2048.
+    pub dh_min_bits: u32,
+    /// The longest ticket a certificate login may produce (`pkinit_max_life_bound`), if any.
+    pub max_life: Option<i64>,
+    /// Whether the certificate's `id-pkinit-san` must name the principal being asked for
+    /// (`pkinit_principal_in_certificate`).
+    ///
+    /// On by default, and it is the difference between "this certificate authenticated somebody"
+    /// and "this certificate authenticated the somebody who is asking".
+    pub principal_in_certificate: bool,
+}
+
+#[cfg(feature = "pkinit")]
+impl Default for PkinitPolicy {
+    fn default() -> Self {
+        PkinitPolicy {
+            dh_min_bits: 2048,
+            max_life: None,
+            principal_in_certificate: true,
+        }
+    }
+}
+
 /// Everything the reply half needs from the realm's configuration.
 #[cfg(feature = "pkinit")]
 pub struct State {
@@ -506,6 +565,54 @@ pub struct State {
     pub identity: Identity,
     /// The roots a client's certificate may chain to.
     pub anchors: super::TrustAnchors,
+    /// What this realm's policy allows a certificate login to do.
+    pub policy: PkinitPolicy,
+}
+
+/// Where a realm's PKINIT identity comes from.
+///
+/// A seam rather than a file format, for the reason [`crate::hdb::Hdb`] and the client crate's
+/// `CcacheStore` are: this KDC parses no PEM and reads no key file, and an embedder that keeps its
+/// certificate in a vault, a database or a Kubernetes secret implements this and is done. It is
+/// also what makes rotation possible — a source is asked on every request, so a certificate
+/// replaced in the vault is used by the next login and no restart is needed.
+///
+/// `Result` rather than `Option`: "this realm has no PKINIT identity" is a configuration state the
+/// KDC knows before it starts, while "the source could not produce one right now" is a failure that
+/// must be reported as itself instead of as a realm without the feature.
+#[cfg(feature = "pkinit")]
+pub trait PkinitSource: Send + Sync + std::fmt::Debug {
+    /// The identity and anchors this realm uses right now.
+    fn state(&self) -> Result<State, PkinitError>;
+}
+
+/// A source whose answer never changes: an [`Identity`] and its anchors, handed over once.
+#[cfg(feature = "pkinit")]
+#[derive(Debug)]
+pub struct Fixed(pub State);
+
+#[cfg(feature = "pkinit")]
+impl PkinitSource for Fixed {
+    fn state(&self) -> Result<State, PkinitError> {
+        Ok(State {
+            identity: self.0.identity.clone(),
+            anchors: self.0.anchors.clone(),
+            policy: self.0.policy.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "pkinit")]
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The identity's own `Debug` prints the key as a placeholder; the anchors are certificates
+        // and safe to count, which is as much as a log line needs.
+        f.debug_struct("pkinit::State")
+            .field("identity", &self.identity)
+            .field("anchors", &self.anchors.len())
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 /// What the exchange produced: the key the reply's `enc-part` is sealed in, and the
@@ -558,10 +665,18 @@ pub fn answer(
         // The certificate names someone else. Answering would issue a ticket to the
         // certificate's owner while the request claims to be another — a mix-up nobody
         // benefits from except an attacker who holds one and asks for the other.
-        return Err(PkinitError::BadPrincipalName(format!(
-            "the certificate names {} but the request asks for {client}",
-            identity.principal
-        )));
+        //
+        // `pkinit_principal_in_certificate = false` turns this comparison off, which is Heimdal's
+        // mode for certificates issued without `id-pkinit-san`: the certificate then proves that
+        // *somebody the CA knows* is asking, and the request decides whose ticket it is. It is off
+        // only where an operator said so, and the client certificate check upstream still has to
+        // pass — what is given up is the binding between the two names, and nothing else.
+        if state.policy.principal_in_certificate {
+            return Err(PkinitError::BadPrincipalName(format!(
+                "the certificate names {} but the request asks for {client}",
+                identity.principal
+            )));
+        }
     }
 
     // 2. That the signature covers this request. `paChecksum` is over the
@@ -577,6 +692,7 @@ pub fn answer(
         return answer_key_transport(state, &identity, as_req_der, enctype, rng);
     };
     let (group, peer) = parse_client_public_value(value)?;
+    check_group(group, &state.policy)?;
 
     // 4. Our own value, and the shared secret.
     let ours = super::dh::KeyPair::generate(group, rng)?;
@@ -861,6 +977,34 @@ fn encode_oid(text: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// `pkinit_dh_min_bits`: the same group is accepted at the default floor and refused when the
+    /// realm demands more, and the refusal names the option so the operator knows what to change.
+    #[test]
+    fn a_group_below_the_realm_minimum_is_refused_by_name() {
+        let group = super::super::dh::Group::at_least(2048);
+        assert_eq!(group.bits(), 2048, "the smallest group this KDC offers");
+
+        assert!(
+            check_group(group, &PkinitPolicy::default()).is_ok(),
+            "Heimdal's 2048-bit floor accepts a 2048-bit group"
+        );
+
+        let strict = PkinitPolicy {
+            dh_min_bits: 4096,
+            ..Default::default()
+        };
+        let err = check_group(group, &strict).expect_err("4096 floor, 2048 group");
+        assert!(
+            err.to_string().contains("pkinit_dh_min_bits"),
+            "the refusal must name the option: {err}"
+        );
+        assert!(matches!(err, PkinitError::Unsupported(_)));
+
+        // And the larger group passes the strict floor, so the rule is a floor and not a
+        // blacklist of one group.
+        assert!(check_group(super::super::dh::Group::at_least(4096), &strict).is_ok());
+    }
+
     use super::*;
     use crate::der::Reader;
 

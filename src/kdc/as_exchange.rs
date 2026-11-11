@@ -775,13 +775,25 @@ impl Kdc {
             self.pkinit(),
         ) {
             (Some(value), Some(state)) => {
+                // A source that could not produce an identity is an outage, not a realm without
+                // the feature, and it is reported as one: `KDC_ERR_NULL_KEY` would tell the client
+                // to try a mechanism this realm does not offer at all.
+                let state = match state {
+                    Ok(state) => state,
+                    Err(e) => {
+                        return Err(Error::Kdc {
+                            code: codes::KDC_ERR_PREAUTH_FAILED,
+                            text: format!("PKINIT: the realm has no usable identity: {e}"),
+                        });
+                    }
+                };
                 let server_key_enctype = session_usable[0];
                 // The private exponent comes from the same source as the session keys. A
                 // failure there is a broken RNG and must not degrade into a predictable
                 // key, so it is a refusal rather than a retry.
                 let entropy = self.cipher().random(Enctype::Aes256Sha1)?.bytes().to_vec();
                 let answer = super::pkinit::reply::answer(
-                    state,
+                    &state,
                     value,
                     body_der,
                     raw,
@@ -887,7 +899,16 @@ impl Kdc {
         let may_postdate = may_postdate(body, &client, &server)?;
         let start = starttime(body, &client);
         let effective_start = start.unwrap_or(now);
-        let endtime = endtime(config, body, &client, &server, effective_start);
+        let mut endtime = endtime(config, body, &client, &server, effective_start);
+        // `pkinit_max_life_bound`: Heimdal lets a realm cap what a certificate login buys, and it
+        // is a cap on this exchange only — a password login is bounded by the policy above. The
+        // bound never extends a lifetime, only shortens one.
+        #[cfg(feature = "pkinit")]
+        if pkinit_answer.is_some()
+            && let Some(bound) = config.pkinit_policy().max_life
+        {
+            endtime = endtime.min(effective_start.saturating_add(bound));
+        }
         if endtime <= effective_start {
             return Err(Error::Kdc {
                 code: codes::KDC_ERR_NEVER_VALID,
@@ -1277,6 +1298,10 @@ impl Kdc {
                     .into(),
             });
         };
+        let state = state.map_err(|e| Error::Kdc {
+            code: codes::KDC_ERR_NULL_KEY,
+            text: format!("anonymous PKINIT: the realm's identity is unusable: {e}"),
+        })?;
 
         let value =
             padata_value(padata, super::pkinit::PA_PK_AS_REQ).ok_or_else(|| Error::Kdc {
@@ -1311,7 +1336,7 @@ impl Kdc {
         // broken RNG must fail loudly rather than produce a predictable key.
         let entropy = self.cipher().random(Enctype::Aes256Sha1)?.bytes().to_vec();
         let answer = super::pkinit::reply::answer_anonymous(
-            state,
+            &state,
             value,
             body_der,
             raw,

@@ -75,6 +75,7 @@ fn kdc() -> Kdc {
     anchors.add(&pem_to_der(&fixture("ca.pem"))).unwrap();
 
     let state = reply::State {
+        policy: Default::default(),
         identity: reply::Identity::from_der(
             &pem_to_der(&fixture("kdc.pem")),
             &pem_to_der(&fixture("kdc-key.pem")),

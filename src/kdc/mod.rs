@@ -203,7 +203,7 @@ pub struct Kdc {
     /// refused rather than half-answered: a KDC that accepted a certificate it cannot chain
     /// would be worse than one that does not offer the feature.
     #[cfg(feature = "pkinit")]
-    pkinit: Option<Arc<pkinit::reply::State>>,
+    pkinit: Option<Arc<dyn pkinit::reply::PkinitSource>>,
     /// The realm key `PA-FX-COOKIE` is sealed under (RFC 6113 §5.4.2.3).
     ///
     /// `None` means this realm does not offer the cookie, and then it must not advertise one:
@@ -265,9 +265,26 @@ impl Kdc {
     }
 
     /// The same KDC answering PKINIT, with the realm's certificate and its trust anchors.
+    ///
+    /// The state is wrapped in a [`pkinit::reply::Fixed`] source, so a realm whose certificate is
+    /// decided once at startup says so; [`Kdc::with_pkinit_source`] is for one that rotates.
     #[cfg(feature = "pkinit")]
     pub fn with_pkinit(mut self, state: Arc<pkinit::reply::State>) -> Self {
-        self.pkinit = Some(state);
+        self.pkinit = Some(Arc::new(pkinit::reply::Fixed(pkinit::reply::State {
+            identity: state.identity.clone(),
+            anchors: state.anchors.clone(),
+            policy: state.policy.clone(),
+        })));
+        self
+    }
+
+    /// The same KDC answering PKINIT, asking `source` for the identity on every login.
+    ///
+    /// The reason to want this over [`Kdc::with_pkinit`]: a certificate replaced in a vault, a
+    /// database or a Kubernetes secret is used by the next request instead of the next restart.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_source(mut self, source: Arc<dyn pkinit::reply::PkinitSource>) -> Self {
+        self.pkinit = Some(source);
         self
     }
 
@@ -283,10 +300,22 @@ impl Kdc {
         }
     }
 
-    /// The PKINIT state, when the realm has one.
+    /// This realm's PKINIT state, resolved for one request.
+    ///
+    /// `Ok(None)` means the realm does not offer certificate logins; `Err` means it does and its
+    /// source could not produce the identity now. The two are different, and a caller that
+    /// collapsed them would report a vault outage as a realm without the feature.
+    ///
+    /// The policy is the realm configuration's, not the source's: an operator changes
+    /// `pkinit_dh_min_bits` in one place, and a source that disagreed with the configuration about
+    /// what is allowed would be a second place to look.
     #[cfg(feature = "pkinit")]
-    pub(super) fn pkinit(&self) -> Option<&pkinit::reply::State> {
-        self.pkinit.as_deref()
+    pub(super) fn pkinit(&self) -> Option<Result<pkinit::reply::State, pkinit::PkinitError>> {
+        let source = self.pkinit.as_ref()?;
+        Some(source.state().map(|mut state| {
+            state.policy = self.config.pkinit_policy();
+            state
+        }))
     }
 
     /// The same KDC issuing PACs, with `identities` answering who an account is.

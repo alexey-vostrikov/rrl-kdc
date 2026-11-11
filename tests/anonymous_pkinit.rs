@@ -68,6 +68,7 @@ fn state() -> Arc<reply::State> {
     let mut anchors = pkinit::TrustAnchors::new();
     anchors.add(&pem_to_der(&fixture("ca.pem"))).unwrap();
     Arc::new(reply::State {
+        policy: Default::default(),
         identity: reply::Identity::from_der(
             &pem_to_der(&fixture("kdc.pem")),
             &pem_to_der(&fixture("kdc-key.pem")),

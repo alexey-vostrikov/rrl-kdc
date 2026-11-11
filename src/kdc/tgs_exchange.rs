@@ -617,6 +617,16 @@ impl Kdc {
             // is over the whole buffer, so a copied one would not verify.
             authorization_data: self.pac_authorization_data(&client, &ticket_key.0, authtime)?,
         };
+        // TEMP-DIAG: the three enctypes a client has to agree with before it can use the ticket.
+        if std::env::var_os("KDC_TGS_DIAG").is_some() {
+            eprintln!(
+                "tgs-diag: sname={sname} requested={:?} session={session_enctype:?} \
+                 ticket_key={:?} reply_key={:?}",
+                usable,
+                ticket_key.0.enctype(),
+                proven.reply_key.enctype()
+            );
+        }
         let ticket = Ticket {
             realm: config.realm().to_owned(),
             // What the client asked for, which may not be the entry's own name: the

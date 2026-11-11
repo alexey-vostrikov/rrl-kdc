@@ -20,7 +20,8 @@ use rrl_kdc::admin::wire::{
 };
 use rrl_kdc::admin::{Admin, Modify, Role};
 use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
-use rrl_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, flags as entry_flags};
+// `Policy` in this file's other import is the authorization trait; a policy record is `PolicyRec`.
+use rrl_kdc::hdb::{Hdb, HdbEntry, Keytab, MemoryHdb, Policy as PolicyRec, flags as entry_flags};
 use rrl_kdc::name::Principal;
 
 const REALM: &str = "EXAMPLE.COM";
@@ -532,6 +533,244 @@ fn an_empty_string_attribute_key_is_refused() {
         },
     ));
     assert!(refused.is_err(), "an empty key must be refused");
+}
+
+/// A policy's whole life over the transport vocabulary: create, read, list, replace, delete.
+#[test]
+fn a_policy_is_created_read_and_removed() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+
+    let created = admin
+        .handle(request(
+            "admin",
+            Operation::CreatePolicy {
+                policy: PolicyRec {
+                    name: "staff".into(),
+                    pw_min_length: 12,
+                    pw_min_classes: 3,
+                    max_life: 86_400,
+                    ..PolicyRec::default()
+                },
+            },
+        ))
+        .unwrap();
+    let Reply::Policy { policy } = created else {
+        panic!("a create_policy must answer with the policy it stored");
+    };
+    assert_eq!(policy.name, "staff");
+    assert_eq!(policy.pw_min_length, 12);
+
+    // The same name again is a refusal: `addpol` does not quietly replace, or every account under
+    // the policy would move without the operator having asked.
+    let twice = admin.handle(request(
+        "admin",
+        Operation::CreatePolicy {
+            policy: PolicyRec::new("staff"),
+        },
+    ));
+    assert!(
+        twice.is_err(),
+        "a duplicate policy must be refused: {twice:?}"
+    );
+
+    // `modpol` is how a policy changes, and reading it back is how an operator learns it did.
+    admin
+        .handle(request(
+            "admin",
+            Operation::ModifyPolicy {
+                policy: PolicyRec {
+                    name: "staff".into(),
+                    pw_min_length: 16,
+                    ..PolicyRec::default()
+                },
+            },
+        ))
+        .unwrap();
+    let read = admin
+        .handle(request(
+            "admin",
+            Operation::Policy {
+                name: "staff".into(),
+            },
+        ))
+        .unwrap();
+    let Reply::Policy { policy } = read else {
+        panic!("a policy read must answer with it");
+    };
+    assert_eq!(
+        policy.pw_min_length, 16,
+        "the new number replaced the old one"
+    );
+
+    let listed = admin.handle(request("admin", Operation::Policies)).unwrap();
+    let Reply::Policies { names } = listed else {
+        panic!("a list must answer with names");
+    };
+    assert_eq!(names, vec!["staff".to_string()]);
+
+    let removed = admin
+        .handle(request(
+            "admin",
+            Operation::DeletePolicy {
+                name: "staff".into(),
+            },
+        ))
+        .unwrap();
+    let Reply::Policies { names } = removed else {
+        panic!("a delete answers with what is left");
+    };
+    assert!(names.is_empty());
+    assert!(
+        admin
+            .handle(request(
+                "admin",
+                Operation::Policy {
+                    name: "staff".into(),
+                },
+            ))
+            .is_err(),
+        "the policy must be gone"
+    );
+}
+
+/// A policy an entry cites cannot be removed: the entry would go on citing a name that resolves to
+/// nothing, and every read of its rules would have to guess.
+#[test]
+fn a_policy_in_use_cannot_be_deleted() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request(
+            "admin",
+            Operation::CreatePolicy {
+                policy: PolicyRec::new("staff"),
+            },
+        ))
+        .unwrap();
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+    admin
+        .handle(request(
+            "admin",
+            Operation::Modify {
+                principal: p("alice"),
+                change: Modify {
+                    policy: Some(Some("staff".into())),
+                    ..Modify::default()
+                },
+            },
+        ))
+        .unwrap();
+
+    let refused = admin.handle(request(
+        "admin",
+        Operation::DeletePolicy {
+            name: "staff".into(),
+        },
+    ));
+    assert!(
+        refused.is_err(),
+        "a policy in use must not be deleted: {refused:?}"
+    );
+
+    // Once nothing cites it, it goes.
+    admin
+        .handle(request(
+            "admin",
+            Operation::Modify {
+                principal: p("alice"),
+                change: Modify {
+                    policy: Some(None),
+                    ..Modify::default()
+                },
+            },
+        ))
+        .unwrap();
+    admin
+        .handle(request(
+            "admin",
+            Operation::DeletePolicy {
+                name: "staff".into(),
+            },
+        ))
+        .unwrap();
+}
+
+/// A principal cannot be put under a policy that does not exist, and the password it is given is
+/// measured against the one it is under.
+#[test]
+fn a_policy_governs_the_password_of_its_principals() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+
+    let absent = admin.handle(request(
+        "admin",
+        Operation::Modify {
+            principal: p("alice"),
+            change: Modify {
+                policy: Some(Some("nosuch".into())),
+                ..Modify::default()
+            },
+        },
+    ));
+    assert!(
+        absent.is_err(),
+        "a missing policy must be refused: {absent:?}"
+    );
+
+    admin
+        .handle(request(
+            "admin",
+            Operation::CreatePolicy {
+                policy: PolicyRec {
+                    name: "staff".into(),
+                    pw_min_length: 16,
+                    ..PolicyRec::default()
+                },
+            },
+        ))
+        .unwrap();
+    admin
+        .handle(request(
+            "admin",
+            Operation::Modify {
+                principal: p("alice"),
+                change: Modify {
+                    policy: Some(Some("staff".into())),
+                    ..Modify::default()
+                },
+            },
+        ))
+        .unwrap();
+
+    let short = admin.handle(request(
+        "admin",
+        Operation::SetPassword {
+            principal: p("alice"),
+            password: b"too short".to_vec(),
+        },
+    ));
+    assert!(
+        short.is_err(),
+        "a password below the policy must be refused: {short:?}"
+    );
+
+    // And one that satisfies it goes through, so the refusal is about the length and not the
+    // principal being unchangeable.
+    admin
+        .handle(request(
+            "admin",
+            Operation::SetPassword {
+                principal: p("alice"),
+                password: b"a long enough password".to_vec(),
+            },
+        ))
+        .unwrap();
 }
 
 #[test]

@@ -194,6 +194,17 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
             ),
         ]));
     }
+    if let Some(policy) = &entry.policy {
+        extensions.push(der::seq(&[
+            der::field(0, der::int(0)),
+            // `UTF8String` (tag 0x0c), which is what `hdb.asn1` says the field is — a
+            // `GeneralString` here would be a different type with the same bytes.
+            der::field(
+                1,
+                der::seq(&[der::field(12, der::tlv(0x0c, policy.as_bytes()))]),
+            ),
+        ]));
+    }
     if !entry.strings.is_empty() {
         // `HDB-Ext-Strings`: the pairs, in the order they were set. Written as an extension
         // rather than as a field of the entry so that an entry without strings is byte-for-byte
@@ -321,6 +332,7 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
     let Extensions {
         delegation: delegation_acl,
         aliases,
+        policy,
         strings,
     } = read_extensions(&f, ctx, &principal.realm)?;
 
@@ -329,6 +341,7 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         keys,
         constrained_delegation: delegation_acl,
         aliases,
+        policy,
         strings,
         flags: f.flags32(2, ctx)?,
         valid_start: time_field(3)?,
@@ -363,17 +376,20 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
 struct Extensions {
     delegation: Option<Vec<Principal>>,
     aliases: Option<Aliases>,
+    policy: Option<String>,
     strings: Vec<(String, String)>,
 }
 
 fn read_extensions(f: &Fields<'_>, ctx: &'static str, realm: &str) -> Result<Extensions> {
     let mut delegation = None;
     let mut aliases = None;
+    let mut policy = None;
     let mut strings = Vec::new();
     if f.opt_bytes(13).is_none() {
         return Ok(Extensions {
             delegation: None,
             aliases: None,
+            policy: None,
             strings,
         });
     }
@@ -431,6 +447,13 @@ fn read_extensions(f: &Fields<'_>, ctx: &'static str, realm: &str) -> Result<Ext
             });
         }
 
+        if choice.opt_bytes(12).is_some() {
+            // `policy [12] UTF8String`, Heimdal's own number for the name of the policy an entry
+            // is governed by — so a Heimdal KDC reading our record sees a policy it understands.
+            let mut pr = Reader::new(choice.bytes(12, ctx)?);
+            policy = Some(String::from_utf8_lossy(pr.expect_in(ctx, 0x0c)?).into_owned());
+        }
+
         if choice.opt_bytes(16).is_some() {
             // This crate's own extension, `HDB-Ext-Strings`: `SEQUENCE OF SEQUENCE {
             // key [0] UTF8String, value [1] UTF8String }`. Numbered 16 because Heimdal's list
@@ -456,6 +479,7 @@ fn read_extensions(f: &Fields<'_>, ctx: &'static str, realm: &str) -> Result<Ext
     Ok(Extensions {
         delegation,
         aliases,
+        policy,
         strings,
     })
 }

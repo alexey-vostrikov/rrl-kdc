@@ -274,6 +274,122 @@ fn a_stock_kadmin_client_modifies_a_principal() {
     stand.kadmin_stand.stop();
 }
 
+/// `addpol` / `getpol` / `listpols` / `modpol` / `delpol`, from the client that writes them.
+#[test]
+fn a_stock_kadmin_client_manages_policies() {
+    let mut stand = stand_with(owner());
+    assert!(
+        stand
+            .client
+            .list_policies("*")
+            .expect("listpols")
+            .is_empty(),
+        "a fresh realm has no policies"
+    );
+
+    // The struct is `non_exhaustive`, so it is filled field by field — which is also what a
+    // caller outside the crate has to do.
+    let mut policy = krb5::kadmin::Policy::default();
+    policy.name = "staff".into();
+    policy.pw_min_length = 12;
+    policy.pw_min_classes = 3;
+    policy.pw_max_life = 2_592_000;
+    stand
+        .client
+        .create_policy(&policy)
+        .expect("addpol must answer");
+
+    let read = stand.client.get_policy("staff").expect("getpol");
+    assert_eq!(read.name, "staff");
+    assert_eq!(read.pw_min_length, 12);
+    assert_eq!(read.pw_min_classes, 3);
+    assert_eq!(read.pw_max_life, 2_592_000);
+
+    assert_eq!(
+        stand.client.list_policies("*").expect("listpols"),
+        vec!["staff".to_string()]
+    );
+
+    // `modpol` replaces, so the number that was not mentioned goes back to its default rather than
+    // keeping the old one: the client sends every field of the record.
+    let mut changed = read.clone();
+    changed.pw_min_length = 16;
+    stand
+        .client
+        .modify_policy(&changed)
+        .expect("modpol must answer");
+    let read = stand.client.get_policy("staff").expect("getpol");
+    assert_eq!(read.pw_min_length, 16);
+    assert_eq!(read.pw_min_classes, 3, "a field that was not changed stays");
+
+    stand
+        .client
+        .delete_policy("staff")
+        .expect("delpol must answer");
+    assert!(
+        stand.client.get_policy("staff").is_err(),
+        "the policy is gone"
+    );
+    // Deleting one that is not there is a refusal with a `kadm5` status, not a silent success: the
+    // operator named a policy, and the answer has to say there was none.
+    assert!(stand.client.delete_policy("staff").is_err());
+    stand.kadmin_stand.stop();
+}
+
+/// A policy governs the principals under it: `modprinc -policy` puts one there, `chpass` is
+/// measured against it, and the policy cannot be deleted while it applies.
+#[test]
+fn a_stock_kadmin_client_cannot_delete_a_policy_in_use() {
+    let mut stand = stand_with(owner());
+    let mut policy = krb5::kadmin::Policy::default();
+    policy.name = "staff".into();
+    policy.pw_min_length = 16;
+    stand.client.create_policy(&policy).expect("addpol");
+
+    let mut changes = krb5::kadmin::PrincipalChanges::default();
+    changes.policy = Some(Some("staff".into()));
+    stand
+        .client
+        .modify_principal(&kp("alice"), &changes)
+        .expect("modprinc -policy");
+
+    // `getprinc` says which policy applies, so an operator can tell without a second lookup.
+    let alice = stand.client.get_principal(&kp("alice")).expect("getprinc");
+    assert_eq!(alice.policy.as_deref(), Some("staff"));
+
+    let refused = stand.client.delete_policy("staff");
+    assert!(
+        refused.is_err(),
+        "a policy a principal is under must not be deleted: {refused:?}"
+    );
+
+    // The policy's length rule is the one `chpass` applies.
+    let short = stand.client.change_password(&kp("alice"), "short");
+    assert!(short.is_err(), "a password below the policy: {short:?}");
+    stand
+        .client
+        .change_password(&kp("alice"), "a long enough password")
+        .expect("a password the policy admits");
+
+    // `-clearpolicy` releases it, and then the delete is allowed.
+    let mut clear = krb5::kadmin::PrincipalChanges::default();
+    clear.policy = Some(None);
+    stand
+        .client
+        .modify_principal(&kp("alice"), &clear)
+        .expect("modprinc -clearpolicy");
+    assert!(
+        stand
+            .client
+            .get_principal(&kp("alice"))
+            .expect("getprinc")
+            .policy
+            .is_none()
+    );
+    stand.client.delete_policy("staff").expect("delpol");
+    stand.kadmin_stand.stop();
+}
+
 /// `ktadd -norandkey`: the keys the admin server hands out are the keys the KDC will accept.
 ///
 /// The point of the test is not that the reply parsed — it is that a ticket obtained with the

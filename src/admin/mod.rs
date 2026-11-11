@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::crypto::{Cipher, Enctype, Key};
 use crate::error::{Error, Result};
-use crate::hdb::{Hdb, HdbEntry, Keytab, flags as entry_flags, keytab::KeytabEntry};
+use crate::hdb::{Hdb, HdbEntry, Keytab, Policy, flags as entry_flags, keytab::KeytabEntry};
 use crate::name::Principal;
 
 /// What to give a new account.
@@ -139,6 +139,12 @@ pub struct Modify {
     pub renewable: Option<bool>,
     /// See [`Modify::forwardable`].
     pub postdated: Option<bool>,
+    /// The policy to put the principal under — MIT's `KADM5_POLICY` (`Some(Some(name))`),
+    /// `KADM5_POLICY_CLR` (`Some(None)`), or neither (`None`, which leaves the policy alone).
+    ///
+    /// A name, not the rules: changing the policy changes every account under it, which is the
+    /// reason an operator gives an account a policy instead of repeating the numbers on each one.
+    pub policy: Option<Option<String>>,
     /// The key version to set — MIT's `KADM5_KVNO`.
     ///
     /// Not the keys themselves: it renumbers what is there, which is what an operator does after
@@ -262,6 +268,7 @@ impl Admin {
             // Nor does a new principal have other names; `rename` and `alias` are separate
             // operations, and an alias list invented here would be one nobody asked for.
             aliases: None,
+            policy: None,
             strings: Vec::new(),
         };
 
@@ -421,6 +428,16 @@ impl Admin {
                 entry.flags = set_flag(entry.flags, flag, on);
             }
         }
+        if let Some(policy) = change.policy {
+            // A policy that does not exist would leave the entry citing nothing, and every later
+            // lookup of its rules would fail — or worse, be treated as "no limits".
+            if let Some(name) = &policy
+                && self.hdb.fetch_policy(name)?.is_none()
+            {
+                return Err(Error::NotFound(format!("no policy {name}")));
+            }
+            entry.policy = policy;
+        }
         if let Some(kvno) = change.kvno {
             // The keys keep their own versions; only the entry's moves, and only forward: an entry
             // below its highest key is a state `HdbEntry::kvno` will not derive, and the backends
@@ -442,6 +459,71 @@ impl Admin {
         Ok(entry)
     }
 
+    /// Creates a policy.
+    ///
+    /// Refuses a name that is taken (`Error::Exists`) and one a [`Policy::check`] rejects. Not a
+    /// replace: an `addpol` that silently overwrote would move every account under that policy
+    /// without the operator having asked, which is what `modpol` is for.
+    pub fn create_policy(&self, policy: Policy) -> Result<Policy> {
+        policy.check()?;
+        if self.hdb.fetch_policy(&policy.name)?.is_some() {
+            return Err(Error::Exists(format!("policy {}", policy.name)));
+        }
+        self.hdb.store_policy(policy.clone())?;
+        Ok(policy)
+    }
+
+    /// Replaces an existing policy; the name is the key, so it must already be there.
+    pub fn modify_policy(&self, policy: Policy) -> Result<Policy> {
+        policy.check()?;
+        if self.hdb.fetch_policy(&policy.name)?.is_none() {
+            return Err(Error::NotFound(format!("no policy {}", policy.name)));
+        }
+        self.hdb.store_policy(policy.clone())?;
+        Ok(policy)
+    }
+
+    /// Removes a policy; returns whether there was one.
+    ///
+    /// A policy an entry cites is not removed: the entry would go on citing a name that resolves
+    /// to nothing, and every read of its rules would have to guess whether that means "no limits".
+    /// [`Hdb::policy_refcount`] is what says so, counted rather than kept as a number.
+    pub fn delete_policy(&self, name: &str) -> Result<bool> {
+        if self.hdb.fetch_policy(name)?.is_none() {
+            return Ok(false);
+        }
+        let in_use = self.hdb.policy_refcount(name)?;
+        if in_use > 0 {
+            return Err(Error::Forbidden(format!(
+                "policy {name} is in use by {in_use} principal(s)"
+            )));
+        }
+        self.hdb.remove_policy(name)
+    }
+
+    /// The policy called `name`, if there is one.
+    ///
+    /// Not `policy`: that name belongs to the accessor that hands out the authorization rules,
+    /// and two things called a policy in one type is one too many.
+    pub fn fetch_policy(&self, name: &str) -> Result<Option<Policy>> {
+        self.hdb.fetch_policy(name)
+    }
+
+    /// Every policy's name, sorted.
+    pub fn policies(&self) -> Result<Vec<String>> {
+        let mut names = self.hdb.policies()?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// The policy `principal` is under, if any.
+    pub fn policy_of(&self, principal: &Principal) -> Result<Option<Policy>> {
+        match self.get(principal)?.policy {
+            None => Ok(None),
+            Some(name) => self.hdb.fetch_policy(&name),
+        }
+    }
+
     /// Sets a password: new keys at the next kvno, the old ones kept.
     ///
     /// Returns the kvno the new keys are at, which is what a service needs to
@@ -453,6 +535,20 @@ impl Admin {
             ));
         }
         let entry = self.get(principal)?;
+        // The policy is checked before the keys are derived: a refused password must not leave a
+        // half-made key behind, and the operator wants the rule named, not a mismatched ticket.
+        if let Some(name) = &entry.policy {
+            match self.hdb.fetch_policy(name)? {
+                Some(policy) => policy.admits_password(password)?,
+                // An entry citing a policy the database does not have is a broken database, and a
+                // password accepted under a rule nobody can read is the wrong way to report it.
+                None => {
+                    return Err(Error::Hdb(format!(
+                        "{principal} is under policy {name}, which is not in the database"
+                    )));
+                }
+            }
+        }
         let updated = entry.rekey(self.cipher.as_ref(), password)?;
         let kvno = updated.kvno();
         self.hdb.store(updated)?;

@@ -11,7 +11,7 @@
 //! one shifts every field after it.
 
 use crate::admin::Modify;
-use crate::hdb::HdbEntry;
+use crate::hdb::{HdbEntry, Policy};
 use crate::name::Principal;
 
 use super::xdr::{Reader, Writer};
@@ -24,6 +24,8 @@ pub const VERS: u32 = 2;
 
 /// `kadm5_init`'s version, and the one this server answers with.
 pub const API_VERSION_2: u32 = 0x1234_5702;
+/// The version MIT 1.9 and later ask for: the lock-out fields.
+pub const API_VERSION_3: u32 = 0x1234_5703;
 /// The version MIT 1.18 and later ask for first.
 pub const API_VERSION_4: u32 = 0x1234_5704;
 
@@ -55,12 +57,22 @@ pub mod proc_ {
     pub const SET_STRING: u32 = 24;
     /// `extract_keys`: the long-term keys in the clear, for `ktadd -norandkey`.
     pub const EXTRACT_KEYS: u32 = 26;
+    /// `create_policy`.
+    pub const CREATE_POLICY: u32 = 8;
+    /// `delete_policy`.
+    pub const DELETE_POLICY: u32 = 9;
+    /// `modify_policy`.
+    pub const MODIFY_POLICY: u32 = 10;
+    /// `get_policy`.
+    pub const GET_POLICY: u32 = 11;
+    /// `get_policies`, a glob.
+    pub const GET_POLS: u32 = 15;
 }
 
 pub use proc_::{
-    CHPASS_PRINCIPAL, CHRAND_PRINCIPAL3, CREATE_PRINCIPAL, DELETE_PRINCIPAL, EXTRACT_KEYS,
-    GET_PRINCIPAL, GET_PRINCS, GET_PRIVS, GET_STRINGS, INIT, MODIFY_PRINCIPAL, RENAME_PRINCIPAL,
-    SET_STRING,
+    CHPASS_PRINCIPAL, CHRAND_PRINCIPAL3, CREATE_POLICY, CREATE_PRINCIPAL, DELETE_POLICY,
+    DELETE_PRINCIPAL, EXTRACT_KEYS, GET_POLICY, GET_POLS, GET_PRINCIPAL, GET_PRINCS, GET_PRIVS,
+    GET_STRINGS, INIT, MODIFY_POLICY, MODIFY_PRINCIPAL, RENAME_PRINCIPAL, SET_STRING,
 };
 
 /// The field masks of a `kadm5_principal_ent_rec` (`kadm5/admin.h`).
@@ -89,8 +101,15 @@ pub mod mask {
     pub const MAX_RLIFE: u32 = 0x0000_2000;
 
     /// The bits `modify_principal` honours here.
-    pub const MODIFY_SUPPORTED: u32 =
-        PRINCIPAL | PRINC_EXPIRE_TIME | PW_EXPIRATION | ATTRIBUTES | MAX_LIFE | KVNO | MAX_RLIFE;
+    pub const MODIFY_SUPPORTED: u32 = PRINCIPAL
+        | PRINC_EXPIRE_TIME
+        | PW_EXPIRATION
+        | ATTRIBUTES
+        | MAX_LIFE
+        | KVNO
+        | MAX_RLIFE
+        | POLICY
+        | POLICY_CLR;
 }
 
 /// The `KADM5_*` attribute bits of a principal (`kadm5/admin.h`).
@@ -177,8 +196,18 @@ pub const DUP: u32 = BASE + 7;
 pub const NOT_INIT: u32 = BASE + 11;
 /// "Principal does not exist".
 pub const UNK_PRINC: u32 = BASE + 12;
+/// "Policy does not exist".
+pub const UNK_POLICY: u32 = BASE + 13;
+/// "Invalid policy name", which is what an empty one is.
+pub const BAD_POLICY: u32 = BASE + 17;
 /// "Invalid field mask for operation".
 pub const BAD_MASK: u32 = BASE + 14;
+/// "Password is too short".
+pub const PASS_Q_TOOSHORT: u32 = BASE + 22;
+/// "Password does not contain enough character classes".
+pub const PASS_Q_CLASS: u32 = BASE + 23;
+/// "Policy is in use".
+pub const POLICY_REF: u32 = BASE + 27;
 /// "Operation requires 'list' privilege".
 pub const AUTH_LIST: u32 = BASE + 44;
 /// "Operation requires 'change-password' privilege".
@@ -211,8 +240,9 @@ pub fn encode_principal_entry(entry: &HdbEntry) -> Vec<u8> {
         .i32(attributes_of(entry) as i32)
         .u32(entry.kvno())
         .u32(1) // mkvno
-        ;
-    w.nullstring(None) // policy
+        // The policy the entry is under, by name: `getprinc` shows it, and an operator who sees
+        // `Policy: staff` knows which rules apply without a second lookup.
+        .nullstring(entry.policy.as_deref())
         .i32(0) // aux_attributes
         .i32(entry.max_renew.unwrap_or(0) as i32)
         .i32(0) // last_success
@@ -450,6 +480,21 @@ pub fn decode_modify(args: &[u8]) -> std::result::Result<(Principal, Modify), u3
     if mask & mask::KVNO != 0 {
         change.kvno = Some(rec.kvno);
     }
+    // `KADM5_POLICY` names the policy to put the entry under, `KADM5_POLICY_CLR` takes it off.
+    // Both at once is a request that asks for two states, so it is refused rather than resolved by
+    // whichever happens to be read second.
+    match (mask & mask::POLICY != 0, mask & mask::POLICY_CLR != 0) {
+        (true, true) => return Err(BAD_MASK),
+        (true, false) => {
+            let name = rec.policy.ok_or(BAD_POLICY)?;
+            if name.is_empty() {
+                return Err(BAD_POLICY);
+            }
+            change.policy = Some(Some(name));
+        }
+        (false, true) => change.policy = Some(None),
+        (false, false) => {}
+    }
     if mask & mask::ATTRIBUTES != 0 {
         // The attribute word replaces the switches, and `..` keeps the fields the mask did not
         // name: a `modprinc -attrs` says nothing about the expiry.
@@ -576,6 +621,154 @@ pub fn encode_key_data(keys: &[crate::hdb::HdbKey]) -> Vec<u8> {
         };
     }
     w.into_bytes()
+}
+
+/// The field mask of a `kadm5_policy_ent_rec` (`kadm5/admin.h`), the policy counterpart of
+/// [`mask`].
+pub mod policy_mask {
+    /// The policy's own name — the only bit `create_policy` needs.
+    pub const POLICY: u32 = 0x0000_0800;
+    /// `pw_max_life`.
+    pub const PW_MAX_LIFE: u32 = 0x0000_4000;
+    /// `pw_min_life`.
+    pub const PW_MIN_LIFE: u32 = 0x0000_8000;
+    /// `pw_min_length`.
+    pub const PW_MIN_LENGTH: u32 = 0x0001_0000;
+    /// `pw_min_classes`.
+    pub const PW_MIN_CLASSES: u32 = 0x0002_0000;
+    /// `pw_history_num`.
+    pub const PW_HISTORY_NUM: u32 = 0x0004_0000;
+    /// `pw_max_fail` — API version 3 and later.
+    pub const PW_MAX_FAILURE: u32 = 0x0010_0000;
+    /// `pw_failcnt_interval` — API version 3 and later.
+    pub const PW_FAILURE_COUNT_INTERVAL: u32 = 0x0020_0000;
+    /// `pw_lockout_duration` — API version 3 and later.
+    pub const PW_LOCKOUT_DURATION: u32 = 0x0040_0000;
+    /// `attributes` — API version 4 and later.
+    pub const POLICY_ATTRIBUTES: u32 = 0x0080_0000;
+    /// `max_life` — API version 4 and later.
+    pub const MAX_LIFE: u32 = 0x0100_0000;
+    /// `max_renewable_life` — API version 4 and later.
+    pub const MAX_RLIFE: u32 = 0x0200_0000;
+    /// `allowed_keysalts` — API version 4 and later.
+    pub const ALLOWED_KEYSALTS: u32 = 0x0400_0000;
+
+    /// Everything this server models.
+    pub const ALL: u32 = POLICY
+        | PW_MAX_LIFE
+        | PW_MIN_LIFE
+        | PW_MIN_LENGTH
+        | PW_MIN_CLASSES
+        | PW_HISTORY_NUM
+        | PW_MAX_FAILURE
+        | PW_FAILURE_COUNT_INTERVAL
+        | PW_LOCKOUT_DURATION
+        | POLICY_ATTRIBUTES
+        | MAX_LIFE
+        | MAX_RLIFE
+        | ALLOWED_KEYSALTS;
+}
+
+/// Reads a `kadm5_policy_ent_rec`, in the shape API version `version` defines.
+///
+/// The version is not decoration: version 3 added the three lock-out fields and version 4 the
+/// three ticket-lifetime ones plus the keysalt list, and a decoder that assumed version 4 reads a
+/// version-2 record's end as its own fields.
+pub fn decode_policy_rec(r: &mut Reader<'_>, version: u32) -> std::result::Result<Policy, u32> {
+    let name = r
+        .nullstring()
+        .map_err(|_| BAD_MASK)?
+        .ok_or(BAD_POLICY)?
+        .to_owned();
+    let min_life = r.i32().map_err(|_| BAD_MASK)?;
+    let max_life_pw = r.i32().map_err(|_| BAD_MASK)?;
+    let min_length = r.i32().map_err(|_| BAD_MASK)?;
+    let min_classes = r.i32().map_err(|_| BAD_MASK)?;
+    let history_num = r.i32().map_err(|_| BAD_MASK)?;
+    let _refcnt = r.i32().map_err(|_| BAD_MASK)?;
+    let mut policy = Policy {
+        name,
+        pw_min_life: i64::from(min_life),
+        pw_max_life: i64::from(max_life_pw),
+        pw_min_length: min_length.max(0) as u32,
+        pw_min_classes: min_classes.max(0) as u32,
+        pw_history_num: history_num.max(0) as u32,
+        ..Policy::default()
+    };
+    if version >= API_VERSION_3 {
+        policy.pw_max_fail = r.u32().map_err(|_| BAD_MASK)?;
+        policy.pw_failcnt_interval = i64::from(r.i32().map_err(|_| BAD_MASK)?);
+        policy.pw_lockout_duration = i64::from(r.i32().map_err(|_| BAD_MASK)?);
+    }
+    if version >= API_VERSION_4 {
+        let _attributes = r.i32().map_err(|_| BAD_MASK)?;
+        policy.max_life = i64::from(r.i32().map_err(|_| BAD_MASK)?);
+        policy.max_renewable_life = i64::from(r.i32().map_err(|_| BAD_MASK)?);
+        policy.allowed_keysalts = r.nullstring().map_err(|_| BAD_MASK)?.unwrap_or_default();
+        let _n_tl_data = r.i32().map_err(|_| BAD_MASK)?;
+        // The tagged-data list is a pointer: `true` is absent, and a policy with a list this
+        // server cannot store is refused rather than silently dropped.
+        if !r.bool().map_err(|_| BAD_MASK)? {
+            return Err(BAD_MASK);
+        }
+    }
+    Ok(policy)
+}
+
+/// A `create_policy` or `modify_policy` request: the record and the mask that says which of its
+/// fields the caller means.
+pub fn decode_policy_request(args: &[u8], version: u32) -> std::result::Result<(Policy, u32), u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let policy = decode_policy_rec(&mut r, version)?;
+    let mask = r.u32().map_err(|_| BAD_MASK)?;
+    Ok((policy, mask))
+}
+
+/// A request that carries only a policy name.
+pub fn decode_policy_name(args: &[u8]) -> std::result::Result<String, u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_POLICY)
+}
+
+/// The body of a `get_policy` reply: the record, in the caller's shape.
+pub fn encode_policy(policy: &Policy, version: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.nullstring(Some(&policy.name));
+    w.i32(policy.pw_min_life as i32)
+        .i32(policy.pw_max_life as i32)
+        .i32(policy.pw_min_length as i32)
+        .i32(policy.pw_min_classes as i32)
+        .i32(policy.pw_history_num as i32)
+        // `policy_refcnt` is not stored: it is counted whenever it is asked for, so a number here
+        // could only disagree with the principals that produce it.
+        .i32(0);
+    if version >= API_VERSION_3 {
+        w.u32(policy.pw_max_fail)
+            .i32(policy.pw_failcnt_interval as i32)
+            .i32(policy.pw_lockout_duration as i32);
+    }
+    if version >= API_VERSION_4 {
+        w.i32(0) // attributes: untagged-data only, no policy flags are modelled
+            .i32(policy.max_life as i32)
+            .i32(policy.max_renewable_life as i32);
+        let keysalts = policy.allowed_keysalts.trim();
+        w.nullstring((!keysalts.is_empty()).then_some(keysalts));
+        w.i32(0).bool(true); // n_tl_data, and no list
+    }
+    w.into_bytes()
+}
+
+/// The bit a `create_policy` request must carry: a policy with no name is one nothing can cite.
+pub fn policy_create_mask_ok(mask: u32) -> bool {
+    mask & policy_mask::POLICY != 0 && mask & !policy_mask::ALL == 0
+}
+
+/// The mask a `modify_policy` request must carry: at least one field, and no field this server
+/// cannot store.
+pub fn policy_modify_mask_ok(mask: u32) -> bool {
+    mask & !policy_mask::ALL == 0 && mask & policy_mask::ALL != 0
 }
 
 #[cfg(test)]
@@ -747,6 +940,80 @@ mod tests {
         assert!(r.rest().is_empty(), "and nothing follows the last key");
     }
 
+    /// A policy record is read at the width the caller negotiated: version 2 stops after the
+    /// reference count, and a decoder that assumed version 4 would read the next field's bytes as
+    /// the lock-out ones.
+    #[test]
+    fn a_policy_record_is_read_at_the_caller_s_version() {
+        let policy = Policy {
+            name: "staff".into(),
+            pw_min_life: 3_600,
+            pw_max_life: 2_592_000,
+            pw_min_length: 12,
+            pw_min_classes: 3,
+            pw_history_num: 5,
+            ..Policy::default()
+        };
+        for version in [API_VERSION_2, API_VERSION_3, API_VERSION_4] {
+            let mut w = Writer::new();
+            w.u32(version);
+            w.raw(&encode_policy(&policy, version));
+            w.u32(policy_mask::POLICY | policy_mask::PW_MIN_LENGTH);
+            let (back, mask) = decode_policy_request(&w.into_bytes(), version).unwrap();
+            assert_eq!(back.name, "staff", "version {version:#x}");
+            assert_eq!(back.pw_min_life, 3_600);
+            assert_eq!(back.pw_max_life, 2_592_000);
+            assert_eq!(back.pw_min_length, 12);
+            assert_eq!(back.pw_min_classes, 3);
+            assert_eq!(back.pw_history_num, 5);
+            assert_eq!(mask, policy_mask::POLICY | policy_mask::PW_MIN_LENGTH);
+        }
+    }
+
+    /// The version-3 and version-4 fields survive the round trip they exist for, and an empty
+    /// keysalt list comes back empty rather than as a name.
+    #[test]
+    fn the_later_policy_fields_survive_a_round_trip() {
+        let policy = Policy {
+            name: "strict".into(),
+            pw_max_fail: 6,
+            pw_failcnt_interval: 300,
+            pw_lockout_duration: 900,
+            max_life: 86_400,
+            max_renewable_life: 604_800,
+            allowed_keysalts: "aes256-cts-hmac-sha1-96".into(),
+            ..Policy::default()
+        };
+        let mut w = Writer::new();
+        w.u32(API_VERSION_4)
+            .raw(&encode_policy(&policy, API_VERSION_4));
+        w.u32(policy_mask::ALL);
+        let (back, _) = decode_policy_request(&w.into_bytes(), API_VERSION_4).unwrap();
+        assert_eq!(back.pw_max_fail, 6);
+        assert_eq!(back.pw_failcnt_interval, 300);
+        assert_eq!(back.pw_lockout_duration, 900);
+        assert_eq!(back.max_life, 86_400);
+        assert_eq!(back.max_renewable_life, 604_800);
+        assert_eq!(back.allowed_keysalts, "aes256-cts-hmac-sha1-96");
+    }
+
+    /// The masks are checked, not trusted: `addpol` without the name bit names nothing, and
+    /// `modpol` with no bit at all asks for no change.
+    #[test]
+    fn a_policy_mask_that_asks_for_nothing_is_refused() {
+        assert!(!policy_create_mask_ok(0), "no name bit");
+        assert!(policy_create_mask_ok(policy_mask::POLICY));
+        // A field this server has no column for is refused rather than dropped.
+        assert!(!policy_create_mask_ok(policy_mask::POLICY | 0x0000_0001));
+
+        assert!(
+            !policy_modify_mask_ok(0),
+            "an empty modify asks for nothing"
+        );
+        assert!(policy_modify_mask_ok(policy_mask::PW_MAX_LIFE));
+        assert!(!policy_modify_mask_ok(0x0000_0001), "a bit nothing models");
+    }
+
     #[test]
     fn a_modify_carries_only_the_fields_its_mask_names() {
         let (principal, change) = decode_modify(&modify_args(
@@ -785,13 +1052,10 @@ mod tests {
         );
     }
 
-    /// A mask bit this server cannot honour is refused by name rather than ignored — including the
-    /// policy bits, while policies are unmodelled.
+    /// A mask bit this server cannot honour is refused by name rather than ignored.
     #[test]
     fn a_mask_bit_this_server_cannot_honour_is_refused() {
         for bit in [
-            mask::POLICY,
-            mask::POLICY_CLR,
             0x0000_0008, // LAST_PWD_CHANGE
             0x0000_0040, // MOD_TIME
             0x0001_0000, // FAIL_AUTH_COUNT
@@ -803,6 +1067,24 @@ mod tests {
                 "mask bit {bit:#x} must be refused"
             );
         }
+    }
+
+    /// The two policy bits are opposites, and a request that carries both asks for two states at
+    /// once: refused, not resolved by whichever is read second.
+    #[test]
+    fn the_two_policy_bits_cannot_both_be_set() {
+        assert_eq!(
+            decode_modify(&modify_args(mask::POLICY | mask::POLICY_CLR, 0, 0, 0)).unwrap_err(),
+            BAD_MASK
+        );
+        // `-policy` with no name in the record names nothing, which is `KADM5_BAD_POLICY`.
+        assert_eq!(
+            decode_modify(&modify_args(mask::POLICY, 0, 0, 0)).unwrap_err(),
+            BAD_POLICY
+        );
+        // `-clearpolicy` needs no name, and says "off".
+        let (_, change) = decode_modify(&modify_args(mask::POLICY_CLR, 0, 0, 0)).unwrap();
+        assert_eq!(change.policy, Some(None));
     }
 
     /// The attribute word is a set, and every switch this server models is written from it — the

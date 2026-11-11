@@ -152,9 +152,16 @@ impl<'de> Deserialize<'de> for Modify {
             postdated: Option<bool>,
             #[serde(default)]
             kvno: Option<u32>,
+            #[serde(
+                default,
+                skip_serializing_if = "Option::is_none",
+                with = "double_option"
+            )]
+            policy: Option<Option<String>>,
         }
         let fields = Fields::deserialize(deserializer)?;
         Ok(Modify {
+            policy: fields.policy,
             invalid: fields.invalid,
             locked_out: fields.locked_out,
             valid_end: fields.valid_end,
@@ -218,6 +225,25 @@ impl Serialize for Operation {
                 out.serialize_field("principal", principal)?;
                 out.serialize_field("password", &Base64(password))?;
             }
+            Operation::CreatePolicy { policy } => {
+                out.serialize_field("operation", "create_policy")?;
+                out.serialize_field("policy", policy)?;
+            }
+            Operation::ModifyPolicy { policy } => {
+                out.serialize_field("operation", "modify_policy")?;
+                out.serialize_field("policy", policy)?;
+            }
+            Operation::DeletePolicy { name } => {
+                out.serialize_field("operation", "delete_policy")?;
+                out.serialize_field("name", name)?;
+            }
+            Operation::Policy { name } => {
+                out.serialize_field("operation", "policy")?;
+                out.serialize_field("name", name)?;
+            }
+            Operation::Policies => {
+                out.serialize_field("operation", "policies")?;
+            }
             Operation::Strings { principal } => {
                 out.serialize_field("operation", "strings")?;
                 out.serialize_field("principal", principal)?;
@@ -272,6 +298,19 @@ impl<'de> Deserialize<'de> for Operation {
                 from: crate::name::Principal,
                 to: crate::name::Principal,
             },
+            CreatePolicy {
+                policy: crate::hdb::Policy,
+            },
+            ModifyPolicy {
+                policy: crate::hdb::Policy,
+            },
+            DeletePolicy {
+                name: String,
+            },
+            Policy {
+                name: String,
+            },
+            Policies,
             Strings {
                 principal: crate::name::Principal,
             },
@@ -313,6 +352,11 @@ impl<'de> Deserialize<'de> for Operation {
             },
             Wire::Modify { principal, change } => Operation::Modify { principal, change },
             Wire::Rename { from, to } => Operation::Rename { from, to },
+            Wire::CreatePolicy { policy } => Operation::CreatePolicy { policy },
+            Wire::ModifyPolicy { policy } => Operation::ModifyPolicy { policy },
+            Wire::DeletePolicy { name } => Operation::DeletePolicy { name },
+            Wire::Policy { name } => Operation::Policy { name },
+            Wire::Policies => Operation::Policies,
             Wire::Strings { principal } => Operation::Strings { principal },
             Wire::SetString {
                 principal,
@@ -415,6 +459,14 @@ impl Serialize for Reply {
             Reply::Modified { entry } => {
                 map.serialize_entry("reply", "modified")?;
                 map.serialize_entry("entry", entry)?;
+            }
+            Reply::Policy { policy } => {
+                map.serialize_entry("reply", "policy")?;
+                map.serialize_entry("policy", policy)?;
+            }
+            Reply::Policies { names } => {
+                map.serialize_entry("reply", "policies")?;
+                map.serialize_entry("names", names)?;
             }
             Reply::Strings { strings } => {
                 map.serialize_entry("reply", "strings")?;

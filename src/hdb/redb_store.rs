@@ -25,6 +25,7 @@ use crate::name::Principal;
 
 use crate::acl::{AclRule, AclStore, Targets};
 
+use super::policy::Policy;
 use super::record;
 use super::{Hdb, HdbEntry};
 
@@ -44,6 +45,12 @@ const ACL: TableDefinition<'_, &'static str, &'static [u8]> = TableDefinition::n
 /// own principal and its own keys, and this table only says which entry to fetch.
 const ALIASES: TableDefinition<'_, &'static str, &'static str> =
     TableDefinition::new("hdb_aliases");
+
+/// `policy name` → the policy, DER-encoded by [`super::policy`]. Same file as the principals for
+/// the reason the ACL is: a backup that restores accounts without the rules they were made under
+/// restores a realm whose passwords suddenly have no length limit, and nothing says so.
+const POLICIES: TableDefinition<'_, &'static str, &'static [u8]> =
+    TableDefinition::new("hdb_policies");
 
 /// The `hdb` interface over a redb file.
 #[derive(Debug)]
@@ -66,6 +73,7 @@ impl RedbHdb {
             txn.open_table(ENTRIES).map_err(store_err)?;
             txn.open_table(ACL).map_err(store_err)?;
             txn.open_table(ALIASES).map_err(store_err)?;
+            txn.open_table(POLICIES).map_err(store_err)?;
         }
         txn.commit().map_err(store_err)?;
         Ok(RedbHdb { db, path })
@@ -112,6 +120,50 @@ impl Hdb for RedbHdb {
 
     fn fetch_for_service(&self, service: &Principal) -> Result<Option<HdbEntry>> {
         self.resolve(service)
+    }
+
+    fn fetch_policy(&self, name: &str) -> Result<Option<Policy>> {
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(POLICIES).map_err(store_err)?;
+        match table.get(name).map_err(store_err)? {
+            None => Ok(None),
+            Some(value) => Ok(Some(Policy::decode(value.value())?)),
+        }
+    }
+
+    fn store_policy(&self, policy: Policy) -> Result<()> {
+        let name = policy.name.clone();
+        let bytes = policy.encode();
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(POLICIES).map_err(store_err)?;
+            table
+                .insert(name.as_str(), bytes.as_slice())
+                .map_err(store_err)?;
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn remove_policy(&self, name: &str) -> Result<bool> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let removed = {
+            let mut table = txn.open_table(POLICIES).map_err(store_err)?;
+            table.remove(name).map_err(store_err)?.is_some()
+        };
+        txn.commit().map_err(store_err)?;
+        Ok(removed)
+    }
+
+    fn policies(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(POLICIES).map_err(store_err)?;
+        let mut names = Vec::new();
+        for row in table.iter().map_err(store_err)? {
+            let (name, _) = row.map_err(store_err)?;
+            names.push(name.value().to_owned());
+        }
+        Ok(names)
     }
 
     fn store(&self, entry: HdbEntry) -> Result<()> {

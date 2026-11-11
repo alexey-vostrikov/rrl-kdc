@@ -147,6 +147,10 @@ pub enum Error {
     /// The database could not be read or written.
     Hdb(String),
 
+    #[error("password policy: {0}")]
+    /// The password breaks a rule of the policy its principal is under.
+    PasswordPolicy(#[from] crate::hdb::policy::Breach),
+
     #[error("config: {0}")]
     /// The configuration is wrong: an unimplemented option, a bad enctype name.
     Config(String),
@@ -293,6 +297,10 @@ impl Error {
             // Neither of these is a protocol answer: a create that collided and a
             // refused right both mean the realm's policy said no.
             Error::Exists(_) | Error::Forbidden(_) => KDC_ERR_POLICY,
+            // A password a policy refuses is a request the realm's policy said no to, in the KDC's
+            // own vocabulary — this error never reaches a ticket exchange, but the code keeps a
+            // single mapping rather than a branch that panics on the one path nobody expected.
+            Error::PasswordPolicy(_) => KDC_ERR_POLICY,
             Error::Kdc { code, .. } => *code,
             Error::Preauth { code, .. } => *code,
             Error::PreauthFailed(_) => KDC_ERR_PREAUTH_FAILED,
@@ -343,6 +351,9 @@ impl Error {
             Error::UnknownPrincipal(_) | Error::NotFound(_) => "not_found",
             Error::Exists(_) => "already_exists",
             Error::Forbidden(_) => "forbidden",
+            // Its own kind, and not "forbidden": the caller may change the password and try
+            // again, which is a different answer from "you are not allowed".
+            Error::PasswordPolicy(_) => "password_policy",
             Error::Preauth { .. } | Error::PreauthFailed(_) => "preauth",
             Error::Kdc { .. } => "policy",
             Error::Skew { .. } => "clock_skew",

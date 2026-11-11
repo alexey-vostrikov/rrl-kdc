@@ -50,7 +50,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `admin::wire` — the operations as values, with the authorization in one place | done |
 | `admin::json` — the JSON form (feature `admin-json`) | done, for a REST front end to wrap |
 | `hdb::ldap` — an entry as directory attributes (feature `hdb-ldap`) | done: Heimdal's schema, plus the Microsoft spellings |
-| `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, modify, rename, chpass, chrand, get/set/del string attributes, extract_keys |
+| `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, modify, rename, chpass, chrand, get/set/del string attributes, extract_keys, and the five policy procedures |
 | `hdb::ad_blob` — `supplementalCredentials` (feature `hdb-ldap`) | done both ways: written as a projection, read back when `krb5Key` is absent |
 | `kdc::pac` — the privilege attribute certificate | done: envelope, `PAC_CLIENT_INFO`, `KERB_VALIDATION_INFO`, both signatures |
 | `kdc::logon_info` — NDR for `KERB_VALIDATION_INFO` | done: encoded by hand, checked by impacket and by a live client |
@@ -241,8 +241,19 @@ String attributes live in `HDB-Ext-Strings [16]`, an extension of this crate's o
 Heimdal has none (`setstr` is MIT's), and its `HDB-extension` CHOICE ends with `...`,
 so a Heimdal KDC reading such an entry skips what it does not know.
 
-Not implemented, and answered with an error rather than a fabricated success:
-policies.
+**Policies** are `kadm5_policy_ent_rec` records, stored in the same database as the principals and
+cited by name from an entry (`policy [12]`, Heimdal's own extension number). `addpol`, `getpol`,
+`listpols`, `modpol` and `delpol` all answer a stock client, `modprinc -policy` puts an entry under
+one, `getprinc` shows which, and a policy an entry cites cannot be deleted (`KADM5_POLICY_REF`) —
+counted at the delete, not kept as a number that could drift.
+
+What a policy *enforces* here is the password: length and character classes, checked before the keys
+are derived and reported as `KADM5_PASS_Q_TOOSHORT` / `KADM5_PASS_Q_CLASS`, which are two different
+fixes and therefore two different codes. What it does not yet enforce: `pw_min_life`, history
+(`pw_history_num` is stored and reported, and nothing reads it), the failed-authentication lock-out,
+and the ticket lifetimes (`max_life`, `max_renewable_life`), which the KDC still takes from the entry
+and its own configuration. Those are named here rather than implied by a field that is accepted and
+ignored.
 
 Not implemented in the exchanges either, and refused by name rather than half-done:
 

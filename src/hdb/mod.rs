@@ -23,6 +23,7 @@ pub mod ad_blob;
 pub mod keytab;
 #[cfg(feature = "hdb-ldap")]
 pub mod ldap;
+pub mod policy;
 pub mod record;
 #[cfg(feature = "hdb-redb")]
 pub mod redb_store;
@@ -30,6 +31,7 @@ pub mod redb_store;
 pub use keytab::Keytab;
 #[cfg(feature = "hdb-ldap")]
 pub use ldap::LdapHdb;
+pub use policy::Policy;
 #[cfg(feature = "hdb-redb")]
 pub use redb_store::RedbHdb;
 
@@ -202,6 +204,11 @@ pub struct HdbEntry {
     /// `Some(Aliases { case_insensitive: true, names: vec![] })` still matches
     /// `ALICE@REALM` for `alice@realm` while one with `None` does not.
     pub aliases: Option<Aliases>,
+    /// The policy this entry is governed by (`policy [12]` in Heimdal's `HDB-extension`), if any.
+    ///
+    /// A name, not a copy of the rules: a policy that changed must apply to every account under it
+    /// at once, which is the whole reason an operator names one instead of repeating the numbers.
+    pub policy: Option<String>,
     /// The principal's string attributes: `kadmin setstr` and `kadmin getstr`.
     ///
     /// MIT keeps these in its database under names an application chooses — `kpasswd_server`,
@@ -240,6 +247,7 @@ impl HdbEntry {
             modified: 0,
             constrained_delegation: None,
             aliases: None,
+            policy: None,
             strings: Vec::new(),
         }
     }
@@ -310,6 +318,7 @@ impl HdbEntry {
             modified: 0,
             constrained_delegation: None,
             aliases: None,
+            policy: None,
             strings: Vec::new(),
         }
     }
@@ -331,6 +340,7 @@ impl HdbEntry {
             modified: 0,
             constrained_delegation: None,
             aliases: None,
+            policy: None,
             strings: Vec::new(),
         }
     }
@@ -497,6 +507,59 @@ pub trait Hdb: Send + Sync + std::fmt::Debug {
 
     /// The principal after `after`, in the backend's order.
     fn next(&self, after: &Principal) -> Result<Option<Principal>>;
+
+    /// The policy called `name`, or `None`.
+    ///
+    /// A backend that has no notion of policies says so rather than answering `None`: "there is no
+    /// such policy" and "this directory cannot hold policies" are different facts, and a caller
+    /// that cannot tell them apart reports the second as the first.
+    fn fetch_policy(&self, name: &str) -> Result<Option<Policy>> {
+        Err(Error::Hdb(format!(
+            "this backend cannot store policies, so it has no policy {name}"
+        )))
+    }
+
+    /// Inserts or replaces a policy.
+    fn store_policy(&self, policy: Policy) -> Result<()> {
+        Err(Error::Hdb(format!(
+            "this backend cannot store policies, so {} cannot be written",
+            policy.name
+        )))
+    }
+
+    /// Removes a policy; returns whether there was one.
+    fn remove_policy(&self, name: &str) -> Result<bool> {
+        Err(Error::Hdb(format!(
+            "this backend cannot store policies, so {name} cannot be removed"
+        )))
+    }
+
+    /// Every policy's name, in the backend's order.
+    fn policies(&self) -> Result<Vec<String>> {
+        Err(Error::Hdb(
+            "this backend cannot store policies, so it lists none".into(),
+        ))
+    }
+
+    /// How many entries name `policy`.
+    ///
+    /// Counted rather than kept as a number: a counter that is incremented on one path and missed on
+    /// another reports a policy as free while an entry still cites it, and the delete that follows
+    /// leaves that entry pointing at nothing. The default walks the backend, which is what a
+    /// database this size can afford; a backend with an index overrides it.
+    fn policy_refcount(&self, policy: &str) -> Result<u32> {
+        let mut count = 0;
+        let mut cursor = self.first()?;
+        while let Some(name) = cursor {
+            if let Some(entry) = self.fetch(&name)?
+                && entry.policy.as_deref() == Some(policy)
+            {
+                count += 1;
+            }
+            cursor = self.next(&name)?;
+        }
+        Ok(count)
+    }
 }
 
 /// `p` with every component and its realm in lower case: how a case-insensitive alias is
@@ -519,6 +582,8 @@ pub struct MemoryHdb {
     /// map probe rather than a walk over every entry. Rebuilt for one entry on every store,
     /// remove and rename; `case-insensitive` aliases are entered in both spellings.
     aliases: RwLock<BTreeMap<Principal, Principal>>,
+    /// The policies, by name.
+    policies: RwLock<BTreeMap<String, Policy>>,
 }
 
 impl MemoryHdb {
@@ -595,6 +660,37 @@ impl MemoryHdb {
 }
 
 impl Hdb for MemoryHdb {
+    fn fetch_policy(&self, name: &str) -> Result<Option<Policy>> {
+        Ok(self.policies.read().expect("policies").get(name).cloned())
+    }
+
+    fn store_policy(&self, policy: Policy) -> Result<()> {
+        self.policies
+            .write()
+            .expect("policies")
+            .insert(policy.name.clone(), policy);
+        Ok(())
+    }
+
+    fn remove_policy(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .policies
+            .write()
+            .expect("policies")
+            .remove(name)
+            .is_some())
+    }
+
+    fn policies(&self) -> Result<Vec<String>> {
+        Ok(self
+            .policies
+            .read()
+            .expect("policies")
+            .keys()
+            .cloned()
+            .collect())
+    }
+
     fn fetch(&self, principal: &Principal) -> Result<Option<HdbEntry>> {
         self.resolve(principal)
     }

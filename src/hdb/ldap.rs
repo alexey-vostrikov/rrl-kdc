@@ -452,6 +452,9 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
         // Aliases live in an HDB extension, and a directory keeps its own (`spn`, `aliases` in
         // AD are attributes this backend reads as service names, not as Heimdal's extension).
         aliases: None,
+        // A policy is a name in an HDB extension; a directory keeps its own idea of account
+        // rules, and reading nothing here is honest about which one governs the entry.
+        policy: None,
         strings: Vec::new(),
         valid_start: attributes.time(attrs::VALID_START, &name)?,
         valid_end: attributes.time(attrs::VALID_END, &name)?,

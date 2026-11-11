@@ -139,7 +139,7 @@ impl Kadmin {
         actor: &Principal,
         call: &Call,
         args: &[u8],
-        _version: u32,
+        version: u32,
     ) -> std::result::Result<Vec<u8>, u32> {
         if call.prog != kadm5::PROG || call.vers != kadm5::VERS {
             return Err(kadm5::UNK_PROC);
@@ -233,6 +233,98 @@ impl Kadmin {
                     status_of(e)
                 })?;
                 Ok(Vec::new())
+            }
+            kadm5::CREATE_POLICY => {
+                self.require(actor, Right::Create)?;
+                let (policy, mask) =
+                    kadm5::decode_policy_request(args, version).inspect_err(|status| {
+                        log_refusal(&format!(
+                            "create_policy: the request was refused ({status})"
+                        ));
+                    })?;
+                if !kadm5::policy_create_mask_ok(mask) {
+                    return Err(kadm5::BAD_MASK);
+                }
+                self.admin.create_policy(policy).map_err(|e| {
+                    log_refusal(&format!("create_policy: {e}"));
+                    status_of(e)
+                })?;
+                Ok(Vec::new())
+            }
+            kadm5::MODIFY_POLICY => {
+                self.require(actor, Right::Modify)?;
+                let (policy, mask) =
+                    kadm5::decode_policy_request(args, version).inspect_err(|status| {
+                        log_refusal(&format!(
+                            "modify_policy: the request was refused ({status})"
+                        ));
+                    })?;
+                if !kadm5::policy_modify_mask_ok(mask) {
+                    return Err(kadm5::BAD_MASK);
+                }
+                self.admin.modify_policy(policy).map_err(|e| {
+                    log_refusal(&format!("modify_policy: {e}"));
+                    status_of_policy(e)
+                })?;
+                Ok(Vec::new())
+            }
+            kadm5::DELETE_POLICY => {
+                self.require(actor, Right::Delete)?;
+                let name = kadm5::decode_policy_name(args).inspect_err(|status| {
+                    log_refusal(&format!(
+                        "delete_policy: the request was refused ({status})"
+                    ));
+                })?;
+                let existed = self.admin.delete_policy(&name).map_err(|e| {
+                    log_refusal(&format!("delete_policy {name}: {e}"));
+                    match e {
+                        // A policy an entry cites is a policy nobody may delete yet, and MIT has
+                        // a code for exactly that state.
+                        Error::Forbidden(_) => kadm5::POLICY_REF,
+                        other => status_of_policy(other),
+                    }
+                })?;
+                if !existed {
+                    return Err(kadm5::UNK_POLICY);
+                }
+                Ok(Vec::new())
+            }
+            kadm5::GET_POLICY => {
+                self.require(actor, Right::Read)?;
+                let name = kadm5::decode_policy_name(args).inspect_err(|status| {
+                    log_refusal(&format!("get_policy: the request was refused ({status})"));
+                })?;
+                let policy = self
+                    .admin
+                    .fetch_policy(&name)
+                    .map_err(status_of_policy)?
+                    .ok_or(kadm5::UNK_POLICY)?;
+                Ok(kadm5::encode_policy(&policy, version))
+            }
+            kadm5::GET_POLS => {
+                self.require(actor, Right::List)?;
+                let mut r = Reader::new(args);
+                let _ = r.u32();
+                let glob = r
+                    .nullstring()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "*".to_owned());
+                let names: Vec<String> = self
+                    .admin
+                    .policies()
+                    .map_err(status_of_policy)?
+                    .into_iter()
+                    .filter(|name| glob_matches(&glob, name))
+                    .collect();
+                let mut out = Writer::new();
+                // The same two counts every list in this protocol carries.
+                out.i32(names.len() as i32);
+                out.u32(names.len() as u32);
+                for name in &names {
+                    out.nullstring(Some(name));
+                }
+                Ok(out.into_bytes())
             }
             kadm5::EXTRACT_KEYS => {
                 // A stronger right than `Keytab`: the caller keeps the keys, so this is the one
@@ -653,11 +745,36 @@ fn unwrap_initial_context_token(token: &[u8]) -> Result<&[u8]> {
 }
 
 /// The `kadm5` status for a crate failure.
+/// The `kadm5` code for a policy refusal.
+///
+/// Policies answer with their own codes: `KADM5_UNK_POLICY` for a name that is not there and
+/// `KADM5_DUP` for one that already is — the same `DUP` an existing principal gets, because MIT
+/// keeps both in one namespace of "already taken".
+fn status_of_policy(error: Error) -> u32 {
+    match error {
+        Error::NotFound(_) => kadm5::UNK_POLICY,
+        Error::Exists(_) => kadm5::DUP,
+        Error::Forbidden(_) => kadm5::POLICY_REF,
+        // A policy whose own numbers contradict each other is a bad mask-bit's worth of "you
+        // asked for something no record can hold".
+        Error::Config(_) => kadm5::BAD_MASK,
+        other => status_of(other),
+    }
+}
+
 fn status_of(error: Error) -> u32 {
     match error {
         Error::NotFound(_) => kadm5::UNK_PRINC,
         Error::Exists(_) => kadm5::DUP,
         Error::Forbidden(_) => kadm5::AUTH_INSUFFICIENT,
+        // The password rules are reported as the two codes an operator can act on: a length and a
+        // class count are different fixes.
+        Error::PasswordPolicy(crate::hdb::policy::Breach::TooShort { .. }) => {
+            kadm5::PASS_Q_TOOSHORT
+        }
+        Error::PasswordPolicy(crate::hdb::policy::Breach::TooFewClasses { .. }) => {
+            kadm5::PASS_Q_CLASS
+        }
         _ => kadm5::FAILURE,
     }
 }

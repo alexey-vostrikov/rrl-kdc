@@ -291,6 +291,31 @@ pub enum Operation {
         /// Its value; `None` deletes the attribute, which is MIT's `delstr`.
         value: Option<String>,
     },
+    /// Create a policy.
+    CreatePolicy {
+        /// The rules.
+        ///
+        /// Fully qualified because `Policy` in this module is the authorization trait — two
+        /// things called a policy, and only one of them is a record.
+        policy: crate::hdb::Policy,
+    },
+    /// Replace an existing policy.
+    ModifyPolicy {
+        /// The rules, under the name it already has.
+        policy: crate::hdb::Policy,
+    },
+    /// Remove a policy.
+    DeletePolicy {
+        /// Its name.
+        name: String,
+    },
+    /// Read one policy.
+    Policy {
+        /// Its name.
+        name: String,
+    },
+    /// Every policy's name.
+    Policies,
     /// Read a principal's string attributes.
     Strings {
         /// Whose.
@@ -325,6 +350,12 @@ impl Operation {
             Operation::Rename { from, .. } => (Right::Modify, Some(from)),
             // String attributes are metadata like any other, so the same two rights cover them:
             // reading needs `Read`, changing needs `Modify`.
+            // A policy is realm-wide: it has no principal to name, so the right is checked against
+            // the realm and not against a target.
+            Operation::CreatePolicy { .. } => (Right::Create, None),
+            Operation::ModifyPolicy { .. } => (Right::Modify, None),
+            Operation::DeletePolicy { .. } => (Right::Delete, None),
+            Operation::Policy { .. } | Operation::Policies => (Right::List, None),
             Operation::Strings { principal } => (Right::Read, Some(principal)),
             Operation::SetString { principal, .. } => (Right::Modify, Some(principal)),
             Operation::Delete { principal } => (Right::Delete, Some(principal)),
@@ -415,6 +446,16 @@ pub enum Reply {
     Modified {
         /// What it looks like now.
         entry: EntryView,
+    },
+    /// A policy, as it now stands.
+    Policy {
+        /// The rules.
+        policy: crate::hdb::Policy,
+    },
+    /// The realm's policies, by name.
+    Policies {
+        /// Their names.
+        names: Vec<String>,
     },
     /// A principal's string attributes.
     Strings {
@@ -527,6 +568,29 @@ impl Admin {
             }
             Operation::Modify { principal, change } => Ok(Reply::Modified {
                 entry: EntryView::of(&self.modify(&principal, change)?),
+            }),
+            Operation::CreatePolicy { policy } => Ok(Reply::Policy {
+                policy: self.create_policy(policy)?,
+            }),
+            Operation::ModifyPolicy { policy } => Ok(Reply::Policy {
+                policy: self.modify_policy(policy)?,
+            }),
+            Operation::DeletePolicy { name } => {
+                // A policy that is not there is not an error here for the same reason an absent
+                // principal is not: the caller asked for an end state and got it. What it gets
+                // back is the list that remains, which says so without a second call.
+                self.delete_policy(&name)?;
+                Ok(Reply::Policies {
+                    names: self.policies()?,
+                })
+            }
+            Operation::Policy { name } => Ok(Reply::Policy {
+                policy: self
+                    .fetch_policy(&name)?
+                    .ok_or_else(|| Error::NotFound(format!("no policy {name}")))?,
+            }),
+            Operation::Policies => Ok(Reply::Policies {
+                names: self.policies()?,
             }),
             Operation::Strings { principal } => Ok(Reply::Strings {
                 strings: self.strings(&principal)?,

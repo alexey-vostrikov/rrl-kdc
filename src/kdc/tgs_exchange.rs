@@ -34,10 +34,10 @@ use crate::msg::{
 };
 use crate::name::Principal;
 
+use super::Kdc;
 use super::as_exchange::Purpose;
 use super::config::TransitedPolicy;
 use super::transited;
-use super::{Kdc, wrong_realm};
 
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
@@ -176,6 +176,17 @@ fn badoption(why: &str) -> Error {
         code: codes::KDC_ERR_BADOPTION,
         text: why.into(),
     }
+}
+
+/// The realm itself and then its ancestors, longest first: `DEV.EXAMPLE.COM` gives
+/// `DEV.EXAMPLE.COM`, `EXAMPLE.COM`, `COM`.
+///
+/// This is the candidate order for a referral (RFC 6806 §8) and nothing more: the realm named by
+/// the request is the best hop when a direct trust exists, and each ancestor is one step closer to
+/// the top of the hierarchy the two realms share.
+fn hierarchy_of(realm: &str) -> Vec<String> {
+    let labels: Vec<&str> = realm.split('.').collect();
+    (0..labels.len()).map(|i| labels[i..].join(".")).collect()
 }
 
 /// The `transited` field of the presented TGT, before its contents are read.
@@ -431,12 +442,24 @@ impl Kdc {
         // The PA-DATA a reply may answer: the inner one under FAST, the outer one otherwise.
         let padata = received.padata;
         let config = self.config();
-        if body.realm != config.realm() {
-            return Err(wrong_realm(&body.realm, config.realm()));
-        }
+        // The realm in a TGS request is the *server's* realm, not this KDC's (RFC 4120 §5.4.1,
+        // field [2]: "the realm part of the server's principal identifier"). A client asking a KDC
+        // for a service in another realm puts that realm here, which is how RFC 6806 §8 referrals
+        // begin — "C: TGS-REQ sname=http/foo.dev.example.com +NC to ADMIN.EXAMPLE.COM" — so a
+        // realm that is not ours is a name to resolve, not a request to refuse. Refusing here would
+        // answer the first hop of every referral chain with `KDC_ERR_WRONG_REALM` and leave the
+        // mechanism unreachable however well the rest of it is written.
+        //
+        // The AS exchange keeps its own check (`as_exchange.rs`): there the realm is the client's,
+        // and a client from another realm has no business asking this one for a TGT.
+
+        // The `transited` field of the evidence is read before anything is issued on it: an
+        // encoding this KDC does not know would otherwise be copied into the reply, and a refusal
+        // for the real reason is cheaper than a path nobody can verify.
+        check_transited_type(&proven.tgt)?;
 
         // The service the client asked for.
-        let sname = body
+        let mut sname = body
             .sname
             .clone()
             .ok_or_else(|| Error::Protocol("TGS-REQ without a service name".into()))?;
@@ -448,13 +471,26 @@ impl Kdc {
         // `servicePrincipalName`, and a client asks for the latter — the ticket is
         // then sealed with `HOST$`'s key while naming `cifs/host` (that is what
         // [MS-ADTS] does, and what Samba needs to join).
-        let server = self
-            .hdb()
-            .fetch_for_service(&sname)?
-            .ok_or_else(|| Error::Kdc {
-                code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
-                text: format!("{sname} is not a service in this realm"),
-            })?;
+        //
+        // A name this realm does not hold is not always a refusal: RFC 6806 §8 lets a KDC answer
+        // with a cross-realm TGT toward the realm that may, and the client walks the chain itself.
+        // That answer is a ticket to `krbtgt/HOP@OURREALM`, so it is a rewrite of the name the
+        // rest of this exchange works with rather than a separate reply path.
+        let server = match self.hdb().fetch_for_service(&sname)? {
+            Some(server) => server,
+            None => match self.referral(&sname, &proven, body)? {
+                Some((hop, entry)) => {
+                    sname = hop;
+                    entry
+                }
+                None => {
+                    return Err(Error::Kdc {
+                        code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                        text: format!("{sname} is not a service in this realm"),
+                    });
+                }
+            },
+        };
         if !server.has(entry_flags::SERVER) {
             return Err(Error::Kdc {
                 code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
@@ -612,12 +648,7 @@ impl Kdc {
         // is neither the client's nor the server's, so an ordinary ticket in this realm carries an
         // empty path and a ticket from A to B through C carries `C`.
         //
-        // The type is checked before the contents are read: RFC 4120 defines one type
-        // (`DOMAIN-X500-COMPRESS`), and type 0 is admitted only when it is empty, which is what
-        // Microsoft's TGTs carry. Heimdal answers `TRTYPE_NOSUPP` for anything else rather than
-        // guessing at an encoding it does not know — a path read wrongly is a ticket accepted on a
-        // route that never existed.
-        check_transited_type(&proven.tgt)?;
+        // The type of the field was checked when the request came in, before any name was resolved.
         let path = transited::path_with_transit(
             &proven.tgt.transited,
             &crealm,
@@ -1119,6 +1150,76 @@ impl Kdc {
         }))
     }
 
+    /// The realm to send a client to when this KDC cannot answer for the name it asked for.
+    ///
+    /// RFC 6806 §8: "If the canonicalize flag in the KDC options is set and the KDC doesn't find
+    /// the principal locally ... the KDC MAY return a cross-realm ticket-granting ticket to the
+    /// next hop on the trust path towards a realm that may be able to resolve the principal name."
+    /// The client then walks the chain itself, and what this KDC issues is an ordinary
+    /// cross-realm TGT — `krbtgt/HOP@OURREALM`, sealed in the key the two realms share — so the
+    /// referral is a rewrite of the name the rest of the exchange works with, not a second reply
+    /// path.
+    ///
+    /// The hop comes from the DNS hierarchy, because this crate is a library: it has no
+    /// `[domain_realm]` to resolve a host name and no `[capaths]` to override one, and the
+    /// embedder owns that configuration. The candidates are the realm the request names and then
+    /// its ancestors, longest first; the first one this database holds as `krbtgt/X@OURREALM` wins.
+    /// Naming the target itself is what lets a realm with a direct trust answer in one hop, and
+    /// naming an ancestor is what lets a realm in the middle of a hierarchy hand the client on.
+    ///
+    /// No referral is issued when the client did not set `canonicalize` (RFC 6806 §3 requires it,
+    /// because the reply then names a principal other than the one asked for), when the target is
+    /// this realm (there is nothing to refer to), or when the hop would go back to where the
+    /// evidence came from — the client's realm, the issuer of its TGT, or a realm already on the
+    /// transited path. A KDC that answers A→B with a ticket back to A hands the client a loop it can
+    /// only leave by giving up.
+    fn referral(
+        &self,
+        sname: &Principal,
+        proven: &Proven,
+        body: &KdcReqBody,
+    ) -> Result<Option<(Principal, HdbEntry)>> {
+        if body.kdc_options & kdc_options::CANONICALIZE == 0 {
+            return Ok(None);
+        }
+        // `krbtgt/X@OURREALM` names X in its second component; a service names its realm in
+        // `realm`. The two spellings of "where this name lives" differ, and reading the wrong one
+        // would send the client to the realm it is already in.
+        let target = if sname.is_krbtgt() {
+            match sname.components.get(1) {
+                Some(realm) => realm.clone(),
+                None => return Ok(None),
+            }
+        } else {
+            sname.realm.clone()
+        };
+        let our_realm = self.config().realm();
+        if target.is_empty() || target == our_realm {
+            return Ok(None);
+        }
+
+        let already = transited::decode(&proven.tgt.transited, &proven.tgt.crealm, &target)
+            .unwrap_or_default();
+        for hop in hierarchy_of(&target) {
+            if hop == our_realm
+                || hop == proven.tgt.crealm
+                || hop == proven.tgt_issuer
+                || already.contains(&hop)
+            {
+                continue;
+            }
+            let name = Principal {
+                name_type: crate::name::NT_SRV_INST,
+                components: vec!["krbtgt".to_owned(), hop],
+                realm: our_realm.to_owned(),
+            };
+            if let Some(entry) = self.hdb().fetch(&name)? {
+                return Ok(Some((name, entry)));
+            }
+        }
+        Ok(None)
+    }
+
     /// The key a user-to-user ticket is sealed in, when the request asked for
     /// one: the session key of the ticket in `additional-tickets`.
     ///
@@ -1429,4 +1530,22 @@ fn first_ticket(encoded: &[u8]) -> Result<Vec<u8>> {
     crate::der::encode_len(&mut out, tlv.content.len());
     out.extend_from_slice(tlv.content);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The candidate order for a referral: the realm named by the request, then its ancestors.
+    /// A KDC that offered the ancestors first would send a client to the top of the tree and back
+    /// down for a service it could have reached in one hop.
+    #[test]
+    fn the_referral_candidates_run_from_the_realm_upwards() {
+        assert_eq!(
+            hierarchy_of("DEV.EXAMPLE.COM"),
+            vec!["DEV.EXAMPLE.COM", "EXAMPLE.COM", "COM"]
+        );
+        assert_eq!(hierarchy_of("EXAMPLE.COM"), vec!["EXAMPLE.COM", "COM"]);
+        assert_eq!(hierarchy_of("REALM"), vec!["REALM"]);
+    }
 }

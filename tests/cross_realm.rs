@@ -6,11 +6,9 @@
 //! half that was missing: the ticket's issuing realm is A, its service realm is B, and B has to
 //! accept it and find the key in a database entry that does not carry its own name.
 //!
-//! What is deliberately not here: the `transited` path across a third realm. Writing it needs the
-//! realm Heimdal calls `tgt_realm`, and its definition (`kdc/krb5tgs.c:1363`, the realm of the
-//! `krbtgt` entry that decrypted the ticket) gives a different answer from the ticket's own name
-//! for a relayed path. Until that is settled against a live two-hop exchange, the path is left
-//! empty here rather than guessed at.
+//! The `transited` path across a third realm is not here: it needs two KDCs in a row, and lives in
+//! `cross_realm_chain.rs`, which walks it over sockets. What this file holds is the accepting half
+//! — a ticket another realm issued, and what this one does with it.
 
 mod common;
 
@@ -118,7 +116,7 @@ fn tgs_req(ticket: &[u8], session_key: &Key, target: &Principal, cname: &Princip
     let cipher = OwnCipher;
     let body = der::seq(&[
         der::field(0, der::flags32(0)),
-        der::field(2, der::general_string(B)),
+        der::field(2, der::general_string(&target.realm)),
         der::field(3, target.encode_name()),
         der::field(5, der::time(NOW + 3600)),
         der::field(7, der::int(0x4242)),
@@ -273,29 +271,49 @@ fn a_ticket_sealed_in_an_unknown_key_is_refused() {
     );
 }
 
-/// The body's realm is still checked: a request that names a realm this KDC does not serve is a
-/// `WRONG_REALM`, and accepting a cross-realm ticket does not loosen that.
+/// A realm this KDC cannot reach gets no ticket and no referral: the body names where the server
+/// lives (RFC 4120 §5.4.1 field [2]), and a name this realm neither holds nor can hand on is a
+/// refusal, not an answer for somebody else's realm.
 #[test]
-fn a_request_for_another_realm_still_gets_wrong_realm() {
+fn a_name_in_a_realm_this_kdc_cannot_reach_is_refused() {
     let (db, shared) = realm_b();
     let kdc = kdc_b(db);
     let user = Principal::parse(&format!("alice@{A}")).unwrap();
     let (ticket, session_key) = tgt_from_a(&user, &shared);
 
-    // The target is in B, but the body says the request is for A.
-    let body_realm = A.to_owned();
-    let _ = body_realm;
+    let elsewhere = Principal::parse("cifs/files@FOREIGN.REALM").unwrap();
+    let reply = kdc.handle_from(
+        &tgs_req(&ticket, &session_key, &elsewhere, &user),
+        NOW,
+        None,
+    );
+    let err = msg::KrbError::decode(&reply).expect("a refusal is a KRB-ERROR");
+    assert_eq!(
+        err.code,
+        rrl_kdc::error::codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+        "no trust, no hierarchy, no referral — and the code says which"
+    );
+}
+
+/// A body rewritten in flight fails its checksum before any name is looked at: the checksum is
+/// over the octets as sent, and a KDC that decoded and re-encoded the body would verify its own
+/// re-encoding and accept the tampering.
+#[test]
+fn a_body_rewritten_in_flight_fails_the_checksum() {
+    let (db, shared) = realm_b();
+    let kdc = kdc_b(db);
+    let user = Principal::parse(&format!("alice@{A}")).unwrap();
+    let (ticket, session_key) = tgt_from_a(&user, &shared);
+
     let mut req = tgs_req(&ticket, &session_key, &service_in_b(), &user);
-    // Rewrite the body realm in place: same length, so the DER stays valid and the checksum over
-    // the body now disagrees — which the KDC must notice before it ever looks at the realm.
-    let a = A.as_bytes();
-    let b = B.as_bytes();
+    // The same length, so the DER stays valid; only the octets the client signed change.
     let at = req
-        .windows(b.len())
-        .position(|w| w == b)
+        .windows(B.len())
+        .position(|w| w == B.as_bytes())
         .expect("the body carries the realm");
-    req[at..at + a.len()].copy_from_slice(a);
+    req[at..at + A.len()].copy_from_slice(A.as_bytes());
 
     let reply = kdc.handle_from(&req, NOW, None);
-    assert!(!succeeded(&reply), "a request for another realm is refused");
+    let err = msg::KrbError::decode(&reply).expect("a refusal");
+    assert_eq!(err.code, rrl_kdc::error::codes::KRB_AP_ERR_MODIFIED);
 }

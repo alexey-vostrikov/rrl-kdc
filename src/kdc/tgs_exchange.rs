@@ -265,7 +265,7 @@ fn service_plan(
     // `renewable-ok`: the client would rather have a renewable ticket than a short one. Heimdal
     // honours it here only when the TGT is renewable — a request that could not be renewed is not
     // made renewable by asking, since the client would be handed a flag its TGT does not support.
-    let renewable_ok = body.kdc_options & super::RENEWABLE_OK != 0
+    let renewable_ok = body.kdc_options & crate::msg::kdc_options::RENEWABLE_OK != 0
         && tgt_flags & tkt_flags::RENEWABLE != 0
         && endtime < super::till_of(body);
     let renewable = body.kdc_options & kdc_options::RENEWABLE != 0 || renewable_ok;

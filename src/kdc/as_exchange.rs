@@ -902,7 +902,7 @@ impl Kdc {
         let mut renewable = body.kdc_options & kdc_options::RENEWABLE != 0;
         let mut renew_till = renew_till(config, body, &client, &server, effective_start);
         if !renewable
-            && body.kdc_options & super::RENEWABLE_OK != 0
+            && body.kdc_options & crate::msg::kdc_options::RENEWABLE_OK != 0
             && endtime < super::till_of(body)
         {
             renewable = true;

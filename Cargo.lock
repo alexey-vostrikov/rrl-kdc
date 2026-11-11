@@ -583,6 +583,15 @@ dependencies = [
 
 [[package]]
 name = "md4"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da5ac363534dce5fabf69949225e174fbf111a498bf0ff794c8ea1fba9f3dda"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "md4"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
@@ -902,12 +911,13 @@ dependencies = [
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#20c04eb6212a22149cf7e49e1fe21850a3af042c"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#8e9acec24ac20b755aca00c2f99ca9048ef762a0"
 dependencies = [
  "aes",
  "getrandom 0.4.3",
  "hmac",
  "md-5",
+ "md4 0.10.2",
  "rskrb5",
  "serde",
  "sha1",
@@ -947,7 +957,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#12ae2bcd0c9263c768e6fd0c952e7cf317ab8d2b"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#912dda51c1746b98b90aa4c72e7a5f49afbbd828"
 dependencies = [
  "hmac",
  "rrl-crypto",
@@ -989,7 +999,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "md-5",
- "md4",
+ "md4 0.11.0",
  "pbkdf2",
  "rasn",
  "rasn-kerberos",

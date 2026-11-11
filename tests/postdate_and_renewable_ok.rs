@@ -17,7 +17,9 @@ use rrl_kdc::crypto::{Cipher, Enctype, Key, OwnCipher, usage};
 use rrl_kdc::der;
 use rrl_kdc::error::codes;
 use rrl_kdc::hdb::{HdbEntry, MemoryHdb, flags as entry_flags};
-use rrl_kdc::kdc::{Kdc, KdcConfig, RENEWABLE_OK};
+use rrl_kdc::kdc::{Kdc, KdcConfig};
+// `renewable-ok` is an RFC 4120 §5.4.1 option like every other one, so its mask lives with them.
+use rrl_kdc::msg::kdc_options::RENEWABLE_OK;
 use rrl_kdc::msg::{self, EncKdcRepPart, EncryptedData, encode_pa_data, kdc_options, tkt_flags};
 use rrl_kdc::name::Principal;
 

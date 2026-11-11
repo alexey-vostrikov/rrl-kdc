@@ -695,7 +695,15 @@ impl Kdc {
         } else {
             (None, proven.reply_key.clone())
         };
-        let plaintext = rep_part.encode(msg::ENC_TGS_REP_PART);
+        let mut plaintext = rep_part.encode(msg::ENC_TGS_REP_PART);
+        // CONTROL: Heimdal's own krb5.asn1 declares no EXPLICIT TAGS, so its decoder reads
+        // `[APPLICATION 26]` as implicit - the sequence's *contents* behind the tag, with no
+        // inner SEQUENCE. RFC 4120's module says EXPLICIT, which is what `encode` writes.
+        if std::env::var_os("KDC_TGS_IMPLICIT").is_some()
+            && let Some(stripped) = strip_inner_sequence(&plaintext)
+        {
+            plaintext = stripped;
+        }
         if std::env::var_os("KDC_TGS_DIAG").is_some() {
             eprintln!(
                 "tgs-diag: sname={sname} armor={} subkey={:?} reply_usage={} strengthened={} \
@@ -779,6 +787,47 @@ impl Kdc {
             ..rep
         }
         .encode())
+    }
+
+    /// Rewrites `tag len 30 len2 fields` as `tag len2 fields`.
+    ///
+    /// Only for the experiment: it is the difference between an ASN.1 module that says EXPLICIT
+    /// TAGS and one that leaves the default, IMPLICIT.
+    fn strip_inner_sequence(der: &[u8]) -> Option<Vec<u8>> {
+        fn tlv(b: &[u8], o: usize) -> Option<(u8, usize, usize)> {
+            let tag = *b.get(o)?;
+            let first = *b.get(o + 1)?;
+            if first & 0x80 == 0 {
+                Some((tag, o + 2, first as usize))
+            } else {
+                let n = (first & 0x7f) as usize;
+                let len = b.get(o + 2..o + 2 + n)?;
+                Some((
+                    tag,
+                    o + 2 + n,
+                    len.iter().fold(0usize, |a, b| a * 256 + *b as usize),
+                ))
+            }
+        }
+        fn header(len: usize) -> Vec<u8> {
+            if len < 0x80 {
+                vec![len as u8]
+            } else if len < 0x100 {
+                vec![0x81, len as u8]
+            } else {
+                vec![0x82, (len >> 8) as u8, len as u8]
+            }
+        }
+        let (tag, body, _len) = tlv(der, 0)?;
+        let (inner, i_body, i_len) = tlv(der, body)?;
+        if inner != 0x30 {
+            return None;
+        }
+        let fields = der.get(i_body..i_body + i_len)?;
+        let mut out = vec![tag];
+        out.extend(header(fields.len()));
+        out.extend_from_slice(fields);
+        Some(out)
     }
 
     /// Evaluates a protocol transition (S4U2Self), MS-SFU §3.1.

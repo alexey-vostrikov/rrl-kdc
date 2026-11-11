@@ -67,6 +67,9 @@ use crate::hdb::HdbEntry;
 /// The property name an AD-shaped reader looks for.
 pub const PROPERTY_KERBEROS_NEWER_KEYS: &str = "Primary:Kerberos-Newer-Keys";
 
+/// The account's NT hash, the value a logon is checked against (MS-SAMR 2.2.10.1).
+pub const PROPERTY_NT_HASH: &str = "Primary:NT";
+
 /// `USER_PROPERTIES`'s signature octet pair ([MS-SAMR] §2.2.10.1).
 const PROPERTY_SIGNATURE: u16 = 0x0050;
 
@@ -92,23 +95,41 @@ const KEY_DATA_NEW: usize = 24;
 /// the credentials and its older ones as the old credentials — which is the
 /// distinction AD draws and the reason a rotation is representable at all.
 pub fn supplemental_credentials(entry: &HdbEntry) -> Vec<u8> {
-    let value = kerberos_newer_keys(entry);
-    // `PropertyValue` is a string, and AD's string holds the hexadecimal text of
-    // the octets. A reader that expects binary here finds an odd length and stops.
-    let hex = hex_lower(&value);
-    let name: Vec<u8> = PROPERTY_KERBEROS_NEWER_KEYS
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
+    user_properties(&[(PROPERTY_KERBEROS_NEWER_KEYS, &kerberos_newer_keys(entry))])
+}
 
-    let mut property = Vec::with_capacity(6 + name.len() + hex.len());
-    property.extend_from_slice(&(name.len() as u16).to_le_bytes());
-    property.extend_from_slice(&(hex.len() as u16).to_le_bytes());
-    property.extend_from_slice(&0u16.to_le_bytes()); // Reserved
-    property.extend_from_slice(&name);
-    property.extend_from_slice(hex.as_bytes());
+/// The same structure with the account's NT hash beside its Kerberos keys.
+///
+/// AD keeps the hash a logon is checked against in `Primary:NT`, as the hexadecimal text of the
+/// sixteen octets. Without it a machine account can be issued tickets and cannot establish a secure
+/// channel: `netr_ServerAuthenticate3` derives its session key from the hash and has nothing else to
+/// derive from. One blob rather than two because the attribute holds one `USER_PROPERTIES`: a second
+/// write would replace the first, and the Kerberos keys are what the KDC reads.
+pub fn supplemental_credentials_with_nt(entry: &HdbEntry, nt_hash: &[u8; 16]) -> Vec<u8> {
+    user_properties(&[
+        (PROPERTY_KERBEROS_NEWER_KEYS, &kerberos_newer_keys(entry)),
+        (PROPERTY_NT_HASH, nt_hash),
+    ])
+}
 
-    let mut out = Vec::with_capacity(112 + property.len());
+/// `USER_PROPERTIES` carrying `properties`, in order (MS-SAMR 2.2.10.1).
+///
+/// `PropertyValue` is a string in the specification, and AD's string holds the hexadecimal text of
+/// the octets: a reader that expects binary here finds an odd length and stops.
+fn user_properties(properties: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for (name, value) in properties {
+        let hex = hex_lower(value);
+        let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+        encoded.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&(hex.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        encoded.extend_from_slice(&name);
+        encoded.extend_from_slice(hex.as_bytes());
+    }
+
+    let mut out = Vec::with_capacity(112 + encoded.len());
     out.extend_from_slice(&0u32.to_le_bytes()); // Reserved1
     // Filled in below: it counts from offset 12 up to `Reserved5`, which the
     // specification writes as the structure's length *minus* that last octet and
@@ -118,8 +139,8 @@ pub fn supplemental_credentials(entry: &HdbEntry) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes()); // Reserved3
     out.extend_from_slice(&[0u8; 96]); // Reserved4
     out.extend_from_slice(&PROPERTY_SIGNATURE.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes()); // PropertyCount
-    out.extend_from_slice(&property);
+    out.extend_from_slice(&(properties.len() as u16).to_le_bytes()); // PropertyCount
+    out.extend_from_slice(&encoded);
     out.extend_from_slice(&[0u8]); // Reserved5
 
     let length = (out.len() - 13) as u32;
@@ -812,6 +833,66 @@ mod tests {
         match credentials(&blob) {
             Err(AdBlobError::BadKeyLength(_, len)) => assert_eq!(len, 31),
             other => panic!("expected a refused key length, got {other:?}"),
+        }
+    }
+
+    /// The NT hash travels beside the keys, and the keys survive the company.
+    ///
+    /// One attribute, one `USER_PROPERTIES`: a second write would replace the first, and what it
+    /// replaced is the blob the KDC reads its keys from.
+    #[test]
+    fn the_nt_hash_shares_the_blob_with_the_keys() {
+        let cipher = OwnCipher;
+        let mut entry = HdbEntry::user(
+            crate::name::Principal::parse("SAMBA$@EXAMPLE.COM").expect("a principal"),
+        );
+        entry
+            .add_password_key(&cipher, Enctype::Aes256Sha1, b"machine-password", 1)
+            .expect("a key");
+        let nt: [u8; 16] = std::array::from_fn(|i| i as u8 * 3);
+
+        let blob = supplemental_credentials_with_nt(&entry, &nt);
+
+        let hash = property_value(&blob, PROPERTY_NT_HASH).expect("the hash is there");
+        assert_eq!(
+            unhex(hash).expect("hex"),
+            nt.to_vec(),
+            "the hash reads back as itself"
+        );
+        assert_eq!(
+            credentials(&blob).expect("the keys still read back").len(),
+            1,
+            "the Kerberos property is not shadowed by the second one"
+        );
+        assert_eq!(
+            property_value(&blob, PROPERTY_KERBEROS_NEWER_KEYS).expect("the keys are there"),
+            hex_lower(&kerberos_newer_keys(&entry)).as_bytes()
+        );
+    }
+
+    /// The count travels where a reader looks for it, and the length is consistent with the size.
+    ///
+    /// Offsets rather than a sentence: the header is 108 octets, then the signature pair, then the
+    /// count. A count written one field early is read as the signature, and the reader then believes
+    /// the blob holds eighty properties.
+    #[test]
+    fn the_property_count_sits_after_the_signature() {
+        let one = user_properties(&[(PROPERTY_NT_HASH, &[0xab; 16])]);
+        assert_eq!(u16_at(&one, 108), PROPERTY_SIGNATURE);
+        assert_eq!(u16_at(&one, 110), 1);
+
+        let two = user_properties(&[
+            (PROPERTY_KERBEROS_NEWER_KEYS, &[1, 2, 3]),
+            (PROPERTY_NT_HASH, &[0xab; 16]),
+        ]);
+        assert_eq!(u16_at(&two, 110), 2);
+
+        for blob in [&one, &two] {
+            assert_eq!(
+                u32_at(blob, 4) as usize,
+                blob.len() - 13,
+                "Length counts from offset 12 to the octet before Reserved5"
+            );
         }
     }
 }

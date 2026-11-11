@@ -194,6 +194,32 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
             ),
         ]));
     }
+    if !entry.strings.is_empty() {
+        // `HDB-Ext-Strings`: the pairs, in the order they were set. Written as an extension
+        // rather than as a field of the entry so that an entry without strings is byte-for-byte
+        // what this crate wrote before strings existed.
+        extensions.push(der::seq(&[
+            der::field(0, der::int(0)),
+            der::field(
+                1,
+                der::seq(&[der::field(
+                    16,
+                    der::seq(
+                        &entry
+                            .strings
+                            .iter()
+                            .map(|(key, value)| {
+                                der::seq(&[
+                                    der::field(0, der::general_string(key)),
+                                    der::field(1, der::general_string(value)),
+                                ])
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                )]),
+            ),
+        ]));
+    }
     if !extensions.is_empty() {
         parts.push(der::field(13, der::seq(&extensions)));
     }
@@ -292,13 +318,18 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
 
     // Read before the struct is built: `principal` takes ownership of the realm, and the ACL's
     // principals are named in it.
-    let (delegation_acl, aliases) = read_extensions(&f, ctx, &principal.realm)?;
+    let Extensions {
+        delegation: delegation_acl,
+        aliases,
+        strings,
+    } = read_extensions(&f, ctx, &principal.realm)?;
 
     Ok(HdbEntry {
         principal,
         keys,
         constrained_delegation: delegation_acl,
         aliases,
+        strings,
         flags: f.flags32(2, ctx)?,
         valid_start: time_field(3)?,
         valid_end: time_field(4)?,
@@ -328,15 +359,23 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
 ///
 /// An extension this crate does not know is skipped rather than refused, as before: a record
 /// written by a foreign tool must stay readable for the fields this KDC does use.
-fn read_extensions(
-    f: &Fields<'_>,
-    ctx: &'static str,
-    realm: &str,
-) -> Result<(Option<Vec<Principal>>, Option<Aliases>)> {
+/// What `extensions [13]` carried, in the shape the entry wants it.
+struct Extensions {
+    delegation: Option<Vec<Principal>>,
+    aliases: Option<Aliases>,
+    strings: Vec<(String, String)>,
+}
+
+fn read_extensions(f: &Fields<'_>, ctx: &'static str, realm: &str) -> Result<Extensions> {
     let mut delegation = None;
     let mut aliases = None;
+    let mut strings = Vec::new();
     if f.opt_bytes(13).is_none() {
-        return Ok((None, None));
+        return Ok(Extensions {
+            delegation: None,
+            aliases: None,
+            strings,
+        });
     }
     let mut r = Reader::new(f.bytes(13, ctx)?);
     let mut list = Reader::new(r.expect_in(ctx, der::SEQUENCE)?);
@@ -391,8 +430,34 @@ fn read_extensions(
                 names,
             });
         }
+
+        if choice.opt_bytes(16).is_some() {
+            // This crate's own extension, `HDB-Ext-Strings`: `SEQUENCE OF SEQUENCE {
+            // key [0] UTF8String, value [1] UTF8String }`. Numbered 16 because Heimdal's list
+            // stops at `krb5-config [15]` and continues with `...`; an entry written here is
+            // readable by Heimdal (it skips an extension it does not know) and its strings are
+            // readable by this crate alone, which is the whole point of the extension being
+            // optional.
+            let mut sr = Reader::new(choice.bytes(16, ctx)?);
+            let mut entries = Reader::new(sr.expect_in(ctx, der::SEQUENCE)?);
+            while !entries.is_empty() {
+                let ef = Fields::parse(ctx, entries.expect_in(ctx, der::SEQUENCE)?)?;
+                let mut kr = Reader::new(ef.bytes(0, ctx)?);
+                let key = kr.expect_in(ctx, der::GENERAL_STRING)?;
+                let mut vr = Reader::new(ef.bytes(1, ctx)?);
+                let value = vr.expect_in(ctx, der::GENERAL_STRING)?;
+                strings.push((
+                    String::from_utf8_lossy(key).into_owned(),
+                    String::from_utf8_lossy(value).into_owned(),
+                ));
+            }
+        }
     }
-    Ok((delegation, aliases))
+    Ok(Extensions {
+        delegation,
+        aliases,
+        strings,
+    })
 }
 
 #[cfg(test)]
@@ -457,6 +522,32 @@ mod tests {
             back.aliases.map(|a| a.names),
             Some(vec![Principal::parse("alias@EXAMPLE.COM").unwrap()])
         );
+    }
+
+    /// String attributes round-trip, in order, and an entry without any writes no extension at all
+    /// — so a record this crate wrote before strings existed still decodes to the same entry.
+    #[test]
+    fn string_attributes_round_trip_in_order() {
+        let mut e = entry();
+        e.strings = vec![
+            ("kpasswd_server".into(), "kpasswd.example.com".into()),
+            ("kadmin_keytab".into(), "/etc/krb5.keytab".into()),
+        ];
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(back.strings, e.strings);
+
+        let plain = decode(&encode(&entry())).unwrap();
+        assert!(plain.strings.is_empty());
+    }
+
+    /// A value with an octet that is not ASCII survives: these are `GeneralString`s, and a path or
+    /// a hostname is not guaranteed to be ASCII by anything this crate controls.
+    #[test]
+    fn a_string_value_need_not_be_ascii() {
+        let mut e = entry();
+        e.strings = vec![("note".into(), "ключ\tзначение".into())];
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(back.strings[0].1, "ключ\tзначение");
     }
 
     /// An entry with no aliases writes no extension, and one that writes none reads back as

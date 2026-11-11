@@ -263,6 +263,28 @@ fn every_operation() -> Vec<AdminRequest> {
         },
         AdminRequest {
             actor: actor.clone(),
+            operation: Operation::SetString {
+                principal: p("alice"),
+                key: "kpasswd_server".into(),
+                value: Some("kpasswd.example.com".into()),
+            },
+        },
+        AdminRequest {
+            actor: actor.clone(),
+            operation: Operation::SetString {
+                principal: p("alice"),
+                key: "kadmin_keytab".into(),
+                value: None,
+            },
+        },
+        AdminRequest {
+            actor: actor.clone(),
+            operation: Operation::Strings {
+                principal: p("alice"),
+            },
+        },
+        AdminRequest {
+            actor: actor.clone(),
             operation: Operation::Modify {
                 principal: p("alice"),
                 change: Modify {
@@ -326,6 +348,9 @@ fn every_operation_tags_itself_with_a_stable_name() {
         "get",
         "create",
         "create",
+        "set_string",
+        "set_string",
+        "strings",
         "modify",
         "delete",
         "set_password",

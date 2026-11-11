@@ -274,6 +274,20 @@ pub enum Operation {
         /// The new password.
         password: Vec<u8>,
     },
+    /// Set or delete a string attribute of a principal.
+    SetString {
+        /// Whose.
+        principal: Principal,
+        /// The attribute's name.
+        key: String,
+        /// Its value; `None` deletes the attribute, which is MIT's `delstr`.
+        value: Option<String>,
+    },
+    /// Read a principal's string attributes.
+    Strings {
+        /// Whose.
+        principal: Principal,
+    },
     /// Drop the keys below the current kvno.
     PruneOldKeys {
         /// Whose.
@@ -301,6 +315,10 @@ impl Operation {
             // The right is on the name the caller must be allowed to change; the target of the
             // rename is the same principal afterwards, so one right covers both halves.
             Operation::Rename { from, .. } => (Right::Modify, Some(from)),
+            // String attributes are metadata like any other, so the same two rights cover them:
+            // reading needs `Read`, changing needs `Modify`.
+            Operation::Strings { principal } => (Right::Read, Some(principal)),
+            Operation::SetString { principal, .. } => (Right::Modify, Some(principal)),
             Operation::Delete { principal } => (Right::Delete, Some(principal)),
             Operation::SetPassword { principal, .. } => (Right::SetPassword, Some(principal)),
             Operation::PruneOldKeys { principal } => (Right::PruneKeys, Some(principal)),
@@ -389,6 +407,11 @@ pub enum Reply {
     Modified {
         /// What it looks like now.
         entry: EntryView,
+    },
+    /// A principal's string attributes.
+    Strings {
+        /// The pairs, in the order they were set.
+        strings: Vec<(String, String)>,
     },
     /// A principal was renamed.
     Renamed {
@@ -497,6 +520,26 @@ impl Admin {
             Operation::Modify { principal, change } => Ok(Reply::Modified {
                 entry: EntryView::of(&self.modify(&principal, change)?),
             }),
+            Operation::Strings { principal } => Ok(Reply::Strings {
+                strings: self.strings(&principal)?,
+            }),
+            Operation::SetString {
+                principal,
+                key,
+                value,
+            } => {
+                match value {
+                    Some(value) => {
+                        self.set_string(&principal, &key, &value)?;
+                    }
+                    None => {
+                        self.delete_string(&principal, &key)?;
+                    }
+                }
+                Ok(Reply::Strings {
+                    strings: self.strings(&principal)?,
+                })
+            }
             Operation::Rename { from, to } => {
                 self.rename(&from, &to)?;
                 Ok(Reply::Renamed { from, to })

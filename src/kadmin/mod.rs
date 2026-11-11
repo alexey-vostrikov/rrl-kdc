@@ -234,6 +234,44 @@ impl Kadmin {
                 })?;
                 Ok(Vec::new())
             }
+            kadm5::GET_STRINGS => {
+                self.require(actor, Right::Read)?;
+                let principal = kadm5::decode_get_strings(args).inspect_err(|status| {
+                    log_refusal(&format!("get_strings: the request was refused ({status})"));
+                })?;
+                let strings = self.admin.strings(&principal).map_err(|e| {
+                    log_refusal(&format!("get_strings {principal}: {e}"));
+                    status_of(e)
+                })?;
+                Ok(kadm5::encode_strings(&strings))
+            }
+            kadm5::SET_STRING => {
+                self.require(actor, Right::Modify)?;
+                let (principal, key, value) =
+                    kadm5::decode_set_string(args).inspect_err(|status| {
+                        log_refusal(&format!("set_string: the request was refused ({status})"));
+                    })?;
+                match value {
+                    Some(value) => {
+                        self.admin
+                            .set_string(&principal, &key, &value)
+                            .map_err(|e| {
+                                log_refusal(&format!("set_string {principal} {key}: {e}"));
+                                match e {
+                                    crate::Error::Config(_) => kadm5::BAD_MASK,
+                                    other => status_of(other),
+                                }
+                            })?;
+                    }
+                    None => {
+                        self.admin.delete_string(&principal, &key).map_err(|e| {
+                            log_refusal(&format!("del_string {principal} {key}: {e}"));
+                            status_of(e)
+                        })?;
+                    }
+                }
+                Ok(Vec::new())
+            }
             kadm5::CREATE_PRINCIPAL => {
                 self.require(actor, Right::Create)?;
                 let (entry, password) = kadm5::decode_create(args)?;

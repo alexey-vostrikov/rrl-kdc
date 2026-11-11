@@ -218,6 +218,22 @@ impl Serialize for Operation {
                 out.serialize_field("principal", principal)?;
                 out.serialize_field("password", &Base64(password))?;
             }
+            Operation::Strings { principal } => {
+                out.serialize_field("operation", "strings")?;
+                out.serialize_field("principal", principal)?;
+            }
+            Operation::SetString {
+                principal,
+                key,
+                value,
+            } => {
+                out.serialize_field("operation", "set_string")?;
+                out.serialize_field("principal", principal)?;
+                out.serialize_field("key", key)?;
+                // `delstr` is the same operation with no value, and JSON's `null` is how a caller
+                // spells it.
+                out.serialize_field("value", value)?;
+            }
             Operation::PruneOldKeys { principal } => {
                 out.serialize_field("operation", "prune_old_keys")?;
                 out.serialize_field("principal", principal)?;
@@ -256,6 +272,15 @@ impl<'de> Deserialize<'de> for Operation {
                 from: crate::name::Principal,
                 to: crate::name::Principal,
             },
+            Strings {
+                principal: crate::name::Principal,
+            },
+            SetString {
+                principal: crate::name::Principal,
+                key: String,
+                #[serde(default)]
+                value: Option<String>,
+            },
             Delete {
                 principal: crate::name::Principal,
             },
@@ -288,6 +313,16 @@ impl<'de> Deserialize<'de> for Operation {
             },
             Wire::Modify { principal, change } => Operation::Modify { principal, change },
             Wire::Rename { from, to } => Operation::Rename { from, to },
+            Wire::Strings { principal } => Operation::Strings { principal },
+            Wire::SetString {
+                principal,
+                key,
+                value,
+            } => Operation::SetString {
+                principal,
+                key,
+                value,
+            },
             Wire::Delete { principal } => Operation::Delete { principal },
             Wire::SetPassword {
                 principal,
@@ -380,6 +415,10 @@ impl Serialize for Reply {
             Reply::Modified { entry } => {
                 map.serialize_entry("reply", "modified")?;
                 map.serialize_entry("entry", entry)?;
+            }
+            Reply::Strings { strings } => {
+                map.serialize_entry("reply", "strings")?;
+                map.serialize_entry("strings", strings)?;
             }
             Reply::Renamed { from, to } => {
                 map.serialize_entry("reply", "renamed")?;

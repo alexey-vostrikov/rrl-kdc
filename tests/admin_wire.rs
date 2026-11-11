@@ -407,6 +407,133 @@ fn a_kvno_below_the_keys_is_refused() {
     );
 }
 
+/// String attributes over the wire vocabulary: set, read back, replace, delete.
+#[test]
+fn string_attributes_are_set_read_and_removed() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+
+    let set = admin
+        .handle(request(
+            "admin",
+            Operation::SetString {
+                principal: p("alice"),
+                key: "kpasswd_server".into(),
+                value: Some("kpasswd.example.com".into()),
+            },
+        ))
+        .unwrap();
+    let Reply::Strings { strings } = set else {
+        panic!("a set_string must answer with the attributes it left");
+    };
+    assert_eq!(
+        strings,
+        vec![(
+            "kpasswd_server".to_string(),
+            "kpasswd.example.com".to_string()
+        )]
+    );
+
+    // A second key keeps the first, and the order is the order they were set in.
+    admin
+        .handle(request(
+            "admin",
+            Operation::SetString {
+                principal: p("alice"),
+                key: "kadmin_keytab".into(),
+                value: Some("/etc/krb5.keytab".into()),
+            },
+        ))
+        .unwrap();
+    let read = admin
+        .handle(request(
+            "admin",
+            Operation::Strings {
+                principal: p("alice"),
+            },
+        ))
+        .unwrap();
+    let Reply::Strings { strings } = read else {
+        panic!("a strings read must answer with them");
+    };
+    assert_eq!(strings.len(), 2);
+    assert_eq!(strings[0].0, "kpasswd_server");
+
+    // The same key again replaces, rather than appending a second pair with that name.
+    admin
+        .handle(request(
+            "admin",
+            Operation::SetString {
+                principal: p("alice"),
+                key: "kpasswd_server".into(),
+                value: Some("other.example.com".into()),
+            },
+        ))
+        .unwrap();
+    let read = admin
+        .handle(request(
+            "admin",
+            Operation::Strings {
+                principal: p("alice"),
+            },
+        ))
+        .unwrap();
+    let Reply::Strings { strings } = read else {
+        panic!("a strings read");
+    };
+    assert_eq!(strings.len(), 2);
+    assert_eq!(strings[0].1, "other.example.com");
+
+    // No value deletes: MIT's `delstr`.
+    admin
+        .handle(request(
+            "admin",
+            Operation::SetString {
+                principal: p("alice"),
+                key: "kpasswd_server".into(),
+                value: None,
+            },
+        ))
+        .unwrap();
+    let read = admin
+        .handle(request(
+            "admin",
+            Operation::Strings {
+                principal: p("alice"),
+            },
+        ))
+        .unwrap();
+    let Reply::Strings { strings } = read else {
+        panic!("a strings read");
+    };
+    assert_eq!(
+        strings,
+        vec![("kadmin_keytab".to_string(), "/etc/krb5.keytab".to_string())]
+    );
+}
+
+/// An empty attribute name is refused: a pair nothing can ask for is a pair nothing reads.
+#[test]
+fn an_empty_string_attribute_key_is_refused() {
+    let (_db, admin) = realm();
+    let admin = as_owner(&admin);
+    admin
+        .handle(request("admin", create("alice", Role::Client)))
+        .unwrap();
+    let refused = admin.handle(request(
+        "admin",
+        Operation::SetString {
+            principal: p("alice"),
+            key: String::new(),
+            value: Some("a value".into()),
+        },
+    ));
+    assert!(refused.is_err(), "an empty key must be refused");
+}
+
 #[test]
 fn a_missing_principal_is_not_found_and_not_a_storage_failure() {
     // A transport answers 404 or 500 depending on this, so it must not be prose

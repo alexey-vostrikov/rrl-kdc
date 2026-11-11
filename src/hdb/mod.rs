@@ -202,6 +202,18 @@ pub struct HdbEntry {
     /// `Some(Aliases { case_insensitive: true, names: vec![] })` still matches
     /// `ALICE@REALM` for `alice@realm` while one with `None` does not.
     pub aliases: Option<Aliases>,
+    /// The principal's string attributes: `kadmin setstr` and `kadmin getstr`.
+    ///
+    /// MIT keeps these in its database under names an application chooses — `kpasswd_server`,
+    /// `kadmin_keytab`, and whatever else an operator invents — and serves them with their own
+    /// RPCs. Heimdal's `hdb.asn1` has no extension for them (its own `kadmin` has no `setstr`), so
+    /// the record carries them in an extension of this crate's own, numbered 16, which Heimdal's
+    /// `HDB-extension` CHOICE leaves open with `...`.
+    ///
+    /// A list, not a map, because the order is what a caller sees and because a key and its value
+    /// are both free text: an attribute name is not an identifier here, it is a label an operator
+    /// picked.
+    pub strings: Vec<(String, String)>,
 }
 
 impl HdbEntry {
@@ -228,6 +240,7 @@ impl HdbEntry {
             modified: 0,
             constrained_delegation: None,
             aliases: None,
+            strings: Vec::new(),
         }
     }
 
@@ -297,6 +310,7 @@ impl HdbEntry {
             modified: 0,
             constrained_delegation: None,
             aliases: None,
+            strings: Vec::new(),
         }
     }
 
@@ -317,6 +331,7 @@ impl HdbEntry {
             modified: 0,
             constrained_delegation: None,
             aliases: None,
+            strings: Vec::new(),
         }
     }
 

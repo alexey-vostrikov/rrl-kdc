@@ -63,6 +63,9 @@ fn realm() -> Arc<MemoryHdb> {
 struct Stand {
     client: krb5::kadmin::AdminClient,
     kdc: krb5::KdcClient,
+    /// The database the KDC and the admin server share, so a test can ask what was actually
+    /// stored rather than what the protocol said.
+    db: Arc<MemoryHdb>,
     /// Held, not read: dropping it stops the KDC the client logs in against.
     #[allow(dead_code)]
     kdc_stand: rrl_kdc::transport::RunningKdc,
@@ -104,6 +107,7 @@ fn stand_with(policy: Arc<dyn Policy>) -> Stand {
     Stand {
         client,
         kdc: client_kdc,
+        db,
         kdc_stand,
         kadmin_stand,
     }
@@ -266,6 +270,74 @@ fn a_stock_kadmin_client_modifies_a_principal() {
         reversed.attributes & krb5::kadmin::attributes::REQUIRES_PRE_AUTH,
         0,
         "and clearing the other must take pre-authentication off"
+    );
+    stand.kadmin_stand.stop();
+}
+
+/// `setstr` / `getstr` / `delstr` over the wire, from the client that writes them.
+#[test]
+fn a_stock_kadmin_client_sets_and_reads_string_attributes() {
+    let mut stand = stand_with(owner());
+    assert!(
+        stand
+            .client
+            .get_strings(&kp("alice"))
+            .expect("getstr")
+            .is_empty(),
+        "a fresh principal has no string attributes"
+    );
+
+    stand
+        .client
+        .set_string(&kp("alice"), "kpasswd_server", Some("kpasswd.example.com"))
+        .expect("setstr must answer");
+    stand
+        .client
+        .set_string(&kp("alice"), "kadmin_keytab", Some("/etc/krb5.keytab"))
+        .expect("setstr must answer");
+
+    let strings = stand.client.get_strings(&kp("alice")).expect("getstr");
+    assert_eq!(
+        strings,
+        vec![
+            (
+                "kpasswd_server".to_string(),
+                "kpasswd.example.com".to_string()
+            ),
+            ("kadmin_keytab".to_string(), "/etc/krb5.keytab".to_string()),
+        ],
+        "the pairs come back in the order they were set"
+    );
+
+    // `delstr`: the value absent is a deletion, and the other attribute stays.
+    stand
+        .client
+        .set_string(&kp("alice"), "kpasswd_server", None)
+        .expect("delstr must answer");
+    assert_eq!(
+        stand.client.get_strings(&kp("alice")).expect("getstr"),
+        vec![("kadmin_keytab".to_string(), "/etc/krb5.keytab".to_string())]
+    );
+    stand.kadmin_stand.stop();
+}
+
+/// The strings live in the entry, so they survive the round trip through the HDB the KDC serves
+/// from — not only in the admin server's memory.
+#[test]
+fn string_attributes_reach_the_database_the_kdc_uses() {
+    let mut stand = stand_with(owner());
+    stand
+        .client
+        .set_string(&kp("alice"), "note", Some("written by kadmin"))
+        .expect("setstr");
+    let stored = stand
+        .db
+        .fetch(&p("alice"))
+        .expect("the database answers")
+        .expect("alice is there");
+    assert_eq!(
+        stored.strings,
+        vec![("note".to_string(), "written by kadmin".to_string())]
     );
     stand.kadmin_stand.stop();
 }

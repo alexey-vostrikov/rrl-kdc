@@ -49,11 +49,15 @@ pub mod proc_ {
     pub const MODIFY_PRINCIPAL: u32 = 3;
     /// `rename_principal`.
     pub const RENAME_PRINCIPAL: u32 = 4;
+    /// `get_strings`.
+    pub const GET_STRINGS: u32 = 23;
+    /// `set_string`, which with a NULL value deletes the attribute.
+    pub const SET_STRING: u32 = 24;
 }
 
 pub use proc_::{
     CHPASS_PRINCIPAL, CHRAND_PRINCIPAL3, CREATE_PRINCIPAL, DELETE_PRINCIPAL, GET_PRINCIPAL,
-    GET_PRINCS, GET_PRIVS, INIT, MODIFY_PRINCIPAL, RENAME_PRINCIPAL,
+    GET_PRINCS, GET_PRIVS, GET_STRINGS, INIT, MODIFY_PRINCIPAL, RENAME_PRINCIPAL, SET_STRING,
 };
 
 /// The field masks of a `kadm5_principal_ent_rec` (`kadm5/admin.h`).
@@ -489,6 +493,46 @@ pub fn encode_key_block(w: &mut Writer, entry: &HdbEntry, kvno: u32) {
             w.opaque(&[]);
         }
     }
+}
+
+/// A `set_string` request: the principal, the key, and the value or nothing.
+///
+/// `None` is `delstr`, not "set to NULL": MIT's protocol uses the absence of the value to mean
+/// removal, and a server that stored an empty string instead would answer "set" for a request that
+/// asked for a deletion.
+pub fn decode_set_string(
+    args: &[u8],
+) -> std::result::Result<(Principal, String, Option<String>), u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let name = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_PRINC)?;
+    let principal = Principal::parse(&name).map_err(|_| UNK_PRINC)?;
+    let key = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(BAD_MASK)?;
+    let value = r.nullstring().map_err(|_| BAD_MASK)?;
+    Ok((principal, key, value))
+}
+
+/// A `get_strings` request: just the principal.
+pub fn decode_get_strings(args: &[u8]) -> std::result::Result<Principal, u32> {
+    let mut r = Reader::new(args);
+    let _version = r.u32().map_err(|_| BAD_MASK)?;
+    let name = r.nullstring().map_err(|_| BAD_MASK)?.ok_or(UNK_PRINC)?;
+    Principal::parse(&name).map_err(|_| UNK_PRINC)
+}
+
+/// The body of a `get_strings` reply: the pairs, with their count twice.
+///
+/// No `generic_ret` here — the dispatcher writes `api_version` and the code for every procedure.
+/// The count appears twice because it is two different things that happen to have the same value:
+/// an `int32` the C client prints, and the XDR array count the decoder reads before the elements.
+pub fn encode_strings(strings: &[(String, String)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.i32(strings.len() as i32);
+    w.u32(strings.len() as u32);
+    for (key, value) in strings {
+        w.nullstring(Some(key)).nullstring(Some(value));
+    }
+    w.into_bytes()
 }
 
 #[cfg(test)]

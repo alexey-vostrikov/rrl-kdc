@@ -262,6 +262,7 @@ impl Admin {
             // Nor does a new principal have other names; `rename` and `alias` are separate
             // operations, and an alias list invented here would be one nobody asked for.
             aliases: None,
+            strings: Vec::new(),
         };
 
         let enctypes = if new.enctypes.is_empty() {
@@ -328,6 +329,49 @@ impl Admin {
             )));
         }
         self.hdb.rename(from, to)
+    }
+
+    /// The string attributes of a principal, in the order they were set.
+    pub fn strings(&self, principal: &Principal) -> Result<Vec<(String, String)>> {
+        Ok(self.get(principal)?.strings)
+    }
+
+    /// Sets one string attribute, replacing a value with the same key.
+    ///
+    /// An empty key is refused: a pair with no name is one no caller can ask for, so storing it
+    /// would be storing something nothing reads. An empty value is allowed and means "present and
+    /// empty", which is not the same as absent — the distinction is how an operator says "this
+    /// attribute exists but is blank" to whatever reads it.
+    pub fn set_string(&self, principal: &Principal, key: &str, value: &str) -> Result<HdbEntry> {
+        if key.is_empty() {
+            return Err(Error::Config(
+                "an empty string-attribute key: a pair with no name is one nothing can ask for"
+                    .into(),
+            ));
+        }
+        let mut entry = self.get(principal)?;
+        match entry.strings.iter_mut().find(|(k, _)| k == key) {
+            Some(pair) => pair.1 = value.to_owned(),
+            None => entry.strings.push((key.to_owned(), value.to_owned())),
+        }
+        self.hdb.store(entry.clone())?;
+        Ok(entry)
+    }
+
+    /// Removes one string attribute; returns whether it was there.
+    ///
+    /// Removing what is not there is not an error, for the same reason deleting an unknown
+    /// principal is not: the caller asked for an end state, and the end state is what it gets.
+    /// [`Admin::strings`] is how it can tell.
+    pub fn delete_string(&self, principal: &Principal, key: &str) -> Result<bool> {
+        let mut entry = self.get(principal)?;
+        let before = entry.strings.len();
+        entry.strings.retain(|(k, _)| k != key);
+        if entry.strings.len() == before {
+            return Ok(false);
+        }
+        self.hdb.store(entry)?;
+        Ok(true)
     }
 
     /// Applies `change` to an existing entry.

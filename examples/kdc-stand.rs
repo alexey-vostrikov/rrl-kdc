@@ -125,6 +125,7 @@ fn main() {
         modified: 0,
         constrained_delegation: None,
         aliases: None,
+        strings: Vec::new(),
     };
     for enctype in Enctype::ALL {
         machine_entry

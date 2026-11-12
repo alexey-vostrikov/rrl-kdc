@@ -43,6 +43,30 @@ use super::transited;
 /// whatever the session key's enctype is.
 const CKSUMTYPE_RSA_MD5: i32 = 7;
 
+/// The octets of a DER `SEQUENCE` without its own tag and length, for the checksum diagnostic.
+///
+/// Some clients checksum the content of `KDC-REQ-BODY` rather than the whole element, and the two
+/// differ by exactly these octets.
+fn strip_sequence_header(bytes: &[u8]) -> &[u8] {
+    if bytes.first() != Some(&0x30) || bytes.len() < 2 {
+        return bytes;
+    }
+    let mut index = 2;
+    if bytes[1] & 0x80 != 0 {
+        let count = (bytes[1] & 0x7f) as usize;
+        if count > 4 {
+            return bytes;
+        }
+        index = 2 + count;
+    }
+    bytes.get(index..).unwrap_or(bytes)
+}
+
+/// Hex, for the checksum diagnostic.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|octet| format!("{octet:02x}")).collect()
+}
+
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
@@ -1510,6 +1534,34 @@ impl Kdc {
                     .as_ref()
                     .is_some_and(|subkey| subkey.verify_rsa_md5_checksum(&req.raw_body, cksum));
             if !verified {
+                if std::env::var_os("KDC_CKSUM_DIAG").is_some() {
+                    // The client's value decides the construction, and guessing it costs a full
+                    // round trip through a Windows join. Every candidate is printed beside what
+                    // arrived: keyed with each key, plain over the body, and keyed over the body's
+                    // content without its SEQUENCE header.
+                    let content = strip_sequence_header(&req.raw_body);
+                    let mut candidates = Vec::new();
+                    candidates.push((
+                        "keyed-session",
+                        ticket_part.session_key.rsa_md5_checksum(&req.raw_body),
+                    ));
+                    if let Some(subkey) = authenticator.subkey.as_ref() {
+                        candidates.push(("keyed-subkey", subkey.rsa_md5_checksum(&req.raw_body)));
+                        candidates.push(("keyed-subkey-content", subkey.rsa_md5_checksum(content)));
+                    }
+                    candidates.push(("plain-body", crate::crypto::md5(&req.raw_body)));
+                    candidates.push(("plain-content", crate::crypto::md5(content)));
+                    let rendered: Vec<String> = candidates
+                        .into_iter()
+                        .map(|(name, value)| format!("{name}={}", hex(&value)))
+                        .collect();
+                    eprintln!(
+                        "cksum-diag: got={} bodylen={} {}",
+                        hex(cksum),
+                        req.raw_body.len(),
+                        rendered.join(" ")
+                    );
+                }
                 return Err(Error::Kdc {
                     code: codes::KRB_AP_ERR_MODIFIED,
                     text: "the rsa-md5 checksum does not cover this request body".into(),

@@ -44,6 +44,7 @@ pub mod fast;
 #[cfg(feature = "gss-preauth")]
 pub mod gss_hdb;
 pub mod gss_preauth;
+pub mod hwauth;
 /// The change-password service (RFC 3244): protocol constants, the reply a
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
 pub mod kpasswd;
@@ -210,6 +211,11 @@ pub struct Kdc {
     hdb: Arc<dyn Hdb>,
     cipher: Arc<dyn Cipher>,
     policy: Arc<dyn ChangePolicy>,
+    /// What counts as hardware authentication for an entry with `require-hwauth`.
+    ///
+    /// [`hwauth::CertificateOnly`] by default, which is Heimdal's own answer when no plugin is
+    /// configured: a certificate admits, a password does not.
+    hw_auth: Arc<dyn hwauth::HwAuthPolicy>,
     /// Where decisions are recorded, when a deployment wants a trail.
     ///
     /// `None` is "nobody is watching", and it is the default because a KDC that wrote a log file
@@ -267,6 +273,7 @@ impl Kdc {
             hdb,
             cipher,
             policy: Arc::new(SelfOnly),
+            hw_auth: Arc::new(hwauth::CertificateOnly),
             audit: None,
             identities: None,
             #[cfg(feature = "pkinit")]
@@ -528,6 +535,20 @@ impl Kdc {
         ]);
         pac::seal(&mut blob, server_key, &kdc_key.key, signature)?;
         Ok(Some(pac::authorization_data(&blob)))
+    }
+
+    /// Decides what `require-hwauth` accepts, when the realm's answer differs from Heimdal's.
+    ///
+    /// The default is [`hwauth::CertificateOnly`]: a certificate admits and a password does not,
+    /// which is what Heimdal's `PA_HARDWARE_AUTH` flags say.
+    pub fn with_hw_auth(mut self, policy: Arc<dyn hwauth::HwAuthPolicy>) -> Self {
+        self.hw_auth = policy;
+        self
+    }
+
+    /// The policy in force for `require-hwauth`.
+    pub fn hw_auth(&self) -> &dyn hwauth::HwAuthPolicy {
+        self.hw_auth.as_ref()
     }
 
     /// Records every decision in `audit`.

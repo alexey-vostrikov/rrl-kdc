@@ -759,6 +759,9 @@ impl Kdc {
         let (announced, announced_state) = self.preauth().announce_all(&context)?;
         let mut mechanism_key: Option<Key> = None;
         let mut mechanism_padata: Option<Vec<u8>> = None;
+        // Which PA type the mechanism answers, for `require-hwauth`: the policy decides by method,
+        // and "a mechanism" is as much as this exchange knows without asking it.
+        let mut mechanism_pa: Option<i32> = None;
         // A mechanism that knows how long its authentication lasts bounds the ticket by it.
         let mut mechanism_bound: Option<i64> = None;
         if let Some((mechanism, value)) = self.preauth().requested(padata) {
@@ -783,6 +786,7 @@ impl Kdc {
                     mechanism_key = Some(reply_key);
                     mechanism_padata = padata;
                     mechanism_bound = endtime_bound;
+                    mechanism_pa = Some(mechanism.pa_type());
                 }
                 Ok(super::preauth::Step::Failed { code, text }) => {
                     return Err(Error::Kdc {
@@ -907,6 +911,52 @@ impl Kdc {
         let pkinit_key = pkinit_answer.as_ref().map(|a| a.reply_key.clone());
         #[cfg(not(feature = "pkinit"))]
         let pkinit_key: Option<Key> = None;
+
+        // `require-hwauth` (HDBFlags bit 10): an entry may demand a method stronger than a password
+        // in software. Heimdal asks `_kdc_hwauth_policy` **before** validating the candidate
+        // pre-authentication type (`kdc/kerberos5.c`), and skips the question for the two PKINIT
+        // types, which its table marks `PA_HARDWARE_AUTH`.
+        //
+        // Checked here, before any of these methods is validated, for two reasons: the answer does
+        // not depend on whether the credential would have verified, and doing the work first would
+        // make this an oracle for a password the account is not allowed to use anyway.
+        if super::hwauth::applies(&client) {
+            // The same order the reply key is chosen in below: a client that sends several methods
+            // is authenticated by the one this code would believe.
+            let certificate = {
+                #[cfg(feature = "pkinit")]
+                {
+                    pkinit_answer.is_some()
+                }
+                #[cfg(not(feature = "pkinit"))]
+                {
+                    // A build without PKINIT has no certificate path, so no certificate reached
+                    // here. Written out rather than cfg-ing the whole expression, so that the
+                    // order of the branches below reads the same in both builds.
+                    false
+                }
+            };
+            let method = if mechanism_key.is_some() {
+                Some(super::hwauth::Method::Mechanism(mechanism_pa.unwrap_or(0)))
+            } else if certificate {
+                Some(super::hwauth::Method::Certificate)
+            } else if challenge.is_some() {
+                Some(super::hwauth::Method::EncryptedChallenge)
+            } else {
+                timestamp.map(|_| super::hwauth::Method::Timestamp)
+            };
+            if let Some(method) = method
+                && !self.hw_auth().admits(&cname, method)
+            {
+                return Err(Error::Kdc {
+                    code: codes::KDC_ERR_POLICY,
+                    text: format!(
+                        "{cname}: this account requires hardware authentication, and {} is not one",
+                        method.as_str()
+                    ),
+                });
+            }
+        }
 
         let reply_key = if let Some(key) = mechanism_key {
             key

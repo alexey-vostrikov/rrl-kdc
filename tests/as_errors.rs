@@ -132,6 +132,23 @@ fn a_foreign_realm_is_wrong_realm() {
 }
 
 #[test]
+fn the_realm_is_compared_without_regard_to_case() {
+    // Windows takes its realm from a DNS name and sends `example.com` for a KDC configured
+    // `EXAMPLE.COM`. Comparing the two as octets refused a realm that exists with WRONG_REALM, and
+    // that refusal was what a domain join died on: the client was perfectly able to ask.
+    let reply = kdc().handle(&as_req("alice", "example.com", &[18], Vec::new()), NOW);
+    let (code, _) = reply_code(&reply);
+    assert_ne!(
+        code,
+        codes::KDC_ERR_WRONG_REALM,
+        "a lowercase realm must reach the exchange, not be refused as foreign"
+    );
+    // It reaches the exchange and is answered there: preauth is the realm's own policy, which is
+    // only consulted once the request is known to be for this realm.
+    assert_eq!(code, codes::KDC_ERR_PREAUTH_REQUIRED);
+}
+
+#[test]
 fn require_preauth_answers_with_the_method_data() {
     let reply = kdc().handle(&as_req("alice", REALM, &[18], Vec::new()), NOW);
     let (code, methods) = reply_code(&reply);

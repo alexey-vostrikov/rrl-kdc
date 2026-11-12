@@ -911,6 +911,36 @@ impl Kdc {
     }
 }
 
+/// Whether two spellings name the same realm.
+///
+/// Kerberos realms are octet strings in RFC 4120, but every implementation in use compares them
+/// without regard to case, and a client takes its realm from a DNS name: Windows sends
+/// `ad.example.com` for a KDC configured `AD.EXAMPLE.COM`. Comparing strictly refuses a realm that
+/// exists with `KDC_ERR_WRONG_REALM` - measured on the AD-join stand, where that refusal was the
+/// only thing between a Windows client and a ticket it was perfectly able to get.
+pub(super) fn same_realm(requested: &str, ours: &str) -> bool {
+    requested.eq_ignore_ascii_case(ours)
+}
+
+/// Rewrites a principal's realm into this KDC's spelling when it names the same realm.
+///
+/// A name is looked up by its octets, so a client that spelled the realm from a DNS name would be
+/// told its own account does not exist. Applied to every name a request carries before any lookup:
+/// the client, and the service it asks for.
+pub(super) fn fold_realm(principal: &mut crate::name::Principal, ours: &str) {
+    if same_realm(&principal.realm, ours) {
+        principal.realm = ours.to_owned();
+    }
+    // A `krbtgt` carries the realm as its second component (`krbtgt/REALM@REALM`), and that
+    // component is what the lookup matches on: folding only the realm field leaves the service name
+    // in the client's case, which is a name the database does not hold.
+    for component in &mut principal.components {
+        if same_realm(component, ours) {
+            *component = ours.to_owned();
+        }
+    }
+}
+
 /// The error a realm that is not ours gets. Naming the realm we do serve tells
 /// the operator what went wrong without telling the client anything it did not
 /// already send.

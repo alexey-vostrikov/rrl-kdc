@@ -1417,7 +1417,7 @@ impl Kdc {
                 ),
             })?
             .clone();
-        if tgt_realm != config.realm() {
+        if !super::same_realm(&tgt_realm, config.realm()) {
             return Err(Error::Kdc {
                 code: codes::KRB_AP_ERR_MODIFIED,
                 text: format!(

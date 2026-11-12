@@ -173,16 +173,18 @@ fn canonical_client_name(cname: &Principal, options: u32, realm: &str) -> Result
              user@realm, and {component:?} has no @"
         )));
     };
-    if named_realm != realm {
+    if !super::same_realm(named_realm, realm) {
         return Err(super::wrong_realm(named_realm, realm));
     }
     if principal.is_empty() {
         return Err(refuse(format!("{cname} names no user before the realm")));
     }
+    // The name is issued in **our** spelling of the realm: the client's case comes from a DNS name,
+    // and every lookup that follows compares against the configured realm.
     Ok(Principal::new(
         crate::name::NT_PRINCIPAL,
         [principal],
-        named_realm,
+        realm,
     ))
 }
 
@@ -601,16 +603,26 @@ impl Kdc {
         body_der: &[u8],
     ) -> Result<Vec<u8>> {
         let config = self.config();
-        if body.realm != config.realm() {
+        if !super::same_realm(&body.realm, config.realm()) {
             return Err(super::wrong_realm(&body.realm, config.realm()));
         }
 
         // 2. The client. An AS-REQ without a client name cannot be answered:
         // there is nobody to encrypt the reply for.
-        let cname = body
+        let mut cname = body
             .cname
             .clone()
             .ok_or_else(|| Error::Protocol("AS-REQ without a client name".into()))?;
+        // The client's spelling of the realm is folded into ours before anything looks the name up:
+        // a lookup compares the realm of the principal against this KDC's, and a client that took
+        // its realm from a DNS name would otherwise be told its own account does not exist.
+        //
+        // A `NT-PRINCIPAL` name carries no realm of its own - the realm is the request's, in the
+        // body - so the empty one is filled from there first.
+        if cname.realm.is_empty() {
+            cname.realm = body.realm.clone();
+        }
+        super::fold_realm(&mut cname, config.realm());
         // RFC 6806 §6: an enterprise name is resolved to the principal it names, and the
         // reply carries that canonical name — which is only legal because the client asked
         // for it with `canonicalize`.
@@ -661,10 +673,13 @@ impl Kdc {
         }
 
         // 3. The service. Only the ticket-granting service is issued here.
-        let sname = body
+        let mut sname = body
             .sname
             .clone()
             .ok_or_else(|| Error::Protocol("AS-REQ without a service name".into()))?;
+        // The same folding as the client: a client that spelled the realm from a DNS name asks for
+        // `krbtgt/EXAMPLE.COM@example.com`, and that name is not in the database.
+        super::fold_realm(&mut sname, config.realm());
         let server = self
             .hdb()
             .fetch(&sname)?

@@ -137,6 +137,38 @@ fn deleting_a_missing_account_reports_that_there_was_none() {
     assert!(!admin.delete(&p("nobody")).unwrap());
 }
 
+/// A password set through the admin API reaches the database with its NT hash, and a rotation
+/// replaces it.
+///
+/// End to end on purpose: the hash is derived in `rekey` and stored by whatever backend the realm
+/// uses, so a test at the entry level would pass while the path an operator actually takes — kadmin
+/// `cpw`, or `set_password` — dropped it.
+#[test]
+fn a_password_change_records_the_nt_hash_in_the_database() {
+    let (_db, admin) = realm();
+    admin
+        .create(NewPrincipal::user(p("alice"), b"Password".to_vec()))
+        .unwrap();
+    let created = admin.get(&p("alice")).unwrap().nt_hash;
+    assert_eq!(
+        created,
+        Some([
+            0xa4, 0xf4, 0x9c, 0x40, 0x65, 0x10, 0xbd, 0xca, 0xb6, 0x82, 0x4e, 0xe7, 0xc3, 0x0f,
+            0xd8, 0x52
+        ]),
+        "the published NT hash of \"Password\""
+    );
+
+    admin.set_password(&p("alice"), b"rotated").unwrap();
+    let rotated = admin.get(&p("alice")).unwrap().nt_hash;
+    assert_ne!(rotated, created, "a new password is a new hash");
+    assert_eq!(
+        rotated,
+        Some(rrl_crypto::nt::hash_password("rotated")),
+        "and it is the hash of the new password, read back from the store"
+    );
+}
+
 #[test]
 fn a_password_change_moves_the_kvno_and_keeps_the_old_keys() {
     let (_db, admin) = realm();

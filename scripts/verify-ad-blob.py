@@ -54,9 +54,26 @@ def parse_property(blob_path, blob):
     return binascii.unhexlify(value_hex)
 
 
+def check_length(blob_path, blob):
+    """`Length` must be the value Windows writes, which is what impacket's boundary uses.
+
+    impacket computes `properties_end = 12 + Length` and then reads `Reserved5` from that
+    offset, so a blob whose `Length` counted `Reserved5` — the literal reading of
+    §2.2.10.1 — would be rejected by it as missing its final octet. This crate reads either
+    reading but must write this one.
+    """
+    length = struct.unpack_from("<L", blob, 4)[0]
+    if 12 + length != len(blob) - 1:
+        raise SystemExit(
+            f"{blob_path.name}: Length {length} puts the end of the structure at "
+            f"{12 + length}, but Reserved5 is the octet at {len(blob) - 1}"
+        )
+
+
 def read_case(blob_path):
     blob = blob_path.read_bytes()
     manifest = json.loads(blob_path.with_suffix(".json").read_text())
+    check_length(blob_path, blob)
 
     if manifest["properties"] == 0:
         # The odd shape: no PropertyCount field at all, and no trailing property.

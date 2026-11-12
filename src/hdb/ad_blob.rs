@@ -41,7 +41,13 @@
 //! * `Length` counts from offset 12 up to but **not including** the final
 //!   `Reserved5` octet, and when there are no properties at all the two-octet
 //!   `PropertyCount` is *omitted* — so a blob with no properties is 111 octets, not
-//!   113.
+//!   113. The `Length` convention is the one place where the specification and every
+//!   implementation that reads real directories disagree: §2.2.10.1 calls it "the length,
+//!   in bytes, of the entire structure, starting from the `Reserved4` field", which would
+//!   include `Reserved5`, while Windows writes the value that stops before it — the value
+//!   impacket's `secretsdump` and mimikatz both locate `PropertyCount` by. This crate
+//!   **writes** what Windows writes and **reads** either, because it does not locate
+//!   anything by `Length`.
 //! * The salt is a `defaultSalt` **and** a length, and the salt this crate keeps is
 //!   per key: a principal whose keys were made with different salts has no single
 //!   default. The first key's salt is written as the default and each key keeps its
@@ -112,6 +118,18 @@ pub fn supplemental_credentials_with_nt(entry: &HdbEntry, nt_hash: &[u8; 16]) ->
     ])
 }
 
+/// A field the structure spells as a 16-bit count or length, or a loud stop.
+///
+/// The alternative is `as u16`, which would write a truncated number into a structure whose
+/// offsets are computed from the untruncated one: the result parses and describes keys that
+/// are not there. A count that does not fit is not a blob to write badly, it is an entry to
+/// report.
+fn u16_field(value: usize, what: &str) -> [u8; 2] {
+    u16::try_from(value)
+        .unwrap_or_else(|_| panic!("{what} is {value}, which a 16-bit field cannot hold"))
+        .to_le_bytes()
+}
+
 /// `USER_PROPERTIES` carrying `properties`, in order (MS-SAMR 2.2.10.1).
 ///
 /// `PropertyValue` is a string in the specification, and AD's string holds the hexadecimal text of
@@ -122,8 +140,8 @@ fn user_properties(properties: &[(&str, &[u8])]) -> Vec<u8> {
         let hex = hex_lower(value);
         let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
 
-        encoded.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        encoded.extend_from_slice(&(hex.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&u16_field(name.len(), "a property name"));
+        encoded.extend_from_slice(&u16_field(hex.len(), "a property value"));
         encoded.extend_from_slice(&0u16.to_le_bytes()); // Reserved
         encoded.extend_from_slice(&name);
         encoded.extend_from_slice(hex.as_bytes());
@@ -139,7 +157,7 @@ fn user_properties(properties: &[(&str, &[u8])]) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes()); // Reserved3
     out.extend_from_slice(&[0u8; 96]); // Reserved4
     out.extend_from_slice(&PROPERTY_SIGNATURE.to_le_bytes());
-    out.extend_from_slice(&(properties.len() as u16).to_le_bytes()); // PropertyCount
+    out.extend_from_slice(&u16_field(properties.len(), "PropertyCount"));
     out.extend_from_slice(&encoded);
     out.extend_from_slice(&[0u8]); // Reserved5
 
@@ -179,7 +197,14 @@ pub fn empty_supplemental_credentials() -> Vec<u8> {
 /// drops and says so here.
 pub fn kerberos_newer_keys(entry: &HdbEntry) -> Vec<u8> {
     let current = entry.kvno();
-    let generation = |kvno: u32| -> Vec<&crate::hdb::HdbKey> {
+    // A version number is not arithmetic on nothing: `kvno - 2` at the first `kvno` would
+    // saturate onto `kvno - 1`, and two of the three names would then describe the same
+    // keys — the blob would carry every key twice and a reader would hand the KDC
+    // duplicates. Below zero there is no generation, so there is nothing to write.
+    let generation = |kvno: Option<u32>| -> Vec<&crate::hdb::HdbKey> {
+        let Some(kvno) = kvno else {
+            return Vec::new();
+        };
         let mut keys: Vec<&crate::hdb::HdbKey> =
             entry.keys.iter().filter(|k| k.kvno == kvno).collect();
         // Deterministic order: a blob that changes byte-for-byte between two reads
@@ -187,9 +212,9 @@ pub fn kerberos_newer_keys(entry: &HdbEntry) -> Vec<u8> {
         keys.sort_by_key(|k| k.key.enctype().id());
         keys
     };
-    let credentials = generation(current);
-    let old = generation(current.saturating_sub(1));
-    let older = generation(current.saturating_sub(2));
+    let credentials = generation(Some(current));
+    let old = generation(current.checked_sub(1));
+    let older = generation(current.checked_sub(2));
 
     // An entry whose keys are all older than its declared version — an account
     // provisioned before its first password — still has keys, and reporting none of
@@ -239,12 +264,12 @@ pub fn kerberos_newer_keys(entry: &HdbEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(next_value);
     out.extend_from_slice(&REVISION_NEW.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // Flags
-    out.extend_from_slice(&(credentials.len() as u16).to_le_bytes());
+    out.extend_from_slice(&u16_field(credentials.len(), "CredentialCount"));
     out.extend_from_slice(&0u16.to_le_bytes()); // ServiceCredentialCount
-    out.extend_from_slice(&(old.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(older.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(salt.len() as u16).to_le_bytes()); // DefaultSaltLength
-    out.extend_from_slice(&(salt.len() as u16).to_le_bytes()); // DefaultSaltMaximumLength
+    out.extend_from_slice(&u16_field(old.len(), "OldCredentialCount"));
+    out.extend_from_slice(&u16_field(older.len(), "OlderCredentialCount"));
+    out.extend_from_slice(&u16_field(salt.len(), "DefaultSaltLength"));
+    out.extend_from_slice(&u16_field(salt.len(), "DefaultSaltMaximumLength"));
     out.extend_from_slice(&(salt_offset as u32).to_le_bytes());
     out.extend_from_slice(&ITERATION_COUNT.to_le_bytes());
     out.extend_from_slice(&key_data);
@@ -429,8 +454,17 @@ fn property_value<'a>(blob: &'a [u8], name: &str) -> Result<&'a [u8], AdBlobErro
     if blob.len() < HEADER + 1 {
         return Err(AdBlobError::NotUserProperties);
     }
-    // `Length` counts from offset 12 up to, but not including, `Reserved5`.
-    if u32_at(blob, 4) as usize != blob.len() - 13 {
+    // `Length` counts from offset 12 — the start of `Reserved4` — and stops at `Reserved5`.
+    // Whether it counts `Reserved5` itself is the one place the specification and every
+    // implementation that reads real directories disagree: §2.2.10.1 says "the length, in
+    // bytes, of the entire structure, starting from the Reserved4 field" (which would
+    // include the final octet), while Windows' own output — and therefore impacket's
+    // `secretsdump` and mimikatz, both of which locate `PropertyCount` by this arithmetic —
+    // stops before it. Both are accepted: this reader does not use `Length` to find
+    // anything, so refusing a whole attribute over one byte whose two documented meanings
+    // are one apart would refuse entries another implementation wrote correctly.
+    let length = u32_at(blob, 4) as usize;
+    if length != blob.len() - 13 && length != blob.len() - 12 {
         return Err(AdBlobError::NotUserProperties);
     }
     if u16_at(blob, 8) != 1 || u16_at(blob, 108) != PROPERTY_SIGNATURE {
@@ -585,6 +619,37 @@ mod tests {
         assert_eq!(*blob.last().unwrap(), 0, "Reserved5 must be zero");
     }
 
+    /// A writer that follows §2.2.10.1 literally counts `Reserved5` in `Length`, one octet
+    /// more than Windows does. Such a blob is correct by the specification, so it must be
+    /// read — and it is, because nothing here is located by `Length`.
+    #[test]
+    fn a_length_that_counts_reserved5_is_still_read() {
+        let mut blob = user_properties(&[(PROPERTY_KERBEROS_NEWER_KEYS, &[1, 2, 3, 4])]);
+        assert_eq!(u32_at(&blob, 4) as usize, blob.len() - 13);
+        let literal = (blob.len() - 12) as u32;
+        blob[4..8].copy_from_slice(&literal.to_le_bytes());
+        assert_eq!(
+            property_value(&blob, PROPERTY_KERBEROS_NEWER_KEYS)
+                .expect("the spec-conforming reading"),
+            b"01020304",
+            "the property is found under either reading of Length"
+        );
+    }
+
+    /// Anything else is a structure that does not describe itself, and is refused.
+    #[test]
+    fn a_length_that_describes_no_reading_of_the_blob_is_refused() {
+        for wrong in [0u32, 5, 96] {
+            let mut blob = user_properties(&[(PROPERTY_KERBEROS_NEWER_KEYS, &[1, 2, 3, 4])]);
+            blob[4..8].copy_from_slice(&wrong.to_le_bytes());
+            assert_eq!(
+                property_value(&blob, PROPERTY_KERBEROS_NEWER_KEYS).unwrap_err(),
+                AdBlobError::NotUserProperties,
+                "Length {wrong} describes nothing"
+            );
+        }
+    }
+
     #[test]
     fn an_empty_blob_is_111_octets_because_the_count_is_omitted() {
         // The one shape a caller would get wrong by analogy: with no properties
@@ -669,6 +734,64 @@ mod tests {
         assert_eq!(u16_at(&blob, 4), 4, "current");
         assert_eq!(u16_at(&blob, 8), 4, "one generation back");
         assert_eq!(u16_at(&blob, 10), 4, "and two, which it can still name");
+    }
+
+    /// The three generations must be three different versions. At `kvno` 0 and 1 the
+    /// arithmetic `kvno - 1` / `kvno - 2` either saturates or goes negative, and two of
+    /// the three names then describe the **same** keys: the blob would carry every key
+    /// twice, and a reader that trusts the counts would hand the KDC duplicates.
+    #[test]
+    fn the_generations_are_three_different_versions_even_at_the_first_kvno() {
+        let mut entry = HdbEntry::user(Principal::parse("new@EXAMPLE.COM").unwrap());
+        // The first password an account ever gets: kvno 0.
+        for enctype in [Enctype::Aes256Sha1, Enctype::Aes128Sha1] {
+            entry
+                .add_password_key(&OwnCipher, enctype, b"pw", 0)
+                .expect("a key");
+        }
+        assert_eq!(entry.kvno(), 0);
+
+        let blob = kerberos_newer_keys(&entry);
+        assert_eq!(u16_at(&blob, 0), 4, "revision");
+        assert_eq!(
+            (
+                u16_at(&blob, 4),
+                u16_at(&blob, 6),
+                u16_at(&blob, 8),
+                u16_at(&blob, 10)
+            ),
+            (2, 0, 0, 0),
+            "two keys, all current: nothing to repeat as old or older"
+        );
+
+        // And it reads back as two keys, not as six.
+        let properties = user_properties(&[(PROPERTY_KERBEROS_NEWER_KEYS, &blob)]);
+        let keys = keys(&properties, 0).expect("read back");
+        assert_eq!(keys.len(), 2, "each key once: {:?}", keys.len());
+    }
+
+    /// The same for `kvno` 1, where `kvno - 2` saturates onto `kvno - 1` rather than zero.
+    #[test]
+    fn an_entry_whose_keys_are_one_version_behind_is_not_written_twice() {
+        let mut entry = HdbEntry::user(Principal::parse("old@EXAMPLE.COM").unwrap());
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 0)
+            .expect("a key");
+        // The entry claims a version it has no keys for: the fallback presents the
+        // newest keys it does have as the current ones, and must do it once.
+        entry.kvno = 1;
+
+        let blob = kerberos_newer_keys(&entry);
+        assert_eq!(
+            (
+                u16_at(&blob, 4),
+                u16_at(&blob, 6),
+                u16_at(&blob, 8),
+                u16_at(&blob, 10)
+            ),
+            (1, 0, 0, 0),
+            "one current key, and no second copy under another name"
+        );
     }
 
     #[test]
@@ -774,10 +897,17 @@ mod tests {
     #[test]
     fn a_blob_that_is_not_user_properties_is_refused() {
         let full = supplemental_credentials(&entry());
-        // Truncated: the length field no longer describes the buffer.
-        assert_eq!(
-            credentials(&full[..full.len() - 1]),
-            Err(AdBlobError::NotUserProperties)
+        // Truncated: dropping `Reserved5` leaves a blob whose `Length` now equals the
+        // specification's literal reading, so it is not refused on the length alone — the
+        // property is then one octet short of the area it claims, and that is refused
+        // instead. Two refusals of the same corrupt blob, each naming the first thing it
+        // can prove is wrong.
+        assert!(
+            matches!(
+                credentials(&full[..full.len() - 1]),
+                Err(AdBlobError::NotUserProperties | AdBlobError::Inconsistent)
+            ),
+            "a blob without its final octet must not read"
         );
         // Signature tampered with.
         let mut wrong = full.clone();

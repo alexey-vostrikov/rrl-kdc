@@ -234,13 +234,20 @@ pub fn unseal_key(
     Ok(open)
 }
 
-/// Whether `bytes` looks like a sealed key rather than a plain one.
+/// Whether `bytes` can be a plain key of `enctype`.
 ///
-/// A sealed key is `confounder + key + tag`, so it is longer than the enctype's key by exactly the
-/// profile's overhead. This is how a decoder recognises one without being told: RFC 4757 and RFC 3961
-/// disagree about the overhead, and both are handled by the enctype's own arithmetic.
-pub fn is_sealed(bytes: &[u8], enctype: Enctype) -> bool {
-    bytes.len() > enctype.key_len() && bytes.len() == enctype.key_len() + enctype.overhead()
+/// The test is the length and nothing else, deliberately. A sealed key is `confounder + key + tag`,
+/// and **the overhead is the master key's, not the sealed key's**: a 32-octet `aes256-cts-hmac-sha384`
+/// key sealed under an `aes256-cts-hmac-sha1` master key is 32 + 16 + 12 = 60 octets, where that
+/// enctype's own overhead is 40. Computing the expected sealed length from the *key's* enctype — which
+/// is what this function first did — therefore misjudges every key whose enctype differs from the
+/// master's, and a live stand caught it: a sha384 key was reported as a 60-octet anomaly.
+///
+/// So the rule is the inverse and it does not need to know which key sealed what: a key whose length
+/// is not its enctype's cannot be plaintext, so it is sealed and needs the master key to open. Whether
+/// it opens at all is decided by the tag.
+pub fn is_plain_key(bytes: &[u8], enctype: Enctype) -> bool {
+    bytes.len() == enctype.key_len()
 }
 
 /// Writes a master keytab at `path`, which is what `kstash` produces: one `K/M` entry per key.
@@ -287,12 +294,48 @@ mod tests {
             60,
             "16 confounder + 32 key + 12 tag: what Heimdal's hprop sends"
         );
-        assert!(is_sealed(&sealed, Enctype::Aes256Sha1));
-        assert!(!is_sealed(&plain, Enctype::Aes256Sha1));
+        assert!(!is_plain_key(&sealed, Enctype::Aes256Sha1));
+        assert!(is_plain_key(&plain, Enctype::Aes256Sha1));
         assert_eq!(
             unseal_key(&OwnCipher, &master, &sealed, Enctype::Aes256Sha1).expect("opened"),
             plain
         );
+    }
+
+    /// A key whose enctype differs from the master's seals and opens, and the length of the result is
+    /// the **master's** overhead plus the key's size — not the sealed key's own overhead.
+    ///
+    /// This is the shape that broke a live stand: `aes256-cts-hmac-sha384` has a 40-octet overhead and
+    /// `aes256-cts-hmac-sha1` a 28-octet one, so a sha384 key sealed under a sha1 master is 60 octets,
+    /// which that enctype's own arithmetic calls impossible.
+    #[test]
+    fn a_key_of_another_enctype_seals_under_the_master() {
+        let master = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        let keys = MasterKeys::single(master.clone(), 1);
+        for (enctype, len) in [
+            (Enctype::Aes256Sha384, 32),
+            (Enctype::Aes256Sha1, 32),
+            (Enctype::Aes128Sha256, 16),
+            (Enctype::Aes128Sha1, 16),
+        ] {
+            let plain = vec![0x42u8; len];
+            let (sealed, kvno) = keys.seal(&OwnCipher, &plain).expect("sealed");
+            assert_eq!(
+                sealed.len(),
+                len + Enctype::Aes256Sha1.overhead(),
+                "{enctype:?}: the overhead is the master key's"
+            );
+            assert!(
+                !is_plain_key(&sealed, enctype),
+                "{enctype:?}: a sealed key is never its own length"
+            );
+            assert_eq!(
+                keys.unseal(&OwnCipher, &sealed, Some(kvno), enctype)
+                    .expect("opened"),
+                plain,
+                "{enctype:?}"
+            );
+        }
     }
 
     /// The usage is Heimdal's `HDB_KU_MKEY`. A different one produces a ciphertext that opens to

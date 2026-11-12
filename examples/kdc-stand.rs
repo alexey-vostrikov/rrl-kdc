@@ -22,6 +22,23 @@
 //! KDC_REALM=AD.EXAMPLE.COM KDC_HOST=samba.ad.example.com \
 //!   cargo run --example kdc-stand --features hdb-redb -- 0.0.0.0:88 /shared
 //! ```
+//!
+//! # A database on disk, and whether its keys are protected
+//!
+//! The stand keeps its realm in memory unless told otherwise, which is what a throwaway stand wants.
+//! Give it `KDC_DB` and `KDC_MKEY` and it keeps the realm in a redb file with **every key sealed
+//! under the master key** — the arrangement a real deployment runs in:
+//!
+//! ```sh
+//! KDC_DB=/shared/hdb.redb KDC_MKEY=/shared/m-key \
+//!   KDC_REALM=AD.EXAMPLE.COM KDC_HOST=samba.ad.example.com \
+//!   cargo run --example kdc-stand --features hdb-redb -- 0.0.0.0:88 /shared
+//! ```
+//!
+//! `KDC_MKEY` is a keytab with a `K/M@REALM` entry, which is what `kstash` writes and what
+//! `rrl_kdc::hdb::mkey::write_keytab` produces. The two variables go together: one without the other
+//! stops the stand at start-up, rather than starting a KDC whose keys are on disk in the clear or
+//! whose master key has nowhere to be applied.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -87,7 +104,16 @@ fn main() {
 
     eprintln!("kdc-stand: start");
     let cipher = OwnCipher;
-    let db = MemoryHdb::new();
+    // In memory, or a file with sealed keys: see this file's documentation. A configuration that
+    // names one variable and not the other stops here rather than starting a KDC that is not what
+    // the operator asked for.
+    let db = match stand_database() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("kdc-stand: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let mut krbtgt = HdbEntry::krbtgt(&realm);
     for enctype in Enctype::ALL {
@@ -104,7 +130,7 @@ fn main() {
         .map(|k| k.key.bytes().to_vec())
         .expect("the krbtgt entry has an AES-256 key");
     eprintln!("kdc-stand: krbtgt seeded");
-    db.insert(krbtgt).unwrap();
+    db.store(krbtgt).expect("the krbtgt entry is stored");
 
     // The machine's short name, uppercased, as AD spells a computer account.
     let machine = host.split('.').next().unwrap_or(&host).to_ascii_uppercase();
@@ -135,7 +161,8 @@ fn main() {
     }
     eprintln!("kdc-stand: machine seeded");
     // Cloned: the machine's keys go into the keytab as well as the database.
-    db.insert(machine_entry.clone()).unwrap();
+    db.store(machine_entry.clone())
+        .expect("the machine entry is stored");
 
     let mut administrator =
         HdbEntry::user(Principal::parse(&format!("administrator@{realm}")).unwrap());
@@ -149,7 +176,8 @@ fn main() {
             .unwrap();
     }
     eprintln!("kdc-stand: administrator seeded");
-    db.insert(administrator).unwrap();
+    db.store(administrator)
+        .expect("the administrator entry is stored");
 
     eprintln!("kdc-stand: services next");
     // One key, three names: what a service keytab contains when the same host runs
@@ -171,7 +199,7 @@ fn main() {
                 timestamp: 0,
             });
         }
-        db.insert(entry).unwrap();
+        db.store(entry).expect("a service entry is stored");
     }
     // The machine's own keys travel too: Samba reads its password from the join,
     // but a service that has to accept a ticket for the machine needs them.
@@ -230,7 +258,7 @@ fn main() {
             "aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96",
         )
         .unwrap();
-    let kdc = Kdc::new(config, Arc::new(db) as Arc<dyn Hdb>, Arc::new(cipher));
+    let kdc = Kdc::new(config, Arc::clone(&db), Arc::new(cipher));
 
     // A PAC only when asked for: the AD-join stand runs this example against a
     // realm whose accounts have no SIDs, and a PAC stating an invented identity
@@ -317,6 +345,66 @@ fn listen_host(listen: &str) -> String {
         }
         None => listen.to_owned(),
     }
+}
+
+/// The realm's database: in memory, or a sealed file when the stand was given a master key.
+///
+/// The two environment variables are all or nothing. `KDC_DB` without `KDC_MKEY` would be a KDC whose
+/// keys sit on disk in the clear — a file that forges tickets for the whole realm — and `KDC_MKEY`
+/// without `KDC_DB` has no file to seal. Both are configuration mistakes that would otherwise surface
+/// only as a subtlety in somebody's backup, so they stop the stand with a sentence naming the missing
+/// variable. That is the project's rule: a broken configuration fails loudly instead of quietly doing
+/// something else.
+#[cfg(feature = "hdb-redb")]
+fn stand_database() -> std::io::Result<Arc<dyn Hdb>> {
+    use rrl_kdc::hdb::RedbHdb;
+    use rrl_kdc::hdb::mkey::MasterKeys;
+
+    let path = std::env::var("KDC_DB").ok();
+    let keytab = std::env::var("KDC_MKEY").ok();
+    match (path, keytab) {
+        (None, None) => Ok(MemoryHdb::new().shared()),
+        (Some(_), None) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "KDC_DB is set and KDC_MKEY is not: the stand would write the realm's keys to disk in \
+             the clear. Set KDC_MKEY to a keytab with a K/M@REALM entry, or unset KDC_DB to keep \
+             the realm in memory",
+        )),
+        (None, Some(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "KDC_MKEY is set and KDC_DB is not: there is no file for it to seal. Set KDC_DB to the \
+             database path, or unset KDC_MKEY to keep the realm in memory",
+        )),
+        (Some(path), Some(keytab)) => {
+            let keys = MasterKeys::from_keytab(&keytab).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("KDC_MKEY={keytab}: {e}"),
+                )
+            })?;
+            eprintln!(
+                "kdc-stand: {path}, {} master key(s) from {keytab}, newest kvno {}",
+                keys.keys().len(),
+                keys.keys().first().map(|k| k.kvno).unwrap_or(0)
+            );
+            let hdb = RedbHdb::open_sealed(&path, keys, Arc::new(OwnCipher))
+                .map_err(|e| std::io::Error::other(format!("KDC_DB={path}: {e}")))?;
+            Ok(Arc::new(hdb))
+        }
+    }
+}
+
+/// A build without the redb backend has no file to seal, and accepting variables it would ignore is
+/// worse than refusing them.
+#[cfg(not(feature = "hdb-redb"))]
+fn stand_database() -> std::io::Result<Arc<dyn Hdb>> {
+    if std::env::var("KDC_DB").is_ok() || std::env::var("KDC_MKEY").is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "KDC_DB and KDC_MKEY need the `hdb-redb` feature, and this build does not have it",
+        ));
+    }
+    Ok(MemoryHdb::new().shared())
 }
 
 fn env(key: &str, default: &str) -> String {

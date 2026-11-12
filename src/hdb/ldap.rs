@@ -260,6 +260,20 @@ impl Attributes {
 /// The write direction. Every attribute it produces is one Heimdal's schema
 /// defines, plus the Microsoft ones when the entry has something to say in them.
 pub fn to_attributes(entry: &HdbEntry) -> Attributes {
+    // The plaintext path cannot fail: it seals nothing. `expect` states that rather than hiding an
+    // error — `to_attributes_with`'s only failure is a master key that cannot seal.
+    to_attributes_with(entry, None).expect("mapping an entry without a master key seals nothing")
+}
+
+/// The attributes of `entry`, sealing its keys under `master` when one is given.
+///
+/// A directory is a store like any other, and sealing here is what stops a read-only account that can
+/// see `krb5Key` from holding every key it can see. Heimdal does the same: `hdb-ldap.c` unseals each
+/// key it reads when the backend has a master key, and seals them when it writes.
+pub fn to_attributes_with(
+    entry: &HdbEntry,
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<Attributes> {
     let context = entry.principal.to_string();
     let mut out = Attributes::new();
 
@@ -272,7 +286,7 @@ pub fn to_attributes(entry: &HdbEntry) -> Attributes {
     out.set(attrs::KDC_FLAGS, entry.flags.to_string().into_bytes());
 
     for key in &entry.keys {
-        out.add(attrs::KEY, encode_key(key));
+        out.add(attrs::KEY, encode_key(key, master)?);
     }
 
     if let Some(etypes) = &entry.etypes {
@@ -344,7 +358,7 @@ pub fn to_attributes(entry: &HdbEntry) -> Attributes {
     for class in OBJECT_CLASSES {
         out.add("objectClass", class.as_bytes());
     }
-    out
+    Ok(out)
 }
 
 /// An entry from the attributes a directory holds.
@@ -353,6 +367,14 @@ pub fn to_attributes(entry: &HdbEntry) -> Attributes {
 /// written by other programs, and an entry that says two contradictory things is
 /// a fact an operator needs to hear about rather than a coin to flip.
 pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
+    from_attributes_with(attributes, None)
+}
+
+/// [`from_attributes`], opening sealed keys with `master`.
+pub fn from_attributes_with(
+    attributes: &Attributes,
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<HdbEntry> {
     let context = "krb5Principal";
     let name = attributes
         .text(attrs::PRINCIPAL_NAME, context)?
@@ -367,7 +389,7 @@ pub fn from_attributes(attributes: &Attributes) -> Result<HdbEntry> {
     let mut keys = Vec::new();
     for value in attributes.get(attrs::KEY) {
         keys.push(
-            decode_key(value)
+            decode_key(value, master)
                 .map_err(|e| Error::Hdb(format!("{principal}: {}: {e}", attrs::KEY)))?,
         );
     }
@@ -806,25 +828,49 @@ pub fn principal_from_spn(spn: &str, realm: &str) -> Result<Principal> {
 }
 
 /// One `krb5Key` value: the ASN.1 `Key`, DER.
-fn encode_key(key: &HdbKey) -> Vec<u8> {
+///
+/// With `master`, the key material is written sealed — `encrypt(master_key, HDB_KU_MKEY, key_bytes)` —
+/// and the value records which master key sealed it. A directory is a copy of the realm's keys like any
+/// other store: `krb5Key` is readable by anyone the directory lets read the attribute, and a read-only
+/// account with `krb5Key` in its ACL holds every key it can see.
+fn encode_key(
+    key: &HdbKey,
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<Vec<u8>> {
+    let (material, mkvno) = match master {
+        Some((cipher, keys)) => {
+            let (sealed, kvno) = keys.seal(cipher, key.key.bytes())?;
+            (sealed, Some(kvno))
+        }
+        None => (key.key.bytes().to_vec(), None),
+    };
     let mut parts = vec![
         crate::der::field(0, crate::der::int(key.kvno as i64)),
         crate::der::field(
             1,
             crate::der::seq(&[
                 crate::der::field(0, crate::der::int(key.key.enctype().id() as i64)),
-                crate::der::field(1, crate::der::octets(key.key.bytes())),
+                crate::der::field(1, crate::der::octets(&material)),
             ]),
         ),
     ];
     if let Some(salt) = &key.salt {
         parts.push(crate::der::field(2, crate::der::octets(salt)));
     }
-    crate::der::seq(&parts)
+    // `[3]`: which master key sealed this value. Written only when it is sealed, so a directory that
+    // holds plaintext keys — the common arrangement, protected by the directory's own ACL — is
+    // unchanged by this.
+    if let Some(mkvno) = mkvno {
+        parts.push(crate::der::field(3, crate::der::int(i64::from(mkvno))));
+    }
+    Ok(crate::der::seq(&parts))
 }
 
-/// The key a `krb5Key` value holds.
-fn decode_key(value: &[u8]) -> Result<HdbKey> {
+/// The key a `krb5Key` value holds, opening it when the value says it is sealed.
+fn decode_key(
+    value: &[u8],
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<HdbKey> {
     use crate::der::{Fields, Reader};
     let context = "krb5Key";
     let mut r = Reader::new(value);
@@ -835,13 +881,40 @@ fn decode_key(value: &[u8]) -> Result<HdbKey> {
     let id = ef.int(0, context)? as i32;
     let enctype = Enctype::from_id(id)
         .ok_or_else(|| Error::Hdb(format!("enctype {id} is not one this KDC implements")))?;
-    let key = Key::new(enctype, ef.octets(1, context)?)?;
+    let stored = ef.octets(1, context)?;
+    let mkvno = f
+        .opt_int(3, context)?
+        .map(|v| {
+            u32::try_from(v)
+                .map_err(|_| Error::Hdb(format!("{context}: mkvno {v} does not fit in 32 bits")))
+        })
+        .transpose()?;
+    // The value may be sealed, and a sealed blob is longer than the enctype accepts — so it is
+    // opened **before** `Key::new`, which would otherwise refuse it with a length error that says
+    // nothing about what is actually wrong.
+    let material = if crate::hdb::mkey::is_plain_key(stored, enctype) {
+        stored.to_vec()
+    } else {
+        let (cipher, keys) = master.ok_or_else(|| {
+            Error::Hdb(format!(
+                "a {}-octet {} key in {} is sealed under a master key{} and none was supplied",
+                stored.len(),
+                enctype.name(),
+                attrs::KEY,
+                match mkvno {
+                    Some(kvno) => format!(" ({kvno})"),
+                    None => String::new(),
+                }
+            ))
+        })?;
+        keys.unseal(cipher, stored, mkvno, enctype)?
+    };
+    let key = Key::new(enctype, material)?;
     Ok(HdbKey {
         kvno,
         key,
         salt: f.opt_octets(2, context)?.map(<[u8]>::to_vec),
-        // The directory holds the key as an attribute value; sealing it is the store's decision,
-        // not the mapping's.
+        // Cleared: the entry in memory holds plaintext, and `mkvno` describes the directory.
         mkvno: None,
     })
 }
@@ -888,12 +961,57 @@ pub trait Directory: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LdapHdb {
     directory: Arc<dyn Directory>,
+    /// The realm's master keys, when the directory holds sealed `krb5Key` values.
+    ///
+    /// `None` is the common arrangement: the directory keeps plaintext keys and protects them with its
+    /// own ACL and transport. Saying so explicitly is the point — a backend that guessed would write
+    /// unsealed keys while its operator believed otherwise.
+    master: Option<crate::hdb::mkey::MasterKeys>,
+    cipher: Arc<dyn crate::crypto::Cipher>,
 }
 
 impl LdapHdb {
     /// An `HDB` over `directory`.
     pub fn new(directory: Arc<dyn Directory>) -> Self {
-        LdapHdb { directory }
+        LdapHdb {
+            directory,
+            master: None,
+            cipher: Arc::new(crate::crypto::OwnCipher),
+        }
+    }
+
+    /// A backend that reads and writes `krb5Key` values sealed under `master`.
+    ///
+    /// Heimdal's LDAP backend does the same when it has a master key: it unseals what it reads
+    /// (`hdb-ldap.c`, `hdb_unseal_key`) and seals what it writes. The reason is the directory itself —
+    /// `krb5Key` is an attribute, and an account allowed to read it holds every key it can see.
+    pub fn with_master_keys(
+        mut self,
+        master: crate::hdb::mkey::MasterKeys,
+        cipher: Arc<dyn crate::crypto::Cipher>,
+    ) -> Result<Self> {
+        if master.is_empty() {
+            return Err(Error::Hdb(
+                "with_master_keys was given no master key: a directory told to seal with nothing \
+                 would hold the realm's keys in the clear while its operator believed otherwise"
+                    .into(),
+            ));
+        }
+        self.master = Some(master);
+        self.cipher = cipher;
+        Ok(self)
+    }
+
+    /// Whether this backend seals the keys it writes.
+    pub fn is_sealed(&self) -> bool {
+        self.master.is_some()
+    }
+
+    /// The pair the mapping functions take.
+    fn codec(&self) -> Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)> {
+        self.master
+            .as_ref()
+            .map(|keys| (self.cipher.as_ref(), keys))
     }
 
     /// The directory, for an embedder that needs to reach past the mapping.
@@ -907,7 +1025,7 @@ impl Hdb for LdapHdb {
         match self.directory.get(principal)? {
             None => Ok(None),
             Some(attributes) => {
-                let entry = from_attributes(&attributes)?;
+                let entry = from_attributes_with(&attributes, self.codec())?;
                 // A directory that returned somebody else's entry is a directory
                 // with a naming bug, and silently answering for the wrong
                 // principal would issue tickets for an account nobody asked for.
@@ -938,7 +1056,7 @@ impl Hdb for LdapHdb {
         let Some(attributes) = self.directory.get_by_spn(&spn)? else {
             return Ok(None);
         };
-        let entry = from_attributes(&attributes)?;
+        let entry = from_attributes_with(&attributes, self.codec())?;
         if !names_service(&attributes, &spn) {
             return Err(Error::Hdb(format!(
                 "{spn}: the directory answered with {}, which does not publish that                  service principal name",
@@ -949,7 +1067,7 @@ impl Hdb for LdapHdb {
     }
 
     fn store(&self, entry: HdbEntry) -> Result<()> {
-        let attributes = to_attributes(&entry);
+        let attributes = to_attributes_with(&entry, self.codec())?;
         self.directory.put(&entry.principal, &attributes)
     }
 
@@ -983,7 +1101,7 @@ impl Hdb for LdapHdb {
             None => {
                 return Err(Error::NotFound(from.to_string()));
             }
-            Some(attributes) => from_attributes(&attributes)?,
+            Some(attributes) => from_attributes_with(&attributes, self.codec())?,
         };
         entry.principal = to.clone();
         self.store(entry)?;
@@ -1063,6 +1181,87 @@ mod tests {
             .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 1)
             .unwrap();
         entry
+    }
+
+    /// A sealed directory value: no key in the clear, and the entry reads back with its key.
+    ///
+    /// The assertion is about the attribute bytes, not about the API. A backend that sealed on the way
+    /// out and opened on the way in but stored plaintext in between would pass every round trip and
+    /// protect nothing — and in a directory that matters more than in a file, because `krb5Key` is
+    /// readable by anyone the ACL lets read the attribute.
+    #[test]
+    fn a_sealed_entry_holds_no_plaintext_key_in_the_directory() {
+        use crate::crypto::{Cipher, OwnCipher};
+        use crate::hdb::mkey::MasterKeys;
+
+        let master = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        let keys = MasterKeys::single(master.clone(), 1);
+        let mut entry = HdbEntry::user(Principal::parse("alice@EXAMPLE.COM").expect("a name"));
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 1)
+            .expect("a key");
+        let plain = entry.keys[0].key.bytes().to_vec();
+
+        let sealed_attrs = to_attributes_with(&entry, Some((&OwnCipher, &keys))).expect("mapped");
+        for value in sealed_attrs.get(attrs::KEY) {
+            assert!(
+                !value.windows(plain.len()).any(|w| w == plain.as_slice()),
+                "a key was written to {attrs} in the clear",
+                attrs = attrs::KEY
+            );
+        }
+
+        // Reading it back needs the master key, and the refusal names it.
+        let err = from_attributes(&sealed_attrs).expect_err("sealed without a key");
+        assert!(
+            err.to_string().contains("sealed under a master key"),
+            "{err}"
+        );
+        let opened = from_attributes_with(&sealed_attrs, Some((&OwnCipher, &keys)))
+            .expect("the master key opens it");
+        assert_eq!(opened.keys[0].key.bytes(), plain.as_slice());
+
+        // A wrong master key is a key problem, not a record problem.
+        let other = MasterKeys::single(OwnCipher.random(Enctype::Aes256Sha1).unwrap(), 1);
+        let err = from_attributes_with(&sealed_attrs, Some((&OwnCipher, &other)))
+            .expect_err("the wrong key");
+        assert!(err.to_string().contains("does not open"), "{err}");
+
+        // And a plaintext entry still maps: a directory written before the realm had a master key is
+        // readable, and becomes sealed the next time it is written.
+        let plain_attrs = to_attributes(&entry);
+        let back = from_attributes_with(&plain_attrs, Some((&OwnCipher, &keys)))
+            .expect("a plaintext entry reads through a sealed backend");
+        assert_eq!(back.keys[0].key.bytes(), plain.as_slice());
+    }
+
+    /// The value is Heimdal's `Key` shape plus the `mkvno` this crate writes, and a value that says it
+    /// is sealed but carries no `mkvno` is still attempted against the whole set — because the tag
+    /// decides, and refusing on a missing number would refuse a directory another KDC wrote.
+    #[test]
+    fn a_sealed_value_without_a_number_is_tried_against_the_set() {
+        use crate::crypto::{Cipher, Enctype, OwnCipher};
+        use crate::hdb::mkey::{MasterKeys, seal_key};
+
+        let old = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        let new = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        let keys = MasterKeys::from_keys([(old.clone(), 1), (new, 2)]);
+        let material = seal_key(&OwnCipher, &old, &[0x5a; 32]).expect("sealed");
+
+        // The attribute value, hand-built: kvno, the sealed material, and no `[3]`.
+        let value = crate::der::seq(&[
+            crate::der::field(0, crate::der::int(1)),
+            crate::der::field(
+                1,
+                crate::der::seq(&[
+                    crate::der::field(0, crate::der::int(Enctype::Aes256Sha1.id() as i64)),
+                    crate::der::field(1, crate::der::octets(&material)),
+                ]),
+            ),
+        ]);
+        let opened =
+            decode_key(&value, Some((&OwnCipher, &keys))).expect("one of the keys opens it");
+        assert_eq!(opened.key.bytes(), [0x5a; 32]);
     }
 
     #[test]

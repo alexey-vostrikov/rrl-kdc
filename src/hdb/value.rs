@@ -419,9 +419,9 @@ fn keys_from(
                     // key** — Heimdal's `hdb_seal_keys_mkey` wraps it, and an AES-256 key arrives
                     // as a confounder, the key and a tag (60 octets). Saying "takes 32, got 60"
                     // would read as corruption; this says what it actually is, and what is missing.
-                    let material = if bytes.content.len() == enctype.key_len() {
+                    let material = if crate::hdb::mkey::is_plain_key(bytes.content, enctype) {
                         bytes.content.to_vec()
-                    } else if crate::hdb::mkey::is_sealed(bytes.content, enctype) {
+                    } else {
                         // A key sealed under the master key: `confounder + key + tag`, which for
                         // AES-256 is 60 octets where the key is 32. Heimdal's `hprop` sends exactly
                         // this when the master database is sealed, and unsealing is the only way to
@@ -437,13 +437,6 @@ fn keys_from(
                             ))
                         })?;
                         keys.unseal(cipher, bytes.content, mkvno, enctype)?
-                    } else {
-                        return Err(Error::Hdb(format!(
-                            "a {}-octet key for {}, which takes {}: neither a key nor a sealed one",
-                            bytes.content.len(),
-                            enctype.name(),
-                            enctype.key_len()
-                        )));
                     };
                     key = Some(
                         Key::new(enctype, material)

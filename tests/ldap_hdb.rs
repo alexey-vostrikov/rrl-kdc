@@ -160,6 +160,67 @@ fn kdc_over(directory: Arc<dyn Directory>) -> Kdc {
     )
 }
 
+/// A sealed LDAP backend: what the directory holds has no key in the clear, and it reads back.
+///
+/// The end-to-end shape matters more here than for a file: `krb5Key` is a *directory attribute*, and a
+/// read-only account with that attribute in its ACL holds every key it can see. Sealing it means such a
+/// copy is worthless without the master keytab, which is exactly what Heimdal's LDAP backend does when
+/// it has a master key.
+#[test]
+fn a_sealed_directory_holds_no_plaintext_key() {
+    use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
+    use rrl_kdc::hdb::mkey::MasterKeys;
+
+    let directory = Arc::new(FakeDirectory::new());
+    realm(&directory);
+    let master = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let keys = MasterKeys::single(master, 1);
+
+    let mut alice = HdbEntry::user(p("alice"));
+    alice
+        .add_password_key(&OwnCipher, Enctype::Aes256Sha1, PASSWORD.as_bytes(), 1)
+        .unwrap();
+    let plain = alice.keys[0].key.bytes().to_vec();
+
+    // Written through a sealed backend: the directory gets sealed values.
+    let sealed = LdapHdb::new(Arc::clone(&directory) as Arc<dyn Directory>)
+        .with_master_keys(keys.clone(), Arc::new(OwnCipher))
+        .expect("a sealed backend");
+    assert!(sealed.is_sealed());
+    sealed.store(alice).expect("stored");
+
+    // What the directory actually holds.
+    let stored = directory
+        .get(&p("alice"))
+        .expect("a lookup")
+        .expect("alice");
+    for value in stored.get(attrs::KEY) {
+        assert!(
+            !value.windows(plain.len()).any(|w| w == plain.as_slice()),
+            "a key was written to the directory in the clear"
+        );
+    }
+
+    // The same backend reads it back, and a backend without the key refuses by name.
+    let back = sealed.fetch(&p("alice")).expect("a fetch").expect("alice");
+    assert_eq!(back.keys[0].key.bytes(), plain.as_slice());
+
+    let unsealed = LdapHdb::new(Arc::clone(&directory) as Arc<dyn Directory>);
+    let err = unsealed
+        .fetch(&p("alice"))
+        .expect_err("a sealed attribute needs the master key");
+    assert!(
+        err.to_string().contains("sealed under a master key"),
+        "{err}"
+    );
+
+    // An empty key set is refused at construction: sealing with nothing is not a mode.
+    let err = LdapHdb::new(Arc::clone(&directory) as Arc<dyn Directory>)
+        .with_master_keys(MasterKeys::none(), Arc::new(OwnCipher))
+        .expect_err("no master key");
+    assert!(err.to_string().contains("no master key"), "{err}");
+}
+
 #[test]
 fn a_client_logs_in_against_a_kdc_whose_database_is_attributes() {
     // The whole chain: attributes → HdbEntry → the engine → a ticket, and a

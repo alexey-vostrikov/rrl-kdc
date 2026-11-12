@@ -357,7 +357,7 @@ pub fn decode_with(
                 })?;
                 master.unseal(cipher, stored, Some(kvno), enctype)?
             }
-            None if crate::hdb::mkey::is_sealed(stored, enctype) => {
+            None if !crate::hdb::mkey::is_plain_key(stored, enctype) => {
                 return Err(Error::Hdb(format!(
                     "a {}-octet key for {} carries no `mkvno`: it is sealed, and the record does not \
                      say which master key sealed it",

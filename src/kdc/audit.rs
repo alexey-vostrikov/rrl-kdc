@@ -29,15 +29,24 @@
 //! # Three layers, and why there are three
 //!
 //! * [`Record`] is the decision, as data. Everything above can be replaced without changing it.
-//! * [`Audit`] takes records. A deployment that batches, samples, signs or ships them to a collector
-//!   implements this, and the KDC calls nothing else.
-//! * [`AuditDriver`] takes **lines**. It exists because most places an audit trail goes are not
-//!   `std::io::Write` — `syslog(3)` is a C function returning nothing, journald frames fields over a
-//!   socket, a collector is an HTTP client. Each is a few lines behind the trait, and none of them
-//!   can be a `Write` without inventing an error type the caller then has to ignore.
+//! * [`Audit`] takes records. A deployment that batches, samples, signs or ships them implements
+//!   this, and the KDC calls nothing else.
+//! * [`AuditDriver`] takes records too, and is where an exporter lives. It exists so that the
+//!   transport is a seam: `syslog(3)`, journald, a file and an OTLP exporter have nothing in common
+//!   except that they want the decision.
 //!
-//! [`StreamAudit`] is the bridge a deployment usually wants: `Audit` over a driver, one line per
-//! record. It is not the only way — it is the shortest one that is durable by default.
+//! [`DriverAudit`] is the bridge a deployment usually wants: `Audit` over a driver. It renders
+//! nothing — a driver that wants text asks for [`Record::to_line`], which is one rendering among
+//! several and a lossy one by construction.
+//!
+//! # OpenTelemetry
+//!
+//! An OTLP log record carries a body **and** attributes, so the mapping is part of the contract
+//! rather than something an exporter invents: [`Record::attributes`] gives a stable key set
+//! (`kerberos.*` for this protocol's own facts, `client.address` where the OpenTelemetry semantic
+//! conventions already name one), [`Record::severity_number`] follows their `SeverityNumber`
+//! enumeration (9 `INFO`, 13 `WARN`), and the body is [`Record::to_line`]. An exporter ships those
+//! four things and nothing else, which means two deployments' dashboards agree.
 //!
 //! # A sink cannot fail
 //!
@@ -162,40 +171,49 @@ impl Audit for Collector {
     }
 }
 
-/// Where a line of audit goes: a file, a pipe, syslog, journald, an HTTP collector.
+/// Where an audit record goes: a file, a pipe, syslog, journald, an OTLP exporter.
 ///
-/// A trait rather than `std::io::Write`, because most of the places a deployment would want to put
-/// an audit trail are not writers. `syslog(3)` is a C function that takes a string and returns
-/// nothing; journald's native protocol is a socket that frames fields, not lines; a collector is an
-/// HTTP client. Each of those is three lines behind this trait and none of them can be expressed as
-/// a `Write` without inventing an error type the caller would then have to ignore — which is the
-/// same reason [`Audit::record`] cannot fail, one level down.
+/// **A driver receives the [`Record`], not a rendered line.** The line is one rendering among
+/// several, and a driver that could only take text would force every destination through it: an
+/// OpenTelemetry log record carries a body *and* attributes, a journald entry carries fields, and a
+/// collector indexes by attribute. Handing a driver a string would mean re-parsing our own line at
+/// the far end, which is a private format nobody asked to support.
+///
+/// Not `std::io::Write` either: `syslog(3)` is a C function that returns nothing, journald frames
+/// fields over a socket, and an OTLP exporter is a client with its own batching and retry. Each is a
+/// few lines behind this trait; none of them is a writer.
+///
+/// A driver is where batching and retry live — an OTLP exporter is expected to buffer and to fail
+/// asynchronously — which is why the trait has no `flush` and no error. The seam is the record; what
+/// happens after it is the exporter's business.
 pub trait AuditDriver: Send + Sync {
-    /// Takes one line, **without** a trailing newline.
+    /// Takes one decision.
     ///
-    /// Returns nothing: a driver that cannot write has nowhere to report it that is not the
-    /// authentication path. It reports on its own channel, or not at all.
-    fn emit(&self, line: &str);
+    /// Returns nothing: a driver that cannot deliver has nowhere to report it that is not the
+    /// authentication path. It reports on its own channel — an exporter's metrics, the deployment's
+    /// logging — or not at all.
+    fn emit(&self, record: &Record);
 }
 
-/// Any closure is a driver, which is what makes a deployment's own sink short: a syslog call, a
+/// Any closure is a driver, which is what makes a deployment's own sink short: a `syslog` call, a
 /// channel send, a counter in a test.
 impl<F> AuditDriver for F
 where
-    F: Fn(&str) + Send + Sync,
+    F: Fn(&Record) + Send + Sync,
 {
-    fn emit(&self, line: &str) {
-        self(line);
+    fn emit(&self, record: &Record) {
+        self(record);
     }
 }
 
-/// A driver over anything that takes bytes, flushing after every line.
+/// A driver over anything that takes bytes, writing [`Record::to_line`] and flushing after every
+/// record.
 ///
 /// **The flush is the point.** An audit trail that sits in a buffer when the process dies is a trail
 /// missing exactly the records that matter — the last ones, before whatever killed it. The cost is a
 /// write syscall per request, which a KDC issuing thousands of tickets a second will feel; a
-/// deployment that wants batching writes its own [`Audit`] over the same [`Record`], where the
-/// trade is visible rather than hidden in a sink that claims to be durable.
+/// deployment that wants batching writes its own [`Audit`] — or its own driver — where the trade is
+/// visible rather than hidden in a sink that claims to be durable.
 pub struct ToWriter<W: std::io::Write + Send> {
     out: Mutex<W>,
 }
@@ -217,26 +235,27 @@ impl<W: std::io::Write + Send> ToWriter<W> {
 }
 
 impl<W: std::io::Write + Send> AuditDriver for ToWriter<W> {
-    fn emit(&self, line: &str) {
+    fn emit(&self, record: &Record) {
         // A write failure is swallowed here for the same reason the trait returns nothing: a full
         // disk must not refuse a login the realm would grant.
         let Ok(mut out) = self.out.lock() else {
             return;
         };
-        let _ = writeln!(out, "{line}");
+        let _ = writeln!(out, "{}", record.to_line());
         let _ = out.flush();
     }
 }
 
-/// A sink that renders each record as one line and hands it to a driver.
+/// An [`Audit`] that hands every record to a driver.
 ///
-/// One line, because that is what every log collector in existence can index: a multi-line record is
-/// one event split into several, and the next record's first line arrives in the middle of it.
-pub struct StreamAudit<D: AuditDriver> {
+/// The shortest wiring a deployment needs: `Kdc::with_audit(Arc::new(DriverAudit::new(exporter)))`.
+/// It does not render, aggregate or batch — a driver that wants any of that does it, because the
+/// record is structured and the exporter is the only thing that knows what its destination takes.
+pub struct DriverAudit<D: AuditDriver> {
     driver: D,
 }
 
-impl<D: AuditDriver> StreamAudit<D> {
+impl<D: AuditDriver> DriverAudit<D> {
     /// Wraps `driver`.
     pub fn new(driver: D) -> Self {
         Self { driver }
@@ -248,34 +267,106 @@ impl<D: AuditDriver> StreamAudit<D> {
     }
 }
 
-impl<D: AuditDriver> Audit for StreamAudit<D> {
+impl<D: AuditDriver> Audit for DriverAudit<D> {
     fn record(&self, record: &Record) {
-        self.driver.emit(&record.to_string());
+        self.driver.emit(record);
+    }
+}
+
+impl Record {
+    /// The record as one line — **a rendering, not the record**.
+    ///
+    /// One line because that is what every line-oriented collector can index: a multi-line record is
+    /// one event split into several, and the next record's first line arrives in the middle of it.
+    /// Anything that can carry structure should take [`Record::attributes`] instead; this is for
+    /// files, `syslog` and pipes.
+    pub fn to_line(&self) -> String {
+        let mut out = format!("at={} {}", self.at, self.exchange.as_str());
+        out.push_str(match self.outcome {
+            Outcome::Issued => " issued",
+            Outcome::Refused => " refused",
+        });
+        if let Some(client) = &self.client {
+            out.push_str(&format!(" client={client}"));
+        }
+        if let Some(service) = &self.service {
+            out.push_str(&format!(" service={service}"));
+        }
+        out.push_str(&format!(" realm={}", self.realm));
+        if let Some(peer) = self.peer {
+            out.push_str(&format!(" peer={peer}"));
+        }
+        if let Some(code) = self.code {
+            out.push_str(&format!(" code={code}"));
+        }
+        out
+    }
+
+    /// The record as OpenTelemetry attributes: a stable key set, in a stable order.
+    ///
+    /// The `kerberos.*` keys are this crate's own — the protocol has facts OpenTelemetry's semantic
+    /// conventions do not name, and inventing a key per deployment would make two dashboards
+    /// describe different realms. `client.address` is theirs, and is used where they define it.
+    ///
+    /// Absent facts are **absent keys**, not empty strings: an exporter that emitted
+    /// `kerberos.client=""` for a refusal that never named a client would put an account with no
+    /// name into a group-by.
+    pub fn attributes(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![
+            ("kerberos.exchange", self.exchange.as_str().to_owned()),
+            (
+                "kerberos.outcome",
+                match self.outcome {
+                    Outcome::Issued => "issued".to_owned(),
+                    Outcome::Refused => "refused".to_owned(),
+                },
+            ),
+            ("kerberos.realm", self.realm.clone()),
+        ];
+        if let Some(client) = &self.client {
+            out.push(("kerberos.client", client.to_string()));
+        }
+        if let Some(service) = &self.service {
+            out.push(("kerberos.service", service.to_string()));
+        }
+        if let Some(peer) = self.peer {
+            // The semantic convention's own key, so a collector can join this with whatever else it
+            // knows about that address without being taught a second spelling.
+            out.push(("client.address", peer.to_string()));
+        }
+        if let Some(code) = self.code {
+            out.push(("kerberos.error_code", code.to_string()));
+        }
+        out
+    }
+
+    /// The OpenTelemetry `SeverityNumber` for this decision.
+    ///
+    /// `9` (`INFO`) for a ticket, `13` (`WARN`) for a refusal. Not `ERROR`: a refusal is the KDC
+    /// working — a wrong password is a fact about a client, not a fault in this server — and a
+    /// dashboard that paints every wrong password red teaches its readers to ignore red. A realm
+    /// that wants errors has [`Record::code`] to alert on, which is the number that distinguishes
+    /// "wrong password" from "the database is gone".
+    pub fn severity_number(&self) -> i32 {
+        match self.outcome {
+            Outcome::Issued => 9,
+            Outcome::Refused => 13,
+        }
+    }
+
+    /// The OpenTelemetry `SeverityText` that goes with [`Self::severity_number`].
+    pub fn severity_text(&self) -> &'static str {
+        match self.outcome {
+            Outcome::Issued => "INFO",
+            Outcome::Refused => "WARN",
+        }
     }
 }
 
 impl std::fmt::Display for Record {
-    /// One line, for a sink that writes to a file: `at=… as refused service=… realm=… peer=… code=…`.
+    /// [`Record::to_line`], so that `{record}` and `record.to_line()` cannot disagree.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "at={} {}", self.at, self.exchange.as_str())?;
-        match self.outcome {
-            Outcome::Issued => write!(f, " issued")?,
-            Outcome::Refused => write!(f, " refused")?,
-        }
-        if let Some(client) = &self.client {
-            write!(f, " client={client}")?;
-        }
-        if let Some(service) = &self.service {
-            write!(f, " service={service}")?;
-        }
-        write!(f, " realm={}", self.realm)?;
-        if let Some(peer) = self.peer {
-            write!(f, " peer={peer}")?;
-        }
-        if let Some(code) = self.code {
-            write!(f, " code={code}")?;
-        }
-        Ok(())
+        f.write_str(&self.to_line())
     }
 }
 
@@ -376,21 +467,18 @@ mod tests {
         assert_eq!(ats, vec![10, 20, 30]);
     }
 
-    /// A closure is a driver, and it receives one line per record, in order, with no newline.
+    /// A closure is a driver, and it receives the **record**, not a rendering of it.
     ///
-    /// This is the shape a deployment's own sink takes — a syslog call, a channel send, a counter —
-    /// and the absence of a trailing newline is part of the contract: the driver decides how lines
-    /// are framed, because journald and a file disagree about it.
+    /// That is the property an OTLP exporter depends on: a driver handed a formatted line would have
+    /// to re-parse this crate's private text to recover the fields, and a collector indexing by
+    /// attribute would be indexing a string it was never given.
     #[test]
-    fn a_closure_is_a_driver() {
-        let lines = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+    fn a_closure_is_a_driver_and_receives_the_record() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<Record>::new()));
         let sink = {
-            let lines = std::sync::Arc::clone(&lines);
-            StreamAudit::new(move |line: &str| {
-                lines
-                    .lock()
-                    .expect("a test's lock is never poisoned")
-                    .push(line.to_owned());
+            let seen = std::sync::Arc::clone(&seen);
+            DriverAudit::new(move |record: &Record| {
+                seen.lock().expect("a test's lock").push(record.clone());
             })
         };
         for at in [1, 2] {
@@ -400,19 +488,22 @@ mod tests {
                 client: Some(principal("alice@EXAMPLE.COM")),
                 service: None,
                 realm: "EXAMPLE.COM".into(),
-                peer: None,
+                peer: Some("198.51.100.4".parse().expect("an address")),
                 outcome: Outcome::Issued,
                 code: None,
             });
         }
-        let lines = lines.lock().expect("a test's lock").clone();
+        let seen = seen.lock().expect("a test's lock").clone();
+        assert_eq!(seen.len(), 2, "one record per decision, in order");
+        assert_eq!(seen[1].at, 2);
+        // The structure survived: fields are fields, not bytes in a line.
         assert_eq!(
-            lines,
-            vec![
-                "at=1 as issued client=alice@EXAMPLE.COM realm=EXAMPLE.COM",
-                "at=2 as issued client=alice@EXAMPLE.COM realm=EXAMPLE.COM",
-            ],
-            "one line per record, in order, and the driver adds no framing of its own"
+            seen[0].client.as_ref().map(ToString::to_string).as_deref(),
+            Some("alice@EXAMPLE.COM")
+        );
+        assert_eq!(
+            seen[0].peer.map(|p| p.to_string()).as_deref(),
+            Some("198.51.100.4")
         );
     }
 
@@ -440,7 +531,7 @@ mod tests {
         }
 
         let log = std::sync::Arc::new(Mutex::new((String::new(), 0usize)));
-        let sink = StreamAudit::new(ToWriter::new(Tap(std::sync::Arc::clone(&log))));
+        let sink = DriverAudit::new(ToWriter::new(Tap(std::sync::Arc::clone(&log))));
         sink.record(&Record {
             at: 7,
             exchange: Exchange::Tgs,
@@ -455,6 +546,104 @@ mod tests {
         let (text, flushes) = log.lock().expect("a test's lock").clone();
         assert_eq!(text, "at=7 tgs refused realm=EXAMPLE.COM code=12\n");
         assert_eq!(flushes, 1, "flushed before the record was taken");
+    }
+
+    /// The OpenTelemetry attributes carry a stable key set, and an unknown fact is an absent key.
+    ///
+    /// An exporter that emitted `kerberos.client=""` for a refusal that named nobody would put an
+    /// account with no name into a group-by — so absence is expressed by absence.
+    #[test]
+    fn the_attributes_are_stable_and_absent_facts_are_absent_keys() {
+        let full = Record {
+            at: 1_700_000_000,
+            exchange: Exchange::Tgs,
+            client: Some(principal("alice@EXAMPLE.COM")),
+            service: Some(principal("cifs/files@EXAMPLE.COM")),
+            realm: "EXAMPLE.COM".into(),
+            peer: Some("192.0.2.7".parse().expect("an address")),
+            outcome: Outcome::Refused,
+            code: Some(crate::error::codes::KDC_ERR_S_PRINCIPAL_UNKNOWN),
+        };
+        assert_eq!(
+            full.attributes(),
+            vec![
+                ("kerberos.exchange", "tgs".to_owned()),
+                ("kerberos.outcome", "refused".to_owned()),
+                ("kerberos.realm", "EXAMPLE.COM".to_owned()),
+                ("kerberos.client", "alice@EXAMPLE.COM".to_owned()),
+                ("kerberos.service", "cifs/files@EXAMPLE.COM".to_owned()),
+                ("client.address", "192.0.2.7".to_owned()),
+                ("kerberos.error_code", "7".to_owned()),
+            ],
+            "keys and order are the contract an exporter ships"
+        );
+
+        // A refusal that named nobody: no `kerberos.client` key at all, not an empty value.
+        let bare = Record {
+            client: None,
+            service: None,
+            peer: None,
+            code: Some(60),
+            ..full.clone()
+        };
+        let keys: Vec<&str> = bare.attributes().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "kerberos.exchange",
+                "kerberos.outcome",
+                "kerberos.realm",
+                "kerberos.error_code"
+            ]
+        );
+
+        // The address uses the semantic convention's key, so a collector can join on it.
+        assert!(
+            full.attributes()
+                .iter()
+                .any(|(k, _)| *k == "client.address")
+        );
+    }
+
+    /// Severity: a refusal is `WARN`, not `ERROR`. A dashboard that paints every wrong password red
+    /// teaches its readers to ignore red.
+    #[test]
+    fn severity_separates_a_refusal_from_a_fault() {
+        let issued = Record {
+            at: 1,
+            exchange: Exchange::As,
+            client: None,
+            service: None,
+            realm: "EXAMPLE.COM".into(),
+            peer: None,
+            outcome: Outcome::Issued,
+            code: None,
+        };
+        assert_eq!(issued.severity_number(), 9);
+        assert_eq!(issued.severity_text(), "INFO");
+        let refused = Record {
+            outcome: Outcome::Refused,
+            code: Some(24),
+            ..issued.clone()
+        };
+        assert_eq!(refused.severity_number(), 13);
+        assert_eq!(refused.severity_text(), "WARN");
+    }
+
+    /// `{record}` and `record.to_line()` cannot disagree, because one is the other.
+    #[test]
+    fn display_and_to_line_are_one_rendering() {
+        let record = Record {
+            at: 42,
+            exchange: Exchange::Undecodable,
+            client: None,
+            service: None,
+            realm: "EXAMPLE.COM".into(),
+            peer: None,
+            outcome: Outcome::Refused,
+            code: Some(60),
+        };
+        assert_eq!(record.to_string(), record.to_line());
     }
 
     /// A record prints as one line, and a refusal names its code.

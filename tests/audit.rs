@@ -203,30 +203,29 @@ fn an_undecodable_request_is_recorded_too() {
     assert!(records[0].code.is_some(), "and the code is the one sent");
 }
 
-/// The whole path end to end through a driver: a closure receives one line per decision, and the
-/// lines say what the records said.
+/// The whole path end to end through a driver: the driver receives the decisions themselves, and
+/// they say what the reply said.
 ///
-/// This is the shape a deployment takes — a `syslog` call, a channel, a counter — and testing it
-/// through the engine rather than through the types is what proves the wiring: a `StreamAudit` that
-/// nobody handed to a `Kdc` would pass every test in the module above.
+/// This is the shape a deployment takes — a `syslog` call, a channel, an OTLP exporter — and testing
+/// it through the engine rather than through the types is what proves the wiring: a `DriverAudit`
+/// that nobody handed to a `Kdc` would pass every test in the module above and record nothing.
 #[test]
-fn a_driver_receives_one_line_per_decision() {
-    use rrl_kdc::kdc::audit::StreamAudit;
+fn a_driver_receives_the_decisions_themselves() {
+    use rrl_kdc::kdc::audit::DriverAudit;
     use std::sync::Mutex;
 
-    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = StreamAudit::new({
-        let lines = Arc::clone(&lines);
-        move |line: &str| {
-            lines
-                .lock()
+    let seen = Arc::new(Mutex::new(Vec::<Record>::new()));
+    let sink = DriverAudit::new({
+        let seen = Arc::clone(&seen);
+        move |record: &Record| {
+            seen.lock()
                 .expect("a test's lock is never poisoned")
-                .push(line.to_owned())
+                .push(record.clone())
         }
     });
     let kdc = kdc(Arc::new(sink) as Arc<dyn Audit>);
 
-    // One granted, one refused: two decisions, two lines.
+    // One granted, one refused: two decisions, and the driver saw both as records.
     kdc.handle_from(
         &as_req(
             "alice",
@@ -237,24 +236,45 @@ fn a_driver_receives_one_line_per_decision() {
     );
     kdc.handle_from(&as_req("nobody", Vec::new()), NOW, None);
 
-    let lines = lines.lock().expect("a test's lock").clone();
-    assert_eq!(lines.len(), 2, "two requests, two lines: {lines:?}");
+    let seen = seen.lock().expect("a test's lock").clone();
+    assert_eq!(seen.len(), 2, "two requests, two records");
+
+    let granted = &seen[0];
+    assert_eq!(granted.outcome, Outcome::Issued);
     assert_eq!(
-        lines[0],
-        format!(
-            "at={NOW} as issued client=alice@EXAMPLE.COM service=krbtgt/EXAMPLE.COM@EXAMPLE.COM \
-             realm=EXAMPLE.COM peer=192.0.2.9"
-        )
+        granted.client.as_ref().map(ToString::to_string).as_deref(),
+        Some("alice@EXAMPLE.COM")
     );
-    assert!(
-        lines[1].contains("as refused") && lines[1].contains("client=nobody@EXAMPLE.COM"),
-        "the refusal names who asked: {}",
-        lines[1]
+    assert_eq!(
+        granted.attributes(),
+        vec![
+            ("kerberos.exchange", "as".to_owned()),
+            ("kerberos.outcome", "issued".to_owned()),
+            ("kerberos.realm", REALM.to_owned()),
+            ("kerberos.client", "alice@EXAMPLE.COM".to_owned()),
+            (
+                "kerberos.service",
+                "krbtgt/EXAMPLE.COM@EXAMPLE.COM".to_owned()
+            ),
+            ("client.address", "192.0.2.9".to_owned()),
+        ],
+        "the attributes an exporter would ship, exactly"
     );
+
+    let refused = &seen[1];
+    assert_eq!(refused.outcome, Outcome::Refused);
+    assert_eq!(refused.code, Some(codes::KDC_ERR_C_PRINCIPAL_UNKNOWN));
+    assert_eq!(refused.severity_number(), 13, "WARN");
+    assert_eq!(
+        refused.client.as_ref().map(ToString::to_string).as_deref(),
+        Some("nobody@EXAMPLE.COM"),
+        "a refusal records who asked"
+    );
+    // And the line rendering is still there for a sink that wants text.
     assert!(
-        lines[1].contains(&format!("code={}", codes::KDC_ERR_C_PRINCIPAL_UNKNOWN)),
-        "and the code the client got: {}",
-        lines[1]
+        refused.to_line().contains("code=6"),
+        "{}",
+        refused.to_line()
     );
 }
 

@@ -415,6 +415,9 @@ pub fn keys(blob: &[u8], kvno: u32) -> Result<Vec<crate::hdb::HdbKey>, AdBlobErr
             key: crate::crypto::Key::new(c.enctype, c.key)
                 .expect("credentials() validated every key's length"),
             salt: c.salt,
+            // A blob from a directory holds plaintext keys: an AD stores them under its own
+            // protection, and what arrives here is already the material itself.
+            mkvno: None,
         })
         .collect())
 }

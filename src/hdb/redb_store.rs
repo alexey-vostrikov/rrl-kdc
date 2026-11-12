@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
+use crate::crypto::{Cipher, OwnCipher};
 use crate::error::{Error, Result};
+use crate::hdb::mkey::MasterKeys;
 use crate::name::Principal;
 
 use crate::acl::{AclRule, AclStore, Targets};
@@ -57,6 +59,14 @@ const POLICIES: TableDefinition<'_, &'static str, &'static [u8]> =
 pub struct RedbHdb {
     db: Database,
     path: PathBuf,
+    /// The realm's master keys, when this database stores its keys sealed.
+    ///
+    /// `None` is not an oversight: a realm that has not provisioned a master key stores plaintext
+    /// keys, and the file is then only as private as its permissions. Every caller that means to
+    /// protect the database has to say so, which is why this is not a default.
+    master: Option<MasterKeys>,
+    /// The realm's cipher, for sealing and opening. Unused without a master key.
+    cipher: std::sync::Arc<dyn Cipher>,
 }
 
 impl RedbHdb {
@@ -76,7 +86,115 @@ impl RedbHdb {
             txn.open_table(POLICIES).map_err(store_err)?;
         }
         txn.commit().map_err(store_err)?;
-        Ok(RedbHdb { db, path })
+        Ok(RedbHdb {
+            db,
+            path,
+            master: None,
+            cipher: std::sync::Arc::new(OwnCipher),
+        })
+    }
+
+    /// Opens (or creates) a database that stores its keys sealed under `master`.
+    ///
+    /// The keys are the realm: a file of them in the clear is a file that forges tickets. With a
+    /// master key every key on disk is `encrypt(master_key, HDB_KU_MKEY, key_bytes)`, and the file is
+    /// worthless without the keytab — which is the arrangement Heimdal has and the one an operator
+    /// expects from a KDC.
+    ///
+    /// An existing database is **read** through the same key set, so a realm that seals its keys can
+    /// still open a file written before it did: a key with no `mkvno` is plaintext, and this backend
+    /// leaves it alone until it is written again.
+    pub fn open_sealed(
+        path: impl AsRef<Path>,
+        master: MasterKeys,
+        cipher: std::sync::Arc<dyn Cipher>,
+    ) -> Result<Self> {
+        let mut hdb = Self::open(path)?;
+        if master.is_empty() {
+            return Err(Error::Hdb(
+                "open_sealed was given no master key: a sealed database needs at least one, and a \
+                 database that silently stored plaintext under this name would be the mistake this \
+                 constructor exists to prevent"
+                    .into(),
+            ));
+        }
+        hdb.master = Some(master);
+        hdb.cipher = cipher;
+        Ok(hdb)
+    }
+
+    /// Whether this handle writes sealed keys.
+    pub fn is_sealed(&self) -> bool {
+        self.master.is_some()
+    }
+
+    /// The master key set, when there is one.
+    pub fn master_keys(&self) -> Option<&MasterKeys> {
+        self.master.as_ref()
+    }
+
+    /// The stored bytes of one entry, exactly as the file holds them.
+    ///
+    /// A test needs this to judge the storage rather than the API: an entry that round trips through
+    /// `store`/`fetch` says nothing about what is on disk.
+    pub fn raw_record(&self, principal: &Principal) -> Result<Vec<u8>> {
+        let k = record::key(principal);
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(ENTRIES).map_err(store_err)?;
+        match table.get(k.as_str()).map_err(store_err)? {
+            None => Err(Error::Hdb(format!("{principal} is not in this database"))),
+            Some(value) => Ok(value.value().to_vec()),
+        }
+    }
+
+    /// The pair `record::encode_with`/`decode_with` take.
+    fn codec(&self) -> Option<(&dyn Cipher, &MasterKeys)> {
+        self.master
+            .as_ref()
+            .map(|keys| (self.cipher.as_ref(), keys))
+    }
+
+    /// Re-seals every entry under the newest master key.
+    ///
+    /// This is what a master-key roll needs: add a key, call this, and every record names the new one;
+    /// the old key can then be removed. Entries already sealed with the newest key are rewritten as
+    /// they are, so a second call is harmless.
+    ///
+    /// One transaction for the whole database: a roll that stopped half way would leave a realm whose
+    /// entries name two keys, and the point of the operation is that it stops naming the old one.
+    pub fn reseal(&self) -> Result<usize> {
+        let Some(codec) = self.codec() else {
+            return Err(Error::Hdb(
+                "reseal needs a master key: this handle stores plaintext keys".into(),
+            ));
+        };
+        let entries: Vec<(String, Vec<u8>)> = {
+            let txn = self.db.begin_read().map_err(store_err)?;
+            let table = txn.open_table(ENTRIES).map_err(store_err)?;
+            let mut out = Vec::new();
+            for row in table.iter().map_err(store_err)? {
+                let (k, v) = row.map_err(store_err)?;
+                out.push((k.value().to_owned(), v.value().to_vec()));
+            }
+            out
+        };
+        let mut resealed = Vec::with_capacity(entries.len());
+        for (key, bytes) in entries {
+            // Opened, then written again: that is what turns the old `mkvno` into the new one.
+            let entry = record::decode_with(&bytes, Some(codec))?;
+            resealed.push((key, record::encode_with(&entry, Some(codec))?));
+        }
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(ENTRIES).map_err(store_err)?;
+            for (key, bytes) in &resealed {
+                table
+                    .insert(key.as_str(), bytes.as_slice())
+                    .map_err(store_err)?;
+            }
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(resealed.len())
     }
 
     /// The file this backend is using.
@@ -99,7 +217,7 @@ impl RedbHdb {
         let txn = self.db.begin_read().map_err(store_err)?;
         let entries = txn.open_table(ENTRIES).map_err(store_err)?;
         if let Some(value) = entries.get(k.as_str()).map_err(store_err)? {
-            return Ok(Some(record::decode(value.value())?));
+            return Ok(Some(record::decode_with(value.value(), self.codec())?));
         }
         let aliases = txn.open_table(ALIASES).map_err(store_err)?;
         let Some(target) = aliases.get(k.as_str()).map_err(store_err)? else {
@@ -108,7 +226,7 @@ impl RedbHdb {
         let target = target.value().to_owned();
         match entries.get(target.as_str()).map_err(store_err)? {
             None => Ok(None),
-            Some(value) => Ok(Some(record::decode(value.value())?)),
+            Some(value) => Ok(Some(record::decode_with(value.value(), self.codec())?)),
         }
     }
 }
@@ -168,7 +286,9 @@ impl Hdb for RedbHdb {
 
     fn store(&self, entry: HdbEntry) -> Result<()> {
         let k = record::key(&entry.principal);
-        let bytes = record::encode(&entry);
+        // Sealed here, on the way out: `entry` holds plaintext because that is what a KDC works
+        // with, and what a file should hold is not the same thing.
+        let bytes = record::encode_with(&entry, self.codec())?;
         // Every alias this entry used to answer to and no longer does has to go: an alias row
         // left behind would send a request for an old name to an entry that no longer claims it.
         let wanted: Vec<String> = entry
@@ -248,9 +368,9 @@ impl Hdb for RedbHdb {
         // One transaction for the remove and the insert: a rename that half
         // happened would lose either the keys or the name, and neither is
         // recoverable from the other.
-        let mut entry = record::decode(&bytes)?;
+        let mut entry = record::decode_with(&bytes, self.codec())?;
         entry.principal = to.clone();
-        let encoded = record::encode(&entry);
+        let encoded = record::encode_with(&entry, self.codec())?;
         let txn = self.db.begin_write().map_err(store_err)?;
         {
             let mut table = txn.open_table(ENTRIES).map_err(store_err)?;
@@ -312,8 +432,9 @@ impl RedbHdb {
             if bound.as_deref() == Some(key.as_str()) {
                 continue;
             }
-            let principal = record::decode(value.value())?.principal;
-            return Ok(Some(principal));
+            // The name only: a walk over a sealed database must not need the master key, and
+            // unsealing every key of every entry to list names would need it for no reason.
+            return Ok(Some(record::principal_of(value.value())?));
         }
         Ok(None)
     }
@@ -447,6 +568,20 @@ mod tests {
         TempDb { dir, hdb }
     }
 
+    /// A directory no other test uses, for the tests that want a file rather than a `TempDb`.
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rhk-sealed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn alice() -> HdbEntry {
         let cipher = OwnCipher;
         let mut e = HdbEntry::user(Principal::parse("alice@R").unwrap());
@@ -497,6 +632,308 @@ mod tests {
                 "an entry must outlive the handle that wrote it"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------ keys at rest
+
+    /// A master key for the sealing tests.
+    fn master_pair() -> (crate::hdb::mkey::MasterKeys, crate::crypto::Key) {
+        let key = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        (crate::hdb::mkey::MasterKeys::single(key.clone(), 1), key)
+    }
+
+    /// A sealed database holds no key in the clear, and the same handle reads it back.
+    ///
+    /// The assertion is about the bytes on disk, not about the API: a store that sealed on the way
+    /// out and unsealed on the way in but wrote plaintext in between would pass every round trip and
+    /// protect nothing.
+    #[test]
+    fn a_sealed_database_holds_no_plaintext_key() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let (master, mkey) = master_pair();
+        let plain = alice().keys[0].key.bytes().to_vec();
+        assert_eq!(plain.len(), 32);
+
+        {
+            let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher))
+                .expect("a sealed database");
+            assert!(hdb.is_sealed());
+            hdb.store(alice()).expect("stored");
+            let got = hdb
+                .fetch(&Principal::parse("alice@R").unwrap())
+                .expect("a fetch")
+                .expect("alice");
+            assert_eq!(
+                got.keys[0].key.bytes(),
+                plain.as_slice(),
+                "the handle that sealed it reads plaintext back"
+            );
+        }
+
+        // The file itself: the key must not appear in it.
+        let bytes = std::fs::read(&path).expect("the file");
+        assert!(
+            !bytes.windows(plain.len()).any(|w| w == plain.as_slice()),
+            "a 32-octet key was found in the database file in the clear"
+        );
+
+        // And the record on disk is sealed in the form the codec defines: reading it **without** a
+        // master key is refused, and reading it with one gives the key back. Checking the bytes for
+        // absence alone would pass a store that wrote nothing at all.
+        let raw = RedbHdb::open(&path)
+            .expect("a plaintext handle reads the same file")
+            .raw_record(&Principal::parse("alice@R").unwrap())
+            .expect("the record");
+        let err = record::decode(&raw).expect_err("the record is sealed");
+        assert!(err.to_string().contains("sealed under master key"), "{err}");
+        let opened = record::decode_with(
+            &raw,
+            Some((
+                &OwnCipher,
+                &crate::hdb::mkey::MasterKeys::single(mkey.clone(), 1),
+            )),
+        )
+        .expect("the master key opens it");
+        assert_eq!(opened.keys[0].key.bytes(), plain.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sealed database opens with the same key set later — including across a handle, which is the
+    /// arrangement a KDC restarts into.
+    #[test]
+    fn a_sealed_database_reopens_with_the_same_master_key() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let (master, key) = master_pair();
+        let plain = alice().keys[0].key.bytes().to_vec();
+        {
+            let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher)).unwrap();
+            hdb.store(alice()).unwrap();
+        }
+        {
+            let master = crate::hdb::mkey::MasterKeys::single(key, 1);
+            let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher)).unwrap();
+            let got = hdb
+                .fetch(&Principal::parse("alice@R").unwrap())
+                .unwrap()
+                .expect("alice survived");
+            assert_eq!(got.keys[0].key.bytes(), plain.as_slice());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the master key the fetch is refused by name, and it says which key is missing: a
+    /// caller that received 60 octets and called them a key would fail later, somewhere worse.
+    #[test]
+    fn a_sealed_database_without_its_master_key_refuses_by_name() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let (master, _key) = master_pair();
+        {
+            let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher)).unwrap();
+            hdb.store(alice()).unwrap();
+        }
+        // The same file, opened without a master key: the plaintext constructor.
+        let hdb = RedbHdb::open(&path).unwrap();
+        let err = hdb
+            .fetch(&Principal::parse("alice@R").unwrap())
+            .expect_err("a sealed key needs the master key");
+        let text = err.to_string();
+        assert!(text.contains("sealed under master key"), "{text}");
+        assert!(text.contains("no master key"), "{text}");
+
+        // A walk still works: listing names is not reading keys, and a slave that lists its
+        // principals should not need the keytab to do it.
+        assert_eq!(
+            hdb.first().unwrap().map(|p| p.name()),
+            Some("alice".to_owned()),
+            "the walk reads names only"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A master key that is not the one the database was sealed with is refused, and the refusal is
+    /// about the key rather than about the record.
+    #[test]
+    fn the_wrong_master_key_is_refused() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let (master, _key) = master_pair();
+        {
+            let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher)).unwrap();
+            hdb.store(alice()).unwrap();
+        }
+        let other = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let hdb = RedbHdb::open_sealed(
+            &path,
+            crate::hdb::mkey::MasterKeys::single(other, 1),
+            std::sync::Arc::new(OwnCipher),
+        )
+        .unwrap();
+        let err = hdb
+            .fetch(&Principal::parse("alice@R").unwrap())
+            .expect_err("the wrong key");
+        assert!(err.to_string().contains("does not open"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rolling the master key re-seals every entry under the newest one, and the old key stops being
+    /// needed: that is what makes a roll a roll rather than a permanent pair of keys.
+    #[test]
+    fn a_roll_reseals_everything_under_the_new_key() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let old = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let new = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let plain = alice().keys[0].key.bytes().to_vec();
+        {
+            let hdb = RedbHdb::open_sealed(
+                &path,
+                crate::hdb::mkey::MasterKeys::single(old.clone(), 1),
+                std::sync::Arc::new(OwnCipher),
+            )
+            .unwrap();
+            hdb.store(alice()).unwrap();
+        }
+        {
+            // The roll as it is actually done: the set holds the old key and the new one, every
+            // entry is rewritten under the newest, and only then is the old one dropped.
+            let hdb = RedbHdb::open_sealed(
+                &path,
+                crate::hdb::mkey::MasterKeys::from_keys([(old.clone(), 1), (new.clone(), 2)]),
+                std::sync::Arc::new(OwnCipher),
+            )
+            .unwrap();
+            assert_eq!(hdb.reseal().unwrap(), 1, "one entry, resealed");
+        }
+        {
+            // Only the new key: the entries must no longer name the old one.
+            let hdb = RedbHdb::open_sealed(
+                &path,
+                crate::hdb::mkey::MasterKeys::single(new, 2),
+                std::sync::Arc::new(OwnCipher),
+            )
+            .unwrap();
+            let got = hdb
+                .fetch(&Principal::parse("alice@R").unwrap())
+                .expect("the new key opens what the roll wrote")
+                .expect("alice");
+            assert_eq!(got.keys[0].key.bytes(), plain.as_slice());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A set with several versions opens a record sealed under any of them, which is the state a
+    /// database is in between the reseal and the removal of the old key.
+    #[test]
+    fn a_set_of_versions_opens_an_entry_sealed_by_an_older_one() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let old = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let new = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        {
+            let hdb = RedbHdb::open_sealed(
+                &path,
+                crate::hdb::mkey::MasterKeys::single(old.clone(), 1),
+                std::sync::Arc::new(OwnCipher),
+            )
+            .unwrap();
+            hdb.store(alice()).unwrap();
+        }
+        let both = crate::hdb::mkey::MasterKeys::from_keys([(old, 1), (new, 2)]);
+        let hdb = RedbHdb::open_sealed(&path, both, std::sync::Arc::new(OwnCipher)).unwrap();
+        assert!(
+            hdb.fetch(&Principal::parse("alice@R").unwrap())
+                .expect("the old key is in the set")
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty key set is refused at open: a database that silently stored plaintext under
+    /// `open_sealed` would be the exact mistake that constructor exists to prevent.
+    #[test]
+    fn an_empty_key_set_is_refused_at_open() {
+        let dir = temp_dir();
+        let err = RedbHdb::open_sealed(
+            dir.join("hdb.redb"),
+            crate::hdb::mkey::MasterKeys::none(),
+            std::sync::Arc::new(OwnCipher),
+        )
+        .expect_err("no key");
+        assert!(err.to_string().contains("no master key"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename does not lose the sealing: the record moves and stays sealed, and the entry reads
+    /// back with its key.
+    #[test]
+    fn a_rename_keeps_the_keys_sealed() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let (master, key) = master_pair();
+        let plain = alice().keys[0].key.bytes().to_vec();
+        {
+            let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher)).unwrap();
+            hdb.store(alice()).unwrap();
+            hdb.rename(
+                &Principal::parse("alice@R").unwrap(),
+                &Principal::parse("carol@R").unwrap(),
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes.windows(plain.len()).any(|w| w == plain.as_slice()),
+            "a rename must not write the key in the clear"
+        );
+        let hdb = RedbHdb::open_sealed(
+            &path,
+            crate::hdb::mkey::MasterKeys::single(key, 1),
+            std::sync::Arc::new(OwnCipher),
+        )
+        .unwrap();
+        let carol = hdb
+            .fetch(&Principal::parse("carol@R").unwrap())
+            .unwrap()
+            .expect("carol");
+        assert_eq!(carol.keys[0].key.bytes(), plain.as_slice());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unsealed database still opens through a sealed handle: a realm that provisions a master
+    /// key does not have to rebuild its database, and the plaintext keys are re-sealed the next time
+    /// they are written.
+    #[test]
+    fn a_plaintext_database_is_readable_through_a_sealed_handle() {
+        let dir = temp_dir();
+        let path = dir.join("hdb.redb");
+        let plain = alice().keys[0].key.bytes().to_vec();
+        {
+            let hdb = RedbHdb::open(&path).unwrap();
+            hdb.store(alice()).unwrap();
+        }
+        let (master, _key) = master_pair();
+        let hdb = RedbHdb::open_sealed(&path, master, std::sync::Arc::new(OwnCipher)).unwrap();
+        let got = hdb
+            .fetch(&Principal::parse("alice@R").unwrap())
+            .unwrap()
+            .expect("alice");
+        assert_eq!(got.keys[0].key.bytes(), plain.as_slice());
+        // And one reseal makes the file require the master key.
+        assert_eq!(hdb.reseal().unwrap(), 1);
+        drop(hdb);
+        let plain_handle = RedbHdb::open(&path).unwrap();
+        assert!(
+            plain_handle
+                .fetch(&Principal::parse("alice@R").unwrap())
+                .is_err(),
+            "after a reseal the file needs the master key"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

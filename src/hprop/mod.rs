@@ -162,6 +162,48 @@ impl FileTarget {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// Stores the propagated entries **sealed** under the realm's master key.
+    ///
+    /// A slave's database is as valuable as its master's: a copy of it forges tickets for every
+    /// principal in the realm. The staging file is re-opened sealed, so what a propagation installs is
+    /// a file whose keys are `encrypt(master_key, HDB_KU_MKEY, …)` — the same form the master's own
+    /// database is in.
+    ///
+    /// Must be called before the first entry arrives: a target that sealed halfway would leave a
+    /// staging file with two kinds of record, and the point of this call is that it has one.
+    pub fn with_master_keys(
+        self,
+        cipher: Arc<dyn Cipher>,
+        keys: crate::hdb::mkey::MasterKeys,
+    ) -> Result<FileTarget> {
+        if keys.is_empty() {
+            return Err(Error::Hprop(
+                "with_master_keys was given no master key: a slave's database is the realm, and \
+                 storing it in the clear is what this call exists to prevent"
+                    .into(),
+            ));
+        }
+        {
+            let mut guard = self
+                .staging
+                .lock()
+                .map_err(|_| Error::Hprop("the staging database is poisoned".into()))?;
+            // Closed first: redb takes a lock on the file, and a second handle — even from the same
+            // process — fails to open it.
+            *guard = None;
+        }
+        let sealed =
+            crate::hdb::redb_store::RedbHdb::open_sealed(&self.staging_path, keys, cipher)?;
+        {
+            let mut guard = self
+                .staging
+                .lock()
+                .map_err(|_| Error::Hprop("the staging database is poisoned".into()))?;
+            *guard = Some(sealed);
+        }
+        Ok(self)
+    }
 }
 
 /// `<path>~`: the same shape Heimdal uses, and for the same reason — a name no running KDC opens.
@@ -975,6 +1017,63 @@ mod tests {
                 .is_some(),
             "bob arrived too"
         );
+    }
+
+    /// A file target can be made to seal, and refuses an empty key set: a slave that accepted a
+    /// propagation into a plaintext file would hold a copy of the whole realm.
+    #[cfg(feature = "hdb-redb")]
+    #[test]
+    fn a_file_target_seals_when_it_is_given_a_master_key() {
+        use crate::crypto::OwnCipher;
+        let dir = std::env::temp_dir().join(format!(
+            "rrl-hprop-seal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a directory");
+
+        // No master key: refused, because "seal" with nothing to seal with is not a mode.
+        let target = FileTarget::new(dir.join("slave.db")).expect("a target");
+        let err = target
+            .with_master_keys(Arc::new(OwnCipher), crate::hdb::mkey::MasterKeys::none())
+            .expect_err("no master key");
+        assert!(err.to_string().contains("no master key"), "{err}");
+
+        // With one: the staging database is sealed, and what it writes names the key.
+        let key = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        let master = crate::hdb::mkey::MasterKeys::single(key, 1);
+        let target = FileTarget::new(dir.join("slave.db"))
+            .expect("a target")
+            .with_master_keys(Arc::new(OwnCipher), master.clone())
+            .expect("sealed");
+        let mut entry = HdbEntry::user(p(&format!("alice@{REALM}")));
+        entry.add_key(
+            OwnCipher.random(Enctype::Aes256Sha1).expect("a key"),
+            1,
+            None,
+        );
+        let plain = entry.keys[0].key.bytes().to_vec();
+        target.store(entry).expect("staged");
+        target.commit().expect("committed");
+
+        let bytes = std::fs::read(dir.join("slave.db")).expect("the installed file");
+        assert!(
+            !bytes.windows(plain.len()).any(|w| w == plain.as_slice()),
+            "a propagation installed a key in the clear"
+        );
+        let installed = crate::hdb::redb_store::RedbHdb::open_sealed(
+            dir.join("slave.db"),
+            master,
+            Arc::new(OwnCipher),
+        )
+        .expect("sealed");
+        let got = installed
+            .fetch(&p(&format!("alice@{REALM}")))
+            .expect("a fetch")
+            .expect("alice");
+        assert_eq!(got.keys[0].key.bytes(), plain.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The service name is `hprop/HOST` and the client is `kadmin/hprop`: the two names Heimdal

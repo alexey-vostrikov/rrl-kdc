@@ -201,15 +201,12 @@ fn serve_hpropd(db_path: &str, addr: &str, realm: &str) -> Result<(), Box<dyn st
     )?)?;
     db.store(hprop::master_entry(realm, &OwnCipher, MASTER_PASSWORD)?)?;
 
-    let target = Arc::new(FileTarget::new(db_path)?);
-    let mut service = Hprop::new(
-        Arc::clone(&db) as Arc<dyn Hdb>,
-        Arc::new(OwnCipher),
-        realm,
-        target,
-    )?;
+    let target = FileTarget::new(db_path)?;
     // The master key, when the stand has one: a master whose database is sealed sends each key
-    // encrypted under it, and a service without it can install nothing.
+    // encrypted under it, and a slave should store them the same way — its file is a copy of the
+    // realm. One key does both jobs: opening what the master sent, and sealing what is installed.
+    let mut target = target;
+    let mut master = None;
     if let Ok(path) = std::env::var("HPROR_MKEY") {
         let keys = rrl_kdc::hdb::mkey::MasterKeys::from_keytab(&path)?;
         eprintln!(
@@ -217,7 +214,19 @@ fn serve_hpropd(db_path: &str, addr: &str, realm: &str) -> Result<(), Box<dyn st
             keys.keys().len(),
             keys.keys().first().map(|k| k.kvno).unwrap_or(0)
         );
-        service = service.with_master_keys(Arc::new(keys));
+        target = target.with_master_keys(Arc::new(OwnCipher), keys.clone())?;
+        master = Some(Arc::new(keys));
+    } else {
+        eprintln!("hpropd: no HPROR_MKEY, so installed keys are stored in the clear");
+    }
+    let mut service = Hprop::new(
+        Arc::clone(&db) as Arc<dyn Hdb>,
+        Arc::new(OwnCipher),
+        realm,
+        Arc::new(target),
+    )?;
+    if let Some(keys) = master {
+        service = service.with_master_keys(keys);
     }
     eprintln!("hpropd: receiving {realm} on {addr}, installing into {db_path}");
     let stand = hprop::serve_on(addr, service)?;

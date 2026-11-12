@@ -475,7 +475,14 @@ fn keys_from(
             }
         }
         if let Some(key) = key {
-            keys.push(HdbKey { kvno, key, salt });
+            // `mkvno` belongs to the stored form and this codec has just unsealed the key, so the
+            // entry it returns holds plaintext: a store that seals sets the field again.
+            keys.push(HdbKey {
+                kvno,
+                key,
+                salt,
+                mkvno: None,
+            });
         }
     }
     Ok(keys)

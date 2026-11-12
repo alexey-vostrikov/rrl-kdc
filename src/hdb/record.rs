@@ -61,6 +61,59 @@ pub fn key(principal: &Principal) -> String {
 /// a backend that keys by [`key`] and stored only the name would lose the realm
 /// a name type cannot carry.
 pub fn encode(entry: &HdbEntry) -> Vec<u8> {
+    // The plaintext path cannot fail: it seals nothing, so there is no key operation to refuse. The
+    // `expect` is a statement about that, not a swallowed error — `encode_with`'s only failure is a
+    // master key that cannot seal, and there is none here.
+    encode_with(entry, None).expect("encoding without a master key seals nothing and cannot fail")
+}
+
+/// Encodes an entry, sealing its keys under `master` when one is given.
+///
+/// This is where a database's protection at rest lives: with a master key every key is written as
+/// `encrypt(master_key, HDB_KU_MKEY, key_bytes)` and the record carries the `mkvno` that names it, so
+/// the file is worthless without the keytab. Without one the bytes are written as they are — which is
+/// what a realm that has not provisioned a master key gets, and it says so.
+pub fn encode_with(
+    entry: &HdbEntry,
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<Vec<u8>> {
+    // Built first, because sealing a key can fail and a record must not be half written: `parts` is
+    // assembled only once every key has been dealt with.
+    let mut key_values = Vec::with_capacity(entry.keys.len());
+    for k in &entry.keys {
+        // The bytes written are what the master key makes them: sealed when there is one, plaintext
+        // otherwise. A failure to seal is a failure to write — falling back to plaintext here would
+        // put a realm's keys on disk unsealed while the caller believed they were protected, and
+        // nothing would say so.
+        let (material, mkvno) = match master {
+            Some((cipher, keys)) => {
+                let (sealed, kvno) = keys.seal(cipher, k.key.bytes())?;
+                (sealed, Some(kvno))
+            }
+            None => (k.key.bytes().to_vec(), None),
+        };
+        let mut key_parts = vec![
+            der::field(0, der::int(k.kvno as i64)),
+            der::field(
+                1,
+                der::seq(&[
+                    der::field(0, der::int(k.key.enctype().id() as i64)),
+                    der::field(1, der::octets(&material)),
+                ]),
+            ),
+        ];
+        if let Some(salt) = &k.salt {
+            key_parts.push(der::field(2, der::octets(salt)));
+        }
+        // `mkvno [3]`: which master key this key is stored under. Written only when the key is
+        // sealed, so a database with no master key keeps exactly the shape it had before this field
+        // existed — an older build reads it unchanged.
+        if let Some(mkvno) = mkvno {
+            key_parts.push(der::field(3, der::int(i64::from(mkvno))));
+        }
+        key_values.push(der::seq(&key_parts));
+    }
+
     let mut parts = vec![
         der::field(
             0,
@@ -80,31 +133,7 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
                 der::field(2, der::general_string(&entry.principal.realm)),
             ]),
         ),
-        der::field(
-            1,
-            der::seq(
-                &entry
-                    .keys
-                    .iter()
-                    .map(|k| {
-                        let mut key_parts = vec![
-                            der::field(0, der::int(k.kvno as i64)),
-                            der::field(
-                                1,
-                                der::seq(&[
-                                    der::field(0, der::int(k.key.enctype().id() as i64)),
-                                    der::field(1, der::octets(k.key.bytes())),
-                                ]),
-                            ),
-                        ];
-                        if let Some(salt) = &k.salt {
-                            key_parts.push(der::field(2, der::octets(salt)));
-                        }
-                        der::seq(&key_parts)
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-        ),
+        der::field(1, der::seq(&key_values)),
         der::field(2, der::flags32(entry.flags)),
     ];
     for (field, value) in [
@@ -234,17 +263,12 @@ pub fn encode(entry: &HdbEntry) -> Vec<u8> {
     if !extensions.is_empty() {
         parts.push(der::field(13, der::seq(&extensions)));
     }
-    der::seq(&parts)
+    Ok(der::seq(&parts))
 }
 
-/// Decodes an entry written by [`encode`].
-pub fn decode(data: &[u8]) -> Result<HdbEntry> {
-    let ctx = "HdbEntry";
-    let mut r = Reader::new(data);
-    let f = Fields::parse(ctx, r.expect_in(ctx, der::SEQUENCE)?)?;
-
-    let mut pr = Reader::new(f.bytes(0, ctx)?);
-    let pf = Fields::parse(ctx, pr.expect_in(ctx, der::SEQUENCE)?)?;
+/// `Principal ::= SEQUENCE { name [0] PrincipalName, realm [1] Realm }` out of the record's `[0]`.
+fn principal_from(ctx: &'static str, content: &[u8]) -> Result<Principal> {
+    let pf = Fields::parse(ctx, content)?;
     let name_type = pf.int(0, ctx)? as i32;
     let mut cr = Reader::new(pf.bytes(1, ctx)?);
     let mut components = Vec::new();
@@ -259,11 +283,45 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
     if components.is_empty() {
         return Err(Error::Hdb(format!("{ctx}: record has no name components")));
     }
-    let principal = Principal {
+    Ok(Principal {
         name_type,
         components,
         realm,
-    };
+    })
+}
+
+/// Decodes an entry written by [`encode`].
+///
+/// A record whose keys are sealed is refused here, by name: opening one needs the master key, and
+/// [`decode_with`] is what a store that has one calls.
+pub fn decode(data: &[u8]) -> Result<HdbEntry> {
+    decode_with(data, None)
+}
+
+/// The principal a record is stored under, without touching its keys.
+///
+/// A walk needs names and nothing else. Reading the keys would mean unsealing every one of them on
+/// every step of a listing — and a walk over a sealed database must not need the master key at all,
+/// because a slave that lists its principals is not thereby reading their keys.
+pub fn principal_of(data: &[u8]) -> Result<Principal> {
+    let ctx = "HdbEntry";
+    let mut r = Reader::new(data);
+    let f = Fields::parse(ctx, r.expect_in(ctx, der::SEQUENCE)?)?;
+    let mut pr = Reader::new(f.bytes(0, ctx)?);
+    principal_from(ctx, pr.expect_in(ctx, der::SEQUENCE)?)
+}
+
+/// Decodes an entry, opening whichever of its keys the record says are sealed.
+pub fn decode_with(
+    data: &[u8],
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<HdbEntry> {
+    let ctx = "HdbEntry";
+    let mut r = Reader::new(data);
+    let f = Fields::parse(ctx, r.expect_in(ctx, der::SEQUENCE)?)?;
+
+    let mut pr = Reader::new(f.bytes(0, ctx)?);
+    let principal = principal_from(ctx, pr.expect_in(ctx, der::SEQUENCE)?)?;
 
     let mut kr = Reader::new(f.bytes(1, ctx)?);
     let mut ks = Reader::new(kr.expect_in(ctx, der::SEQUENCE)?);
@@ -276,11 +334,47 @@ pub fn decode(data: &[u8]) -> Result<HdbEntry> {
         let id = ef.int(0, ctx)? as i32;
         let enctype = Enctype::from_id(id)
             .ok_or_else(|| Error::Hdb(format!("{ctx}: enctype {id} is not implemented")))?;
-        let key = Key::new(enctype, ef.octets(1, ctx)?)?;
+        let stored = ef.octets(1, ctx)?;
+        let mkvno = kf
+            .opt_int(3, ctx)?
+            .map(|v| {
+                u32::try_from(v)
+                    .map_err(|_| Error::Hdb(format!("{ctx}: mkvno {v} does not fit in 32 bits")))
+            })
+            .transpose()?;
+        // The key on disk may be sealed under the master key, and a sealed blob is longer than the
+        // enctype accepts — so it is opened **before** `Key::new`, which would otherwise refuse it
+        // with a length error that says nothing about what is actually wrong.
+        let material = match mkvno {
+            Some(kvno) => {
+                let (cipher, master) = master.ok_or_else(|| {
+                    Error::Hdb(format!(
+                        "a {}-octet key for {} is sealed under master key {kvno}, and no master key \
+                         was supplied",
+                        stored.len(),
+                        enctype.name()
+                    ))
+                })?;
+                master.unseal(cipher, stored, Some(kvno), enctype)?
+            }
+            None if crate::hdb::mkey::is_sealed(stored, enctype) => {
+                return Err(Error::Hdb(format!(
+                    "a {}-octet key for {} carries no `mkvno`: it is sealed, and the record does not \
+                     say which master key sealed it",
+                    stored.len(),
+                    enctype.name()
+                )));
+            }
+            None => stored.to_vec(),
+        };
+        let key = Key::new(enctype, material)?;
         keys.push(HdbKey {
             kvno,
             key,
             salt: kf.opt_octets(2, ctx)?.map(<[u8]>::to_vec),
+            // Cleared: the entry in memory holds plaintext, and `mkvno` describes what is on disk.
+            // Leaving it set would let an encoder write plaintext under a "sealed" label.
+            mkvno: None,
         });
     }
 

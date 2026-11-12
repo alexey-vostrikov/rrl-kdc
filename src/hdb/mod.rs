@@ -138,13 +138,19 @@ pub struct Aliases {
 /// any principal whose name changed.
 #[derive(Clone, Debug)]
 pub struct HdbKey {
-    /// `mkvno` is not modelled yet: nothing here is encrypted under a master
-    /// key, so no key records which one it used.
+    /// The key's own version, which a client matches a ticket's `kvno` against.
     pub kvno: u32,
     /// The key.
     pub key: Key,
     /// The salt `s2k` used, as it must be sent in `ETYPE-INFO2`.
     pub salt: Option<Vec<u8>>,
+    /// `mkvno`: the master key this key is **stored** under, when it is stored under one.
+    ///
+    /// `None` means the key is in the clear — a realm with no master key, or an entry written before
+    /// one existed. A storage backend sets it when it seals; a backend that unseals clears it, so an
+    /// entry in memory always holds plaintext and the field always describes the file, never the
+    /// value.
+    pub mkvno: Option<u32>,
 }
 
 /// `hdb_entry`: one principal.
@@ -420,7 +426,12 @@ impl HdbEntry {
     /// version alone, which is the point of keeping old keys at all.
     pub fn add_key(&mut self, key: Key, kvno: u32, salt: Option<Vec<u8>>) {
         self.kvno = self.kvno.max(kvno);
-        self.keys.push(HdbKey { kvno, key, salt });
+        self.keys.push(HdbKey {
+            kvno,
+            key,
+            salt,
+            mkvno: None,
+        });
     }
 
     /// A copy of this entry at the next kvno, with new keys derived from

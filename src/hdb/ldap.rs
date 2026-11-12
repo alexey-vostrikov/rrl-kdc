@@ -840,6 +840,9 @@ fn decode_key(value: &[u8]) -> Result<HdbKey> {
         kvno,
         key,
         salt: f.opt_octets(2, context)?.map(<[u8]>::to_vec),
+        // The directory holds the key as an attribute value; sealing it is the store's decision,
+        // not the mapping's.
+        mkvno: None,
     })
 }
 

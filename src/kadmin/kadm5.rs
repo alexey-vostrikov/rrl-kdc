@@ -901,11 +901,13 @@ mod tests {
                 kvno: 2,
                 key: Key::new(Enctype::Aes256Sha1, [7u8; 32]).unwrap(),
                 salt: None,
+                mkvno: None,
             },
             crate::hdb::HdbKey {
                 kvno: 2,
                 key: Key::new(Enctype::Aes128Sha1, [9u8; 16]).unwrap(),
                 salt: Some(b"EXAMPLE.COMalice".to_vec()),
+                mkvno: None,
             },
         ];
         let bytes = encode_key_data(&keys);

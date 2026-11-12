@@ -1498,10 +1498,18 @@ impl Kdc {
         // `KRB_AP_ERR_INAPP_CKSUM` for `checksum type 7` against `aes256-cts-hmac-sha1-96`. Heimdal
         // met the same client and answered it, so a KDC that serves Windows has to as well.
         if *cksum_type == CKSUMTYPE_RSA_MD5 {
-            if !ticket_part
+            // Keyed with the subkey when the client sent one: RFC 4120 §5.4.1 lets a client key the
+            // request-body checksum with the authenticator's subkey, and Windows does exactly that —
+            // verifying only against the TGT's session key refuses a client that did everything
+            // right. Both keys are tried, any of them matching is proof.
+            let verified = ticket_part
                 .session_key
                 .verify_rsa_md5_checksum(&req.raw_body, cksum)
-            {
+                || authenticator
+                    .subkey
+                    .as_ref()
+                    .is_some_and(|subkey| subkey.verify_rsa_md5_checksum(&req.raw_body, cksum));
+            if !verified {
                 return Err(Error::Kdc {
                     code: codes::KRB_AP_ERR_MODIFIED,
                     text: "the rsa-md5 checksum does not cover this request body".into(),

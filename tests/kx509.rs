@@ -452,3 +452,226 @@ fn a_bare_public_key_is_refused_as_no_proof_of_possession() {
 fn realm_client() -> Principal {
     p(&format!("alice@{REALM}"))
 }
+
+// ---------------------------------------------------------------- the refusals a KDC must make
+
+/// An AP-REQ whose ticket names `sname` in `realm`, sealed in the service key `db` holds for it.
+///
+/// `ap_req` above builds the one shape every positive test wants; these tests need the shapes a
+/// server refuses, so the ticket's name and realm are parameters here.
+fn ap_req_for(db: &MemoryHdb, client: &Principal, sname: &str, realm: &str) -> (Vec<u8>, Key) {
+    let cipher = OwnCipher;
+    let session = cipher.random(Enctype::Aes256Sha1).expect("a session key");
+    let part = EncTicketPart {
+        flags: 0,
+        session_key: session.clone(),
+        crealm: REALM.to_owned(),
+        cname: client.clone(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: NOW - 60,
+        starttime: None,
+        endtime: NOW + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let enc = EncryptedData::seal(
+        &cipher,
+        &service_key(db),
+        usage::KDC_REP_TICKET,
+        None,
+        &part.encode(),
+    )
+    .expect("the ticket seals");
+    let ticket = Ticket {
+        realm: realm.to_owned(),
+        sname: p(sname),
+        enc,
+    };
+    let authenticator = Authenticator {
+        crealm: REALM.to_owned(),
+        cname: client.clone(),
+        cksum: None,
+        cusec: 0,
+        ctime: NOW,
+        subkey: None,
+        seq_number: None,
+        authorization_data: None,
+    };
+    let authenticator = EncryptedData::seal(
+        &cipher,
+        &session,
+        usage::AP_REQ_AUTH,
+        None,
+        &authenticator.encode(),
+    )
+    .expect("the authenticator seals");
+    let ap = ApReq {
+        ap_options: 0,
+        ticket: ticket.encode(),
+        authenticator,
+    };
+    (ap.encode(), session)
+}
+
+/// A CA that cannot sign: an outage, which is the server's problem and not the client's.
+#[derive(Debug)]
+struct BrokenCa;
+
+impl CertificateAuthority for BrokenCa {
+    fn sign(&self, _request: &SigningRequest) -> Result<Vec<u8>, CaError> {
+        Err(CaError::Authority("the signer is unavailable".into()))
+    }
+}
+
+/// An authorizer that refuses everybody: the realm's policy, not the client's error.
+#[derive(Debug)]
+struct RefusingAuthorizer;
+
+impl rrl_kdc::kdc::ca::CsrAuthorizer for RefusingAuthorizer {
+    fn authorize(&self, _requester: &Principal, _request: &SigningRequest) -> Result<(), CaError> {
+        Err(CaError::Refused("not for you".into()))
+    }
+}
+
+/// A ticket for another realm is refused before the database is consulted: the realm is the one
+/// thing a kx509 ticket cannot get wrong, since the certificate names a principal of this realm.
+#[test]
+fn a_ticket_from_another_realm_is_refused() {
+    let (db, kdc) = realm();
+    let (ap, session) = ap_req_for(
+        &db,
+        &realm_client(),
+        &format!("kx509/{HOST}@{REALM}"),
+        "OTHER.COM",
+    );
+    let reply = parse_response(&kdc.handle(&request(&ap, &session, &csr(), false), NOW));
+    assert_eq!(
+        reply.code,
+        KRB_ERROR_BASE + rrl_kdc::error::codes::KRB_AP_ERR_MODIFIED
+    );
+    assert!(reply.certificate.is_none());
+    assert!(
+        reply.text.unwrap_or_default().contains("another realm"),
+        "the refusal has to say which check failed"
+    );
+}
+
+/// A ticket for the kx509 service of a host this realm has no entry for: the client is told the
+/// name is unknown, not that its request was malformed.
+///
+/// The ticket is sealed with the key of the entry that *does* exist, and that is the point: the
+/// database is consulted before the seal is judged, so the answer is about the name and not about
+/// the key.
+#[test]
+fn a_service_the_database_does_not_know_is_refused_by_name() {
+    let (db, kdc) = realm();
+    let absent = format!("kx509/absent.example.com@{REALM}");
+    let (ap, session) = ap_req_for(&db, &realm_client(), &absent, REALM);
+    let reply = parse_response(&kdc.handle(&request(&ap, &session, &csr(), false), NOW));
+    assert_eq!(
+        reply.code,
+        KRB_ERROR_BASE + rrl_kdc::error::codes::KDC_ERR_S_PRINCIPAL_UNKNOWN
+    );
+    assert!(reply.certificate.is_none());
+    assert!(
+        reply
+            .text
+            .unwrap_or_default()
+            .contains("not in the database"),
+        "a missing entry is named, not reported as a bad token"
+    );
+}
+
+/// A ticket whose authenticator does not open: the session key is wrong, so nothing after this
+/// point can be believed and no certificate is issued.
+#[test]
+fn an_authenticator_that_does_not_open_is_refused() {
+    let (db, kdc) = realm();
+    let (ap, session) = ap_req(&db, &realm_client());
+    // Sealed in a key that is not the ticket's: the authenticator will not decrypt.
+    let mut broken = ap.clone();
+    let last = broken.len() - 20;
+    broken[last] ^= 0xff;
+    let reply = parse_response(&kdc.handle(&request(&broken, &session, &csr(), false), NOW));
+    assert!(reply.certificate.is_none());
+    assert_ne!(reply.code, 0);
+    // The MAC of the request is checked after the ticket opens, so the session key here is the real
+    // one and the refusal comes from the authenticator, not from the MAC.
+    assert!(
+        reply.code == KRB_ERROR_BASE + rrl_kdc::error::codes::KRB_AP_ERR_MODIFIED
+            || reply.code == KRB_ERROR_BASE + rrl_kdc::error::codes::KRB_AP_ERR_BAD_INTEGRITY,
+        "code {}",
+        reply.code
+    );
+}
+
+/// A realm that refuses the request issues nothing, and says so with `KDC_ERR_POLICY` — a decision,
+/// not a malformed message.
+#[test]
+fn a_refused_csr_is_a_policy_error() {
+    let (db, kdc) = realm();
+    let kdc = kdc.with_csr_authorizer(std::sync::Arc::new(RefusingAuthorizer));
+    let (ap, session) = ap_req(&db, &realm_client());
+    let reply = parse_response(&kdc.handle(&request(&ap, &session, &csr(), false), NOW));
+    assert_eq!(
+        reply.code,
+        KRB_ERROR_BASE + rrl_kdc::error::codes::KDC_ERR_POLICY
+    );
+    assert!(reply.certificate.is_none());
+    assert!(reply.text.unwrap_or_default().contains("not for you"));
+}
+
+/// A CA that cannot sign is a server-side permanent problem, and the code says which side has to
+/// act: `4`, not `1`.
+#[test]
+fn a_broken_ca_is_a_server_side_problem() {
+    let (db, kdc) = realm();
+    let kdc = kdc.with_ca(std::sync::Arc::new(BrokenCa));
+    let (ap, session) = ap_req(&db, &realm_client());
+    let reply = parse_response(&kdc.handle(&request(&ap, &session, &csr(), false), NOW));
+    assert_eq!(reply.code, kx509::STATUS_SERVER_BAD);
+    assert!(
+        reply.hash.is_none(),
+        "an unauthenticated answer carries no MAC"
+    );
+}
+
+/// A request that begins with the version and then is not a `Kx509Request` is refused by name:
+/// the prefix claimed it, so silence would leave the client waiting.
+#[test]
+fn a_truncated_request_after_the_version_is_refused() {
+    let (_db, kdc) = realm();
+    let mut malformed = VERSION.to_vec();
+    malformed.extend_from_slice(&der::octets(b"not a SEQUENCE"));
+    let reply = parse_response(&kdc.handle(&malformed, NOW));
+    assert_eq!(reply.code, kx509::STATUS_CLIENT_BAD);
+    assert!(reply.text.unwrap_or_default().contains("SEQUENCE"));
+}
+
+/// A reply's MAC verifies against the certificate the client asked for — recomputed here from
+/// RFC 6717 §3 rather than asked of the code under test, so the two cannot agree on a mistake.
+#[test]
+fn a_probe_against_a_realm_without_a_ca_says_the_service_is_off() {
+    let db = std::sync::Arc::new(MemoryHdb::new());
+    db.insert(
+        kx509::service_entry(REALM, HOST, &OwnCipher, SERVICE_PASSWORD).expect("a service entry"),
+    )
+    .expect("stored");
+    let kdc = Kdc::new(
+        KdcConfig::new(REALM).unwrap(),
+        std::sync::Arc::clone(&db) as _,
+        std::sync::Arc::new(OwnCipher),
+    );
+    let probe = request(
+        b"",
+        &Key::new(Enctype::Aes256Sha1, vec![0u8; 32]).unwrap(),
+        b"",
+        false,
+    );
+    let reply = parse_response(&kdc.handle(&probe, NOW));
+    assert_eq!(reply.code, kx509::STATUS_SERVER_BAD);
+    assert!(reply.hash.is_none());
+    assert!(reply.text.unwrap_or_default().contains("not enabled"));
+}

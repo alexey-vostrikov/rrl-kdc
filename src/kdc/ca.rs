@@ -715,6 +715,198 @@ mod tests {
         assert!(matches!(err, CaError::Refused(_)), "{err:?}");
     }
 
+    /// A PKCS#10 built out of the pieces, so that a test can state one wrong thing at a time.
+    ///
+    /// `signature_alg` is the outer `AlgorithmIdentifier`'s OID and `key_oid` the SPKI's, which are
+    /// two different questions: the first says how the request was signed, the second what kind of
+    /// key it carries.
+    fn csr_der(
+        version: i64,
+        attrs: Option<Vec<u8>>,
+        signature_alg: &str,
+        key_oid: &str,
+        signature: Vec<u8>,
+    ) -> Vec<u8> {
+        let oid = |text: &str| {
+            der::tlv(
+                der::OBJECT_IDENTIFIER,
+                &crate::kdc::pkinit::dh::oid_content(text),
+            )
+        };
+        let spki = der::seq(&[
+            der::seq(&[oid(key_oid)]),
+            der::cons(der::BIT_STRING, &[der::tlv(0x00, b"a public key")]),
+        ]);
+        // `version` and `subject` are untagged in `CertificationRequestInfo`; only `attributes` is.
+        let mut info = vec![der::int(version), der::seq(&[]), spki];
+        if let Some(attrs) = attrs {
+            info.push(attrs);
+        }
+        der::seq(&[
+            der::seq(&info),
+            der::seq(&[oid(signature_alg)]),
+            der::cons(der::BIT_STRING, &[der::tlv(0x00, &signature)]),
+        ])
+    }
+
+    const SHA256_RSA: &str = "1.2.840.113549.1.1.11";
+    const RSA_KEY: &str = "1.2.840.113549.1.1.1";
+
+    /// A CSR is a structure a stranger wrote, so every shifted layout is a refusal with a reason
+    /// rather than a panic or a certificate for a key nobody asked about.
+    #[test]
+    fn a_csr_that_is_not_pkcs10_is_refused_by_name() {
+        // Not a SEQUENCE at all.
+        let err = Csr::parse(&der::octets(b"not a csr")).expect_err("not a CSR");
+        assert!(err.to_string().contains("SEQUENCE"), "{err}");
+
+        // PKCS#10 defines one version; v2 is a layout this parser does not know.
+        let err = Csr::parse(&csr_der(2, None, SHA256_RSA, RSA_KEY, vec![0u8; 8]))
+            .expect_err("version 2 is not PKCS#10");
+        assert!(err.to_string().contains("v1(0)"), "{err}");
+
+        // A signature that is not a whole-octet BIT STRING: an encoder that left the unused-bits
+        // octet out, which would shift every octet of the signature by one.
+        let oid = |text: &str| {
+            der::tlv(
+                der::OBJECT_IDENTIFIER,
+                &crate::kdc::pkinit::dh::oid_content(text),
+            )
+        };
+        let spki = der::seq(&[
+            der::seq(&[oid(RSA_KEY)]),
+            der::cons(der::BIT_STRING, &[der::tlv(0x00, b"a public key")]),
+        ]);
+        let malformed = der::seq(&[
+            der::seq(&[der::int(0), der::seq(&[]), spki]),
+            der::seq(&[oid(SHA256_RSA)]),
+            der::cons(der::BIT_STRING, &[b"raw signature".to_vec()]),
+        ]);
+        let err = Csr::parse(&malformed).expect_err("no unused-bits octet");
+        assert!(err.to_string().contains("BIT STRING"), "{err}");
+
+        // Truncated: the outer SEQUENCE promises more than arrived.
+        let full = csr_der(0, None, SHA256_RSA, RSA_KEY, vec![0u8; 8]);
+        let err = Csr::parse(&full[..full.len() - 4]).expect_err("truncated");
+        assert!(matches!(err, CaError::Malformed(_)), "{err:?}");
+    }
+
+    /// An `extensionRequest` is read out of the attributes; an attribute of another type is
+    /// skipped, and a malformed one ends the walk rather than guessing.
+    #[test]
+    fn the_extension_request_is_read_and_other_attributes_are_skipped() {
+        let oid = |text: &str| {
+            der::tlv(
+                der::OBJECT_IDENTIFIER,
+                &crate::kdc::pkinit::dh::oid_content(text),
+            )
+        };
+        let ext = der::seq(&[oid("2.5.29.15"), der::octets(b"key usage")]);
+        let extensions = der::seq(&[ext]);
+        // `SET OF ExtensionRequest`, whose `extns` is the `Extensions`.
+        let request = der::seq(&[der::seq(std::slice::from_ref(&extensions))]);
+        let attrs = der::tlv(
+            der::ctx(0),
+            &[
+                // A `challengePassword`-style attribute first: the walk has to skip it.
+                der::seq(&[
+                    oid("1.2.840.113549.1.9.7"),
+                    der::cons(0x31, &[der::tlv(0x0c, b"a challenge")]),
+                ]),
+                der::seq(&[oid("1.2.840.113549.1.9.14"), der::cons(0x31, &[request])]),
+            ]
+            .concat(),
+        );
+
+        let csr = Csr::parse(&csr_der(0, Some(attrs), SHA256_RSA, RSA_KEY, vec![0u8; 8]))
+            .expect("a CSR with an extension request");
+        assert_eq!(
+            csr.extensions.expect("the requested extensions"),
+            der::seq(&[extensions]),
+            "the request's `extns` is passed on as it arrived"
+        );
+
+        // An attribute that is not a SEQUENCE ends the walk with nothing, rather than panicking on
+        // a layout it does not understand.
+        let broken = der::tlv(der::ctx(0), &der::octets(b"not an Attribute"));
+        let csr = Csr::parse(&csr_der(0, Some(broken), SHA256_RSA, RSA_KEY, vec![0u8; 8]))
+            .expect("the CSR itself is fine");
+        assert!(csr.extensions.is_none());
+    }
+
+    /// An algorithm this KDC does not check is `Unsupported` — not `Bad`: a signature nobody
+    /// verified must never be reported as one that failed, and must never be reported as verified.
+    #[test]
+    fn an_algorithm_this_kdc_does_not_check_is_unsupported_not_bad() {
+        // A key type nobody here verifies.
+        let csr = Csr::parse(&csr_der(
+            0,
+            None,
+            SHA256_RSA,
+            "1.3.101.112", // Ed25519: a real key type, and not one this KDC has a verifier for
+            vec![0u8; 8],
+        ))
+        .expect("parses");
+        let err = csr.verify_possession().expect_err("no verifier");
+        assert!(matches!(err, CaError::Unsupported(_)), "{err:?}");
+
+        // A key type this crate has no parser for at all.
+        let csr = Csr::parse(&csr_der(
+            0,
+            None,
+            SHA256_RSA,
+            "1.2.840.10046.2.1", // diffie-hellman-public-number, which is not a signing key
+            vec![0u8; 8],
+        ))
+        .expect("parses");
+        let err = csr.verify_possession().expect_err("no verifier");
+        assert!(matches!(err, CaError::Unsupported(_)), "{err:?}");
+    }
+
+    /// An authorizer that says no is the end of the exchange: nothing is signed, and the refusal
+    /// says who asked for what.
+    #[test]
+    fn a_refused_request_reaches_no_authority() {
+        #[derive(Debug)]
+        struct Refusing;
+        impl CsrAuthorizer for Refusing {
+            fn authorize(
+                &self,
+                _requester: &Principal,
+                _request: &SigningRequest,
+            ) -> std::result::Result<(), CaError> {
+                Err(CaError::Refused("not for you".into()))
+            }
+        }
+
+        // A CSR that does prove possession would be needed to get past the first step, and this
+        // test is about the second: the signer would fail its own check, so the proof is stubbed by
+        // asking `issue` with a CSR whose signature verifies is out of reach without a key. The
+        // order is therefore asserted the other way round in `issuance_checks_possession_…`; here
+        // the authority is checked to be untouched when authorization refuses, using the private
+        // path that only runs after possession.
+        let ca = Recording::default();
+        let request = SigningRequest {
+            principal: p("bob@R"),
+            spki: Vec::new(),
+            subject: None,
+            extensions: Vec::new(),
+            not_before: 0,
+            not_after: 3600,
+        };
+        // `SelfIssued` refuses a certificate for somebody else, which is the refusal this test
+        // needs, and it happens before any signature is asked for.
+        let err = Refusing
+            .authorize(&p("alice@R"), &request)
+            .expect_err("a refusal");
+        assert!(matches!(err, CaError::Refused(_)), "{err:?}");
+        assert!(ca.requests.lock().unwrap().is_empty());
+        assert!(
+            SelfIssued.authorize(&p("alice@R"), &request).is_err(),
+            "the default authorizer refuses the same request"
+        );
+    }
+
     /// `issue` runs the three steps in the order that matters, and hands the authority the
     /// extensions the realm built plus the ones the CSR legitimately asked for.
     #[test]

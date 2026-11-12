@@ -295,3 +295,175 @@ fn convert(entry: &HdbEntry, realm: &str) -> Vec<rrl_krb5::ServiceKey> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{Cipher, Enctype, OwnCipher};
+    // The trait, so that `name`, `keys`, `find` and `insert` are the keytab's view of the realm
+    // rather than methods of a private struct.
+    use rrl_krb5::keytab::KeytabSource;
+
+    /// A realm with a `krbtgt`, and the acceptor over it.
+    fn realm() -> (Arc<dyn Hdb>, HdbGssAcceptor) {
+        let mut krbtgt = HdbEntry::krbtgt("EXAMPLE.COM");
+        krbtgt.add_key(
+            OwnCipher.random(Enctype::Aes256Sha1).expect("a key"),
+            3,
+            None,
+        );
+        let db = crate::hdb::MemoryHdb::new();
+        db.insert(krbtgt).expect("stored");
+        let db: Arc<dyn Hdb> = Arc::new(db);
+        let acceptor = HdbGssAcceptor::new(Arc::clone(&db), "EXAMPLE.COM").expect("an acceptor");
+        (db, acceptor)
+    }
+
+    /// The credential is the realm's own `krbtgt` and nothing else: that is the one key only the KDC
+    /// holds, and the reason a client's own TGT can be the token.
+    #[test]
+    fn the_service_is_the_realms_own_krbtgt() {
+        let (_db, acceptor) = realm();
+        assert_eq!(
+            acceptor.service().to_string(),
+            "krbtgt/EXAMPLE.COM@EXAMPLE.COM"
+        );
+    }
+
+    /// The keytab view answers for that one name, in both spellings, and for nothing else —
+    /// including a `krbtgt` of another realm, which is the case a careless match would accept.
+    #[test]
+    fn the_source_answers_for_the_krbtgt_name_and_nothing_else() {
+        let (_db, acceptor) = realm();
+        let source = HdbKeytab {
+            hdb: Arc::clone(&acceptor.hdb),
+            service: acceptor.service.clone(),
+            service_name: acceptor.service_name.clone(),
+            realm: acceptor.realm.clone(),
+        };
+        assert_eq!(source.name(), "HDB:EXAMPLE.COM/krbtgt/EXAMPLE.COM");
+
+        let key = source
+            .find(
+                "krbtgt/EXAMPLE.COM",
+                rrl_krb5::EncType::AES256CtsHmacSha196,
+                None,
+            )
+            .expect("the key under the bare name");
+        assert_eq!(key.kvno, 3);
+        assert_eq!(key.realm, "EXAMPLE.COM");
+        assert_eq!(key.principal, "krbtgt/EXAMPLE.COM");
+
+        // With the realm, too: a ticket's `sname` is compared either way.
+        assert!(
+            source
+                .find(
+                    "krbtgt/EXAMPLE.COM@EXAMPLE.COM",
+                    rrl_krb5::EncType::AES256CtsHmacSha196,
+                    Some(3)
+                )
+                .is_some(),
+            "the versioned lookup finds the key it has"
+        );
+
+        for other in [
+            "krbtgt/OTHER.COM",             // another realm
+            "host/kdc.example.com",         // another service in this realm
+            "krbtgt/EXAMPLE.COM@OTHER.COM", // this name, somebody else's realm
+        ] {
+            assert!(
+                source
+                    .find(other, rrl_krb5::EncType::AES256CtsHmacSha196, None)
+                    .is_none(),
+                "{other} must find no key"
+            );
+        }
+
+        // An enctype the entry does not hold: a miss, not a different key.
+        assert!(
+            source
+                .find(
+                    "krbtgt/EXAMPLE.COM",
+                    rrl_krb5::EncType::AES128CtsHmacSha256128,
+                    None
+                )
+                .is_none()
+        );
+    }
+
+    /// `keys()` is the whole entry, which is what an exporter or a log line wants; an empty
+    /// database is an empty list rather than an error.
+    #[test]
+    fn the_sources_keys_are_the_entrys() {
+        let (_db, acceptor) = realm();
+        let source = HdbKeytab {
+            hdb: Arc::clone(&acceptor.hdb),
+            service: acceptor.service.clone(),
+            service_name: acceptor.service_name.clone(),
+            realm: acceptor.realm.clone(),
+        };
+        assert_eq!(source.keys().len(), 1);
+
+        // A realm whose own entry is missing: no keys, and `find` says so rather than panicking.
+        let empty: Arc<dyn Hdb> = Arc::new(crate::hdb::MemoryHdb::new());
+        let acceptor = HdbGssAcceptor::new(Arc::clone(&empty), "EXAMPLE.COM").expect("an acceptor");
+        let source = HdbKeytab {
+            hdb: Arc::clone(&acceptor.hdb),
+            service: acceptor.service.clone(),
+            service_name: acceptor.service_name.clone(),
+            realm: acceptor.realm.clone(),
+        };
+        assert!(source.keys().is_empty());
+        assert!(
+            source
+                .find(
+                    "krbtgt/EXAMPLE.COM",
+                    rrl_krb5::EncType::AES256CtsHmacSha196,
+                    None
+                )
+                .is_none()
+        );
+    }
+
+    /// The keytab view is read-only through the trait: the realm's keys come from its database, and
+    /// a source that accepted an insert would be a second place they could disagree.
+    #[test]
+    fn the_keytab_view_refuses_to_store_a_key() {
+        let (_db, acceptor) = realm();
+        let source = HdbKeytab {
+            hdb: Arc::clone(&acceptor.hdb),
+            service: acceptor.service.clone(),
+            service_name: acceptor.service_name.clone(),
+            realm: acceptor.realm.clone(),
+        };
+        assert!(!source.is_writable());
+        let err = source
+            .insert(rrl_krb5::ServiceKey::new(
+                "krbtgt/EXAMPLE.COM",
+                "EXAMPLE.COM",
+                1,
+                rrl_krb5::EncType::AES256CtsHmacSha196,
+                vec![0u8; 32],
+            ))
+            .expect_err("a read-only source");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    /// The policy knobs are the realm's, and each is reported by the accessor that sets it: a
+    /// binding requirement that defaulted the other way would be a bypass, not a convenience.
+    #[test]
+    fn the_binding_policy_defaults_to_required_and_can_be_relaxed() {
+        let (_db, acceptor) = realm();
+        assert!(acceptor.require_bound_request);
+        assert_eq!(acceptor.max_skew_secs, 300);
+        let relaxed = acceptor
+            .with_require_bound_request(false)
+            .with_clock_skew(60);
+        assert!(!relaxed.require_bound_request);
+        assert_eq!(relaxed.max_skew_secs, 60);
+        // `Debug` names the service and the policy, which is what a log line needs.
+        let text = format!("{relaxed:?}");
+        assert!(text.contains("krbtgt/EXAMPLE.COM@EXAMPLE.COM"), "{text}");
+        assert!(text.contains("require_bound_request: false"), "{text}");
+    }
+}

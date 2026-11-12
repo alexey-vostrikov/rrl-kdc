@@ -429,6 +429,7 @@ pub fn announcement() -> Announced {
 mod tests {
     use super::*;
     use crate::crypto::{Cipher, Enctype, OwnCipher};
+    use crate::der;
 
     /// An acceptor that finishes in one round and hands back a fixed key: the mechanism's wiring,
     /// without a GSS stack.
@@ -562,6 +563,194 @@ mod tests {
             permissive.round(&request(), &[], &token).expect("allowed"),
             Step::Done { .. }
         ));
+    }
+
+    /// An acceptor that reports a checksum over the request body: the mechanism has to verify it,
+    /// because a token accepted for one request must not be replayable into another.
+    #[derive(Debug)]
+    struct Checksummed {
+        key: Key,
+        tamper: bool,
+    }
+
+    impl GssAcceptor for Checksummed {
+        fn step(
+            &self,
+            _mechanism: Option<&str>,
+            _token: &[u8],
+            _state: &[u8],
+            bindings: &[u8],
+        ) -> std::result::Result<GssStep, GssError> {
+            let mut sum =
+                crate::crypto::profile::checksum(self.key.enctype(), self.key.bytes(), bindings)
+                    .expect("a checksum");
+            if self.tamper {
+                sum[0] ^= 0xff;
+            }
+            Ok(GssStep::Done {
+                output: Vec::new(),
+                session_key: self.key.clone(),
+                initiator: Some("alice@EXAMPLE.COM".to_owned()),
+                anonymous: false,
+                lifetime: Some(300),
+                mechanism: "1.2.840.113554.1.2.2".to_owned(),
+                body_checksum: Some(sum),
+            })
+        }
+    }
+
+    /// A mechanism that reports an anonymous context, and one that reports a name which is not the
+    /// request's client.
+    #[derive(Debug)]
+    struct Reporting {
+        initiator: String,
+        anonymous: bool,
+    }
+
+    impl GssAcceptor for Reporting {
+        fn step(
+            &self,
+            _mechanism: Option<&str>,
+            _token: &[u8],
+            _state: &[u8],
+            _bindings: &[u8],
+        ) -> std::result::Result<GssStep, GssError> {
+            Ok(GssStep::Done {
+                output: Vec::new(),
+                session_key: OwnCipher.random(Enctype::Aes256Sha1).expect("a key"),
+                initiator: Some(self.initiator.clone()),
+                anonymous: self.anonymous,
+                lifetime: None,
+                mechanism: "1.2.840.113554.1.2.2".to_owned(),
+                body_checksum: None,
+            })
+        }
+    }
+
+    fn with(acceptor: Arc<dyn GssAcceptor>) -> GssPreauth {
+        GssPreauth::new(acceptor, Vec::new(), false, "EXAMPLE.COM")
+    }
+
+    /// A token that answers a different request is refused, and one that answers this request is
+    /// not: the checksum is what keeps a token from being replayed into another AS-REQ.
+    #[test]
+    fn a_token_bound_by_checksum_to_another_request_is_refused() {
+        let key = OwnCipher.random(Enctype::Aes256Sha1).expect("a key");
+        let good = with(Arc::new(Checksummed {
+            key: key.clone(),
+            tamper: false,
+        }));
+        let step = good
+            .round(&request(), &[], &encode_pa_gss(None, b"a token"))
+            .expect("the checksum answers this request");
+        assert!(
+            matches!(
+                step,
+                Step::Done {
+                    endtime_bound: Some(300),
+                    ..
+                }
+            ),
+            "the mechanism's lifetime bounds the ticket: {step:?}"
+        );
+
+        let bad = with(Arc::new(Checksummed { key, tamper: true }));
+        let err = bad
+            .round(&request(), &[], &encode_pa_gss(None, b"a token"))
+            .expect_err("a checksum for another request must be refused");
+        assert!(err.to_string().contains("different request"), "{err}");
+    }
+
+    /// An anonymous context authenticates only an anonymous request: it proves nothing about who is
+    /// asking, so accepting it for a named client would let anybody in.
+    #[test]
+    fn an_anonymous_context_needs_an_anonymous_request() {
+        let named = with(Arc::new(Reporting {
+            initiator: "alice@EXAMPLE.COM".to_owned(),
+            anonymous: true,
+        }));
+        let err = named
+            .round(&request(), &[], &encode_pa_gss(None, b"a token"))
+            .expect_err("an anonymous context for a named client");
+        assert!(err.to_string().contains("anonymous"), "{err}");
+
+        // The same token is accepted once the request itself is anonymous.
+        static ANON: std::sync::OnceLock<crate::name::Principal> = std::sync::OnceLock::new();
+        let anonymous_client = ANON.get_or_init(|| {
+            // Name type 11, `KRB_NT_WELLKNOWN`: the name type is part of what makes a principal the
+            // anonymous one, which is how the KDC's own `is_anonymous` reads it.
+            crate::name::Principal::new(
+                crate::name::NT_WELLKNOWN,
+                ["WELLKNOWN", "ANONYMOUS"],
+                "WELLKNOWN:ANONYMOUS",
+            )
+        });
+        let anon_request = Request {
+            cname: anonymous_client,
+            ..request()
+        };
+        assert!(
+            matches!(
+                named
+                    .round(&anon_request, &[], &encode_pa_gss(None, b"a token"))
+                    .expect("an anonymous request"),
+                Step::Done { .. }
+            ),
+            "an anonymous context authenticates an anonymous request"
+        );
+    }
+
+    /// An initiator name without a realm is the client's own name when the components match, and a
+    /// different name is refused: both spellings reach here from different acceptors.
+    #[test]
+    fn an_initiator_name_must_be_the_clients() {
+        let bare = with(Arc::new(Reporting {
+            initiator: "alice".to_owned(),
+            anonymous: false,
+        }));
+        assert!(
+            matches!(
+                bare.round(&request(), &[], &encode_pa_gss(None, b"a token"))
+                    .expect("a bare name for the right client"),
+                Step::Done { .. }
+            ),
+            "a bare name that matches the client is accepted"
+        );
+
+        let other = with(Arc::new(Reporting {
+            initiator: "mallory@EXAMPLE.COM".to_owned(),
+            anonymous: false,
+        }));
+        let err = other
+            .round(&request(), &[], &encode_pa_gss(None, b"a token"))
+            .expect_err("another principal's token");
+        assert!(err.to_string().contains("mallory@EXAMPLE.COM"), "{err}");
+    }
+
+    /// The value is read in the one shape that matters for a client that knows a single mechanism —
+    /// a bare token — and a `SEQUENCE` with no token in it is refused rather than accepted as empty.
+    #[test]
+    fn a_bare_token_and_an_empty_value_are_told_apart() {
+        let mechanism = with(Arc::new(OneShot));
+        assert!(
+            matches!(
+                mechanism
+                    .round(&request(), &[], b"a bare token")
+                    .expect("a bare token is a token"),
+                Step::Done { .. }
+            ),
+            "a client that sends no OID is understood"
+        );
+
+        // A `SEQUENCE` with a realm and no token: what a client sends when it has nothing to say.
+        let no_token = der::seq(&[der::field(
+            2,
+            der::tlv(crate::der::GENERAL_STRING, b"OTHER.COM"),
+        )]);
+        let err = mechanism
+            .round(&request(), &[], &no_token)
+            .expect_err("a PA-GSS with no token is not a token");
+        assert!(err.to_string().contains("carries no token"), "{err}");
     }
 
     /// Two rounds: the first leaves state, which travels in the cookie and comes back — and the

@@ -160,6 +160,56 @@ fn kdc_over(directory: Arc<dyn Directory>) -> Kdc {
     )
 }
 
+/// A projection with no version declared is refused, because the version is the one thing the blob
+/// cannot carry and a key without a real one is a key nothing will ever match.
+///
+/// The alternative — reading the keys at version 0 — is worse than a refusal in a way worth stating:
+/// the entry looks healthy, the KDC issues tickets sealed under a key the client never had, and the
+/// account fails to log in with a decryption error at the client, pointing at the client rather than
+/// at the directory that lost the attribute.
+#[test]
+fn a_projection_without_a_declared_version_is_refused() {
+    let directory = FakeDirectory::new();
+    realm(&directory);
+    let attributes = directory
+        .entries
+        .lock()
+        .unwrap()
+        .get(&p("alice").to_string())
+        .cloned()
+        .unwrap();
+
+    let mut ad_shaped = attributes;
+    assert!(
+        ad_shaped.remove(attrs::KEY),
+        "the projection is all that is left"
+    );
+    ad_shaped.remove(attrs::KEY_VERSION_NUMBER);
+    ad_shaped.remove(attrs::AD_KEY_VERSION_NUMBER);
+    let err = from_attributes(&ad_shaped)
+        .expect_err("keys with no version cannot be matched to anything")
+        .to_string();
+    for named in [
+        attrs::AD_SUPPLEMENTAL_CREDENTIALS,
+        attrs::AD_KEY_VERSION_NUMBER,
+        attrs::KEY_VERSION_NUMBER,
+    ] {
+        assert!(err.contains(named), "the message must name {named}: {err}");
+    }
+
+    // The same entry with the version back reads, so the refusal is about the version and not about
+    // the projection.
+    let mut with_version = ad_shaped.clone();
+    with_version.set(attrs::AD_KEY_VERSION_NUMBER, b"3".to_vec());
+    let entry = from_attributes(&with_version).expect("a version is the whole difference");
+    assert_eq!(entry.kvno, 3);
+    assert!(!entry.keys.is_empty(), "and the keys came back");
+    assert!(
+        entry.keys.iter().all(|k| k.kvno == 3),
+        "every key takes the declared version"
+    );
+}
+
 /// A `krb5Key` value in the layout this crate wrote **before** KRB-3.4: `kvno` in `[0]` and the salt
 /// in `[2]` as bare octets.
 ///

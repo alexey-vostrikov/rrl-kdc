@@ -422,7 +422,21 @@ pub fn from_attributes_with(
     if keys.is_empty()
         && let Some(blob) = attributes.get(attrs::AD_SUPPLEMENTAL_CREDENTIALS).first()
     {
-        let kvno = declared_kvno.unwrap_or(0);
+        // The blob carries no version of its own — `KERB_STORED_CREDENTIAL_NEW` has no field for
+        // one — so the version has to come from the directory, which is where AD keeps it. Without
+        // it the keys would be read at version 0, and a key at version 0 matches no ticket: the
+        // KDC would serve the account's tickets sealed under a key its clients never held, and the
+        // failure would surface as a decryption error at the client, long after the directory that
+        // caused it. Refusing here names the missing attribute instead.
+        let Some(kvno) = declared_kvno else {
+            return Err(Error::Hdb(format!(
+                "{name}: {} holds keys but the directory declares no version — a key needs one, \
+                 and the projection does not carry it: set {} (AD) or {} (Heimdal)",
+                attrs::AD_SUPPLEMENTAL_CREDENTIALS,
+                attrs::AD_KEY_VERSION_NUMBER,
+                attrs::KEY_VERSION_NUMBER
+            )));
+        };
         keys = crate::hdb::ad_blob::keys(blob, kvno).map_err(|e| {
             Error::Hdb(format!(
                 "{name}: {}: {e}",

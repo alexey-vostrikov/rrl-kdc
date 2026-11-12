@@ -60,7 +60,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `hdb::ldap` — sealed `krb5Key` (feature `hdb-ldap`) | done: `LdapHdb::with_master_keys` seals what it writes and opens what it reads, as Heimdal's `hdb-ldap.c` does — `krb5Key` is an attribute, so a read-only account holding it holds the keys it can see |
 | `hdb::ldap` — Heimdal's `Key` layout (feature `hdb-ldap`) | done: `mkvno[0] OPTIONAL, key[1], salt[2] Salt`, with the version in `krb5KeyVersionNumber`; values in this crate's old layout still read, and `LdapHdb::migrate_key_layout` rewrites them |
 | `kadmin` — MIT's `kadm5` protocol over ONC RPC (feature `kadmin`) | done: init, get_privs, get/get_principals, create, delete, modify, rename, chpass, chrand, get/set/del string attributes, extract_keys, and the five policy procedures |
-| `hdb::ad_blob` — `supplementalCredentials` (feature `hdb-ldap`) | done both ways: written as a projection, read back when `krb5Key` is absent |
+| `hdb::ad_blob` — `supplementalCredentials` (feature `hdb-ldap`) | done both ways: written as a projection, read back when `krb5Key` is absent — and refused without a declared version, because the blob cannot carry one |
 | `kdc::pac` — the privilege attribute certificate | done: envelope, `PAC_CLIENT_INFO`, `KERB_VALIDATION_INFO`, both signatures |
 | `kdc::logon_info` — NDR for `KERB_VALIDATION_INFO` | done: encoded by hand, checked by impacket and by a live client |
 | `kdc::names` — RFC 6806 §6 enterprise names | done: `NT-ENTERPRISE` client names resolve to the principal they name when the request sets `canonicalize`, and are refused when it does not |

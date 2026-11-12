@@ -432,6 +432,11 @@ pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
 }
 
 /// [`credentials`] as `HdbKey`s at `kvno`, ready to be handed to a KDC.
+///
+/// `kvno` is the version from `msDS-KeyVersionNumber`, and it has to be a real one: the structure
+/// has no field for it, so this function cannot check it, and reading keys at version 0 would produce
+/// keys no ticket ever matches. [`crate::hdb::ldap::from_attributes`] refuses an entry that has a
+/// blob and no declared version rather than calling this with a guess.
 pub fn keys(blob: &[u8], kvno: u32) -> Result<Vec<crate::hdb::HdbKey>, AdBlobError> {
     Ok(credentials(blob)?
         .into_iter()

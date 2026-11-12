@@ -74,6 +74,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `kdc::cookie` — RFC 6113 §5.4.2.3 `PA-FX-COOKIE` | done: opaque realm state, sealed under a key of its own; an expired, foreign or altered cookie is ignored rather than refused, because refusing would let a rewritten request break a legitimate login |
 | `kdc::preauth` — the multi-round framework | done: `KDC_ERR_MORE_PREAUTH_DATA_REQUIRED` (91), a mechanism trait that returns the reply key itself, and nothing advertised by a realm that configured nothing |
 | `kdc::spake` — RFC 9588 SPAKE (feature `spake`) | done for `edwards25519`: the mask, the transcript, `K'[n]`, and the second factor that proves the password. Checked against the published vectors and accepted by `krb5` |
+| `kdc::audit` — the trail (`kdc/kdc-plugin.c`'s `audit` hook) | done: one `Record` per request, emitted by `Kdc::handle_from` — the only place that answers one — so an undecodable request is recorded too; the subject comes from the **reply** when a ticket is issued (after an alias, a canonicalization or `PA-FOR-USER`) and from the request when it is refused (a `KRB-ERROR` carries no client); the code is the one the client received. `Audit` cannot fail, so a full disk cannot refuse a login; `Collector` and `StreamAudit` (one flushed line per record) are the two sinks |
 | `kdc::otp` — RFC 6560 OTP (feature `otp`) | done for the `must-encrypt-nonce`-clear variant: `PA-OTP-CHALLENGE` → `PA-OTP-REQUEST` inside FAST armor, the nonce carried in a cookie and compared in constant time, and the reply key left as the armor key. Who judges a one-time value is the caller's `Verifier` |
 
 ### Managing a realm without inventing an API
@@ -142,15 +143,19 @@ this crate.
 
 Planned:
 
-* **Cross-realm** — a `krbtgt` of another realm, `transited` fields and referrals
-  (`kdc/krb5tgs.c`).
+* **Replication** — see below; `hprop`/`hpropd` are written, a second domain controller is a
+  decision rather than a task.
 * **OTP's `must-encrypt-nonce` variant** (RFC 6560 §3.3) — where the one-time value never travels
   and generates the reply key instead. It needs the KDC to hold every token's current value, which
   this crate has no store for; the variant that asks a verifier is written.
 * **SPAKE over the NIST groups** (RFC 9588 §12.2.2) — the exchange is written and accepted by
   `krb5`, for `edwards25519` only, which is the group that client asks for.
-* **Audit trail and pre-authentication hooks** (`kdc/kdc-plugin.c`) — one stable record per
-  decision, and a way to add a method without editing the exchange.
+* **`require-hwauth` is a flag with no effect** — it is stored and served by kadm5, and nothing in
+  the AS exchange reads it (Heimdal asks a plugin through `_kdc_hwauth_policy`). Tracked as KRB-1.13;
+  until then an administrator who sets it gets no change in behaviour, which is the worst of both.
+* **The rest of `kdc-plugin.c`'s hooks** — `check_access`, `referral_policy`, `finalize_reply`
+  exist as behaviour but not as seams a deployment can replace; `pac_generate`/`pac_verify` are the
+  `PacIdentities` seam.
 * **Replication** (`kdc/hprop.c`, `hpropd.c`) — a second domain controller. Not planned work
   in the sense of "next": a decision was taken that one HDB is enough, so this sits at
   `deferred` rather than `todo`.

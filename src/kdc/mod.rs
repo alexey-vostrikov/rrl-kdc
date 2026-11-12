@@ -23,6 +23,7 @@
 //! here — ticket lifetimes, clock skew, expiry — is about an instant.
 
 pub mod ap_req;
+pub mod audit;
 pub mod config;
 
 mod as_exchange;
@@ -209,6 +210,12 @@ pub struct Kdc {
     hdb: Arc<dyn Hdb>,
     cipher: Arc<dyn Cipher>,
     policy: Arc<dyn ChangePolicy>,
+    /// Where decisions are recorded, when a deployment wants a trail.
+    ///
+    /// `None` is "nobody is watching", and it is the default because a KDC that wrote a log file
+    /// without being asked would be a KDC that fills a disk nobody knew it had. A realm that needs
+    /// an audit trail says so once, here.
+    audit: Option<Arc<dyn audit::Audit>>,
     identities: Option<Arc<dyn logon_info::PacIdentities>>,
     /// The realm's certificate and trust anchors, when PKINIT is configured.
     ///
@@ -260,6 +267,7 @@ impl Kdc {
             hdb,
             cipher,
             policy: Arc::new(SelfOnly),
+            audit: None,
             identities: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
@@ -522,6 +530,16 @@ impl Kdc {
         Ok(Some(pac::authorization_data(&blob)))
     }
 
+    /// Records every decision in `audit`.
+    ///
+    /// One record per request, written by [`Self::handle_from`] — the only place that answers one.
+    /// The sink cannot fail, so a full log file cannot turn a login into a refusal; that is a
+    /// property of the [`audit::Audit`] trait rather than of this call.
+    pub fn with_audit(mut self, audit: Arc<dyn audit::Audit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
     /// The same KDC with `policy` deciding who may change whose password.
     pub fn with_change_policy(mut self, policy: Arc<dyn ChangePolicy>) -> Self {
         self.policy = policy;
@@ -592,7 +610,24 @@ impl Kdc {
         }
         let req = match KdcReq::decode(request) {
             Ok(req) => req,
-            Err(err) => return self.error(None, &Error::from(err), now),
+            Err(err) => {
+                let err = Error::from(err);
+                let reply = self.error(None, &err, now);
+                // A request that did not decode is recorded too. A trail that begins after decoding
+                // has its blind spot exactly where probing is cheapest: an attacker's malformed
+                // packets would be the only ones nobody could count.
+                self.record(audit::Record {
+                    at: now,
+                    exchange: audit::Exchange::Undecodable,
+                    client: None,
+                    service: None,
+                    realm: self.config.realm().to_owned(),
+                    peer,
+                    outcome: audit::Outcome::Refused,
+                    code: Some(Self::reply_code(&err)),
+                });
+                return reply;
+            }
         };
         let outcome = match address::check(
             self.config.address_policy(),
@@ -632,8 +667,69 @@ impl Kdc {
             }
         }
         match outcome {
-            Ok(reply) => reply,
-            Err(err) => self.error(Some(&req), &err, now),
+            Ok(reply) => {
+                // The subject comes from the **reply**, not from the request: after an alias, a
+                // canonicalization or a `PA-FOR-USER`, the name the ticket is for is the one the
+                // KDC decided on, and a trail recording the requested spelling would document a
+                // decision nobody made.
+                let exchange = if req.msg_type == crate::msg::TGS_REQ {
+                    audit::Exchange::Tgs
+                } else {
+                    audit::Exchange::As
+                };
+                self.record(audit::Record {
+                    at: now,
+                    exchange,
+                    client: audit::reply_subject(&reply, &req.body.realm),
+                    service: req.body.sname.clone(),
+                    realm: req.body.realm.clone(),
+                    peer,
+                    outcome: audit::Outcome::Issued,
+                    code: None,
+                });
+                reply
+            }
+            Err(err) => {
+                let reply = self.error(Some(&req), &err, now);
+                // A refusal has no client in its reply — `KRB-ERROR` carries realm, service and
+                // `e-data`, not `cname` — so the request's is the only one there is. That is honest
+                // for a refusal: it records who *asked*, which is exactly what an operator wants to
+                // count when the answer was no.
+                self.record(audit::Record {
+                    at: now,
+                    exchange: if req.msg_type == crate::msg::TGS_REQ {
+                        audit::Exchange::Tgs
+                    } else {
+                        audit::Exchange::As
+                    },
+                    client: req.body.cname.clone(),
+                    service: req.body.sname.clone(),
+                    realm: req.body.realm.clone(),
+                    peer,
+                    outcome: audit::Outcome::Refused,
+                    code: Some(Self::reply_code(&err)),
+                });
+                reply
+            }
+        }
+    }
+
+    /// Hands one decision to the sink, if there is one.
+    fn record(&self, record: audit::Record) {
+        if let Some(audit) = &self.audit {
+            audit.record(&record);
+        }
+    }
+
+    /// The Kerberos error code a refusal is answered with.
+    ///
+    /// The same choice [`Self::error`] makes when it builds the reply, kept in one place: a trail
+    /// that named a different code than the client received would send an operator looking for a
+    /// failure that did not happen.
+    fn reply_code(err: &Error) -> i32 {
+        match err {
+            Error::Preauth { code, .. } => *code,
+            other => other.kdc_code(),
         }
     }
 

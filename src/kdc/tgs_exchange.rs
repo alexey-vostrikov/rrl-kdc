@@ -43,30 +43,6 @@ use super::transited;
 /// whatever the session key's enctype is.
 const CKSUMTYPE_RSA_MD5: i32 = 7;
 
-/// The octets of a DER `SEQUENCE` without its own tag and length, for the checksum diagnostic.
-///
-/// Some clients checksum the content of `KDC-REQ-BODY` rather than the whole element, and the two
-/// differ by exactly these octets.
-fn strip_sequence_header(bytes: &[u8]) -> &[u8] {
-    if bytes.first() != Some(&0x30) || bytes.len() < 2 {
-        return bytes;
-    }
-    let mut index = 2;
-    if bytes[1] & 0x80 != 0 {
-        let count = (bytes[1] & 0x7f) as usize;
-        if count > 4 {
-            return bytes;
-        }
-        index = 2 + count;
-    }
-    bytes.get(index..).unwrap_or(bytes)
-}
-
-/// Hex, for the checksum diagnostic.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|octet| format!("{octet:02x}")).collect()
-}
-
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
@@ -1522,46 +1498,17 @@ impl Kdc {
         // `KRB_AP_ERR_INAPP_CKSUM` for `checksum type 7` against `aes256-cts-hmac-sha1-96`. Heimdal
         // met the same client and answered it, so a KDC that serves Windows has to as well.
         if *cksum_type == CKSUMTYPE_RSA_MD5 {
-            // Keyed with the subkey when the client sent one: RFC 4120 §5.4.1 lets a client key the
-            // request-body checksum with the authenticator's subkey, and Windows does exactly that —
-            // verifying only against the TGT's session key refuses a client that did everything
-            // right. Both keys are tried, any of them matching is proof.
-            let verified = ticket_part
-                .session_key
-                .verify_rsa_md5_checksum(&req.raw_body, cksum)
-                || authenticator
-                    .subkey
-                    .as_ref()
-                    .is_some_and(|subkey| subkey.verify_rsa_md5_checksum(&req.raw_body, cksum));
-            if !verified {
-                if std::env::var_os("KDC_CKSUM_DIAG").is_some() {
-                    // The client's value decides the construction, and guessing it costs a full
-                    // round trip through a Windows join. Every candidate is printed beside what
-                    // arrived: keyed with each key, plain over the body, and keyed over the body's
-                    // content without its SEQUENCE header.
-                    let content = strip_sequence_header(&req.raw_body);
-                    let mut candidates = Vec::new();
-                    candidates.push((
-                        "keyed-session",
-                        ticket_part.session_key.rsa_md5_checksum(&req.raw_body),
-                    ));
-                    if let Some(subkey) = authenticator.subkey.as_ref() {
-                        candidates.push(("keyed-subkey", subkey.rsa_md5_checksum(&req.raw_body)));
-                        candidates.push(("keyed-subkey-content", subkey.rsa_md5_checksum(content)));
-                    }
-                    candidates.push(("plain-body", crate::crypto::md5(&req.raw_body)));
-                    candidates.push(("plain-content", crate::crypto::md5(content)));
-                    let rendered: Vec<String> = candidates
-                        .into_iter()
-                        .map(|(name, value)| format!("{name}={}", hex(&value)))
-                        .collect();
-                    eprintln!(
-                        "cksum-diag: got={} bodylen={} {}",
-                        hex(cksum),
-                        req.raw_body.len(),
-                        rendered.join(" ")
-                    );
-                }
+            // Type 7 is **plain** MD5 over the request body, not MD5 keyed with the session key.
+            // Measured on the AD-join stand: the octets a Windows client sends equal
+            // `md5(KDC-REQ-BODY)` exactly, while `md5(session_key || body)` differs from them on
+            // every request. RFC 3961 §6 calls the type a checksum of the data for that reason - the
+            // key plays no part in it.
+            //
+            // That is not a hole: the checksum travels inside the authenticator, which is encrypted
+            // under the session key, so the key still proves who sent it. What the checksum adds is
+            // the binding between the body and that authenticator, and it does that unkeyed.
+            let plain = crate::crypto::md5(&req.raw_body);
+            if !crate::crypto::ct_eq(&plain, cksum) {
                 return Err(Error::Kdc {
                     code: codes::KRB_AP_ERR_MODIFIED,
                     text: "the rsa-md5 checksum does not cover this request body".into(),

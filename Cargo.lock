@@ -1116,7 +1116,7 @@ dependencies = [
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#04878f0f828f172604df4d57832a545669cc84c8"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#e9c80260051446efb07bb7ce2e2e1f0c1dfb8f25"
 dependencies = [
  "aes",
  "getrandom 0.4.3",

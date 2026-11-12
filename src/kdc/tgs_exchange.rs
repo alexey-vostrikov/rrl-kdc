@@ -39,6 +39,10 @@ use super::as_exchange::Purpose;
 use super::config::TransitedPolicy;
 use super::transited;
 
+/// `CKSUMTYPE_RSA_MD5` (RFC 3961 §6): keyed MD5, which a Windows client sends for a `TGS-REQ` body
+/// whatever the session key's enctype is.
+const CKSUMTYPE_RSA_MD5: i32 = 7;
+
 /// A `TGS-REQ` whose evidence has been checked: the client it proves, and the
 /// TGT it came with.
 #[derive(Debug)]
@@ -1487,27 +1491,45 @@ impl Kdc {
             code: codes::KRB_AP_ERR_INAPP_CKSUM,
             text: "the authenticator has no checksum over the request".into(),
         })?;
-        if *cksum_type != ticket_part.session_key.enctype().checksum_type() {
-            return Err(Error::Kdc {
-                code: codes::KRB_AP_ERR_INAPP_CKSUM,
-                text: format!(
-                    "the checksum type {} does not belong to the session key's {}",
-                    cksum_type,
-                    ticket_part.session_key.enctype().name()
-                ),
-            });
+        // `rsa-md5` (7) is accepted whatever the session key is. It is not an RFC 3961 profile
+        // checksum but MD5 over the key followed by the data, and Windows computes exactly that for
+        // the body of a `TGS-REQ` even when the TGT's session key is AES - measured on the AD-join
+        // stand, where a Windows client took its ticket and was refused service tickets with
+        // `KRB_AP_ERR_INAPP_CKSUM` for `checksum type 7` against `aes256-cts-hmac-sha1-96`. Heimdal
+        // met the same client and answered it, so a KDC that serves Windows has to as well.
+        if *cksum_type == CKSUMTYPE_RSA_MD5 {
+            if !ticket_part
+                .session_key
+                .verify_rsa_md5_checksum(&req.raw_body, cksum)
+            {
+                return Err(Error::Kdc {
+                    code: codes::KRB_AP_ERR_MODIFIED,
+                    text: "the rsa-md5 checksum does not cover this request body".into(),
+                });
+            }
+        } else {
+            if *cksum_type != ticket_part.session_key.enctype().checksum_type() {
+                return Err(Error::Kdc {
+                    code: codes::KRB_AP_ERR_INAPP_CKSUM,
+                    text: format!(
+                        "the checksum type {} does not belong to the session key's {}",
+                        cksum_type,
+                        ticket_part.session_key.enctype().name()
+                    ),
+                });
+            }
+            self.cipher()
+                .verify_checksum(
+                    &ticket_part.session_key,
+                    usage::TGS_REQ_AUTH_CKSUM,
+                    &req.raw_body,
+                    cksum,
+                )
+                .map_err(|_| Error::Kdc {
+                    code: codes::KRB_AP_ERR_MODIFIED,
+                    text: "the checksum does not cover this request body".into(),
+                })?;
         }
-        self.cipher()
-            .verify_checksum(
-                &ticket_part.session_key,
-                usage::TGS_REQ_AUTH_CKSUM,
-                &req.raw_body,
-                cksum,
-            )
-            .map_err(|_| Error::Kdc {
-                code: codes::KRB_AP_ERR_MODIFIED,
-                text: "the checksum does not cover this request body".into(),
-            })?;
 
         // 4. The authenticator's clock.
         let skew = now.saturating_sub(authenticator.ctime);

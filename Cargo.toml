@@ -144,6 +144,11 @@ required-features = ["pkinit"]
 name = "hprop-stand"
 required-features = ["hdb-redb"]
 
+# The `krb5Key` layout partner: it writes a value for Heimdal to decode and reads one Heimdal wrote.
+[[example]]
+name = "key-value"
+required-features = ["hdb-ldap"]
+
 [[example]]
 name = "pkinit-reply"
 required-features = ["pkinit"]

@@ -160,6 +160,206 @@ fn kdc_over(directory: Arc<dyn Directory>) -> Kdc {
     )
 }
 
+/// A `krb5Key` value in the layout this crate wrote **before** KRB-3.4: `kvno` in `[0]` and the salt
+/// in `[2]` as bare octets.
+///
+/// Built here by hand rather than by an old build, because the point is to keep reading what such a
+/// build wrote: a directory in the field has values of this shape, and a test that could only produce
+/// the current shape would not prove the migration works.
+fn legacy_krb5_key(kvno: u32, key: &rrl_kdc::crypto::Key, salt: Option<&[u8]>) -> Vec<u8> {
+    use rrl_kdc::der;
+    let mut parts = vec![
+        der::field(0, der::int(kvno as i64)),
+        der::field(
+            1,
+            der::seq(&[
+                der::field(0, der::int(key.enctype().id() as i64)),
+                der::field(1, der::octets(key.bytes())),
+            ]),
+        ),
+    ];
+    if let Some(salt) = salt {
+        parts.push(der::field(2, der::octets(salt)));
+    }
+    der::seq(&parts)
+}
+
+/// The layout Heimdal writes: `mkvno[0] OPTIONAL`, `key[1]`, `salt[2] Salt ::= SEQUENCE { type[0],
+/// salt[1] }`.
+#[test]
+fn a_written_value_uses_heimdals_layout() {
+    use rrl_kdc::crypto::{Enctype, OwnCipher};
+    use rrl_kdc::der::Reader;
+
+    let mut entry = HdbEntry::user(p("alice"));
+    entry
+        .add_password_key(&OwnCipher, Enctype::Aes256Sha1, PASSWORD.as_bytes(), 3)
+        .expect("a key");
+    let attributes = to_attributes(&entry);
+    let value = attributes.first(attrs::KEY).expect("a key value");
+
+    let mut r = Reader::new(value);
+    let body = r.next_tlv("Key").expect("a SEQUENCE");
+    let mut f = Reader::new(body.content);
+    let mut numbers = Vec::new();
+    let mut salt_is_struct = false;
+    while !f.is_empty() {
+        let field = f.next_tlv("field").expect("a field");
+        let number = field.tag & 0x1f;
+        numbers.push(number);
+        if number == 2 {
+            let mut inner = Reader::new(field.content);
+            let value = inner.next_tlv("salt").expect("the salt");
+            salt_is_struct = value.tag == rrl_kdc::der::SEQUENCE;
+        }
+    }
+    assert_eq!(
+        numbers,
+        vec![1, 2],
+        "no mkvno (the key is not sealed), then the key and a Salt structure"
+    );
+    assert!(
+        salt_is_struct,
+        "the salt is a Salt ::= SEQUENCE, not a bare octet string"
+    );
+
+    // The version is an attribute, as Heimdal keeps it, and not a field of the value.
+    assert_eq!(
+        attributes
+            .first(attrs::KEY_VERSION_NUMBER)
+            .map(<[u8]>::to_vec),
+        Some(b"3".to_vec())
+    );
+}
+
+/// A value in the old layout still reads, with its version taken from the attribute.
+#[test]
+fn a_legacy_value_still_reads() {
+    use rrl_kdc::crypto::{Enctype, OwnCipher};
+
+    let key = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let mut attributes = Attributes::new();
+    attributes.set(attrs::PRINCIPAL_NAME, p("alice").to_string().into_bytes());
+    attributes.set(attrs::KEY_VERSION_NUMBER, b"5".to_vec());
+    attributes.add(
+        attrs::KEY,
+        legacy_krb5_key(5, &key, Some(b"EXAMPLE.COMalice")),
+    );
+
+    let entry = from_attributes(&attributes).expect("a legacy entry reads");
+    assert_eq!(entry.principal, p("alice"));
+    assert_eq!(entry.keys.len(), 1);
+    assert_eq!(entry.keys[0].kvno, 5);
+    assert_eq!(entry.keys[0].key.bytes(), key.bytes());
+    assert_eq!(
+        entry.keys[0].salt.as_deref(),
+        Some(&b"EXAMPLE.COMalice"[..]),
+        "the salt survives the old bare-octet form"
+    );
+}
+
+/// The migration rewrites old values into Heimdal's layout, keeps everything else in the entry, and
+/// does nothing on a second run.
+#[test]
+fn the_migration_rewrites_the_layout_and_is_idempotent() {
+    use rrl_kdc::crypto::{Enctype, OwnCipher};
+
+    let directory = Arc::new(FakeDirectory::new());
+    let key = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+
+    let mut attributes = Attributes::new();
+    attributes.set(attrs::PRINCIPAL_NAME, p("alice").to_string().into_bytes());
+    attributes.set(attrs::KEY_VERSION_NUMBER, b"7".to_vec());
+    // An attribute this crate's mapping does not model: the migration must leave it alone.
+    attributes.set("description", b"an account somebody annotated".to_vec());
+    attributes.add(
+        attrs::KEY,
+        legacy_krb5_key(7, &key, Some(b"EXAMPLE.COMalice")),
+    );
+    directory
+        .put(&p("alice"), &attributes)
+        .expect("stored in the directory");
+
+    let backend = LdapHdb::new(Arc::clone(&directory) as Arc<dyn Directory>);
+    assert_eq!(backend.migrate_key_layout().expect("migrated"), 1);
+
+    let after = directory.get(&p("alice")).unwrap().expect("alice");
+    let value = after.first(attrs::KEY).expect("a key value");
+    let mut r = rrl_kdc::der::Reader::new(value);
+    let body = r.next_tlv("Key").expect("a SEQUENCE");
+    let mut f = rrl_kdc::der::Reader::new(body.content);
+    let first = f.next_tlv("field").expect("a field");
+    assert_eq!(
+        first.tag & 0x1f,
+        1,
+        "no [0]: the version left the value and became an attribute"
+    );
+    // Everything that is not `krb5Key` is untouched.
+    assert_eq!(
+        after.first("description").map(<[u8]>::to_vec),
+        Some(b"an account somebody annotated".to_vec()),
+        "the migration must not drop attributes it does not model"
+    );
+    assert_eq!(
+        after.first(attrs::KEY_VERSION_NUMBER).map(<[u8]>::to_vec),
+        Some(b"7".to_vec()),
+        "the version is still there, where Heimdal keeps it"
+    );
+
+    // The entry still reads, with its key and its salt.
+    let entry = backend.fetch(&p("alice")).unwrap().expect("alice");
+    assert_eq!(entry.keys[0].kvno, 7);
+    assert_eq!(entry.keys[0].key.bytes(), key.bytes());
+    assert_eq!(
+        entry.keys[0].salt.as_deref(),
+        Some(&b"EXAMPLE.COMalice"[..])
+    );
+
+    // A second run finds nothing to do, so a migration loop cannot rewrite a directory forever.
+    assert_eq!(backend.migrate_key_layout().expect("migrated again"), 0);
+}
+
+/// A sealed value records its master-key number in `[0]`, which is where Heimdal puts it — and that is
+/// what tells a reader the key is not plaintext when the two layouts would otherwise look alike.
+#[test]
+fn a_sealed_value_puts_the_master_key_number_where_heimdal_does() {
+    use rrl_kdc::crypto::{Cipher, Enctype, OwnCipher};
+    use rrl_kdc::hdb::mkey::MasterKeys;
+
+    let master = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+    let keys = MasterKeys::single(master, 2);
+    let mut entry = HdbEntry::user(p("alice"));
+    entry
+        .add_password_key(&OwnCipher, Enctype::Aes256Sha1, PASSWORD.as_bytes(), 4)
+        .expect("a key");
+
+    let attributes =
+        rrl_kdc::hdb::ldap::to_attributes_with(&entry, Some((&OwnCipher, &keys))).expect("mapped");
+    let value = attributes.first(attrs::KEY).expect("a key value");
+    let mut r = rrl_kdc::der::Reader::new(value);
+    let body = r.next_tlv("Key").expect("a SEQUENCE");
+    let mut f = rrl_kdc::der::Reader::new(body.content);
+    let first = f.next_tlv("field").expect("a field");
+    assert_eq!(first.tag & 0x1f, 0, "mkvno is [0]");
+    let mut inner = rrl_kdc::der::Reader::new(first.content);
+    let mkvno = inner.next_tlv("mkvno").expect("an INTEGER");
+    assert_eq!(
+        rrl_kdc::der::as_int("mkvno", mkvno.content).unwrap(),
+        2,
+        "the master key that sealed it, not the key version"
+    );
+
+    // And it reads back to the right version and the right key.
+    let back = rrl_kdc::hdb::ldap::from_attributes_with(&attributes, Some((&OwnCipher, &keys)))
+        .expect("opened");
+    assert_eq!(back.keys[0].kvno, 4, "the version came from the attribute");
+    assert_eq!(
+        back.keys[0].key.bytes(),
+        entry.keys[0].key.bytes(),
+        "and the key came back"
+    );
+}
+
 /// A sealed LDAP backend: what the directory holds has no key in the clear, and it reads back.
 ///
 /// The end-to-end shape matters more here than for a file: `krb5Key` is a *directory attribute*, and a

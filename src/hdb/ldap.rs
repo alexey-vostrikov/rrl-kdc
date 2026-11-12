@@ -386,14 +386,9 @@ pub fn from_attributes_with(
         })?;
     let principal = Principal::parse(&name)?;
 
-    let mut keys = Vec::new();
-    for value in attributes.get(attrs::KEY) {
-        keys.push(
-            decode_key(value, master)
-                .map_err(|e| Error::Hdb(format!("{principal}: {}: {e}", attrs::KEY)))?,
-        );
-    }
-
+    // The version is read **before** the keys: it is where Heimdal keeps a key's version, and a value
+    // in Heimdal's layout does not carry one at all. Reading the keys first would mean guessing a
+    // version and then re-checking it.
     let kvno_krb5 = attributes.number(attrs::KEY_VERSION_NUMBER, &name)?;
     let kvno_ad = attributes.number(attrs::AD_KEY_VERSION_NUMBER, &name)?;
     // Agreed first, so a contradiction is reported even when the keys would
@@ -405,6 +400,14 @@ pub fn from_attributes_with(
         attrs::AD_KEY_VERSION_NUMBER,
         kvno_ad,
     )?;
+
+    let mut keys = Vec::new();
+    for value in attributes.get(attrs::KEY) {
+        keys.push(
+            decode_key(value, declared_kvno, master)
+                .map_err(|e| Error::Hdb(format!("{principal}: {}: {e}", attrs::KEY)))?,
+        );
+    }
     // An entry with keys but no kvno is an entry whose keys nothing can match.
     // Reading the highest one is what Heimdal's LDAP backend does when the
     // attribute is absent, and it is the only value that cannot be wrong.
@@ -827,12 +830,30 @@ pub fn principal_from_spn(spn: &str, realm: &str) -> Result<Principal> {
     Principal::parse_in_realm(spn, realm).map_err(Error::from)
 }
 
-/// One `krb5Key` value: the ASN.1 `Key`, DER.
+/// `hdb-pw-salt` (`lib/hdb/hdb.asn1`): the salt type of a password-derived key.
+pub const SALT_TYPE_PW: u32 = 3;
+/// `hdb-afs3-salt`: an AFS3 salt. Read and preserved, never produced.
+pub const SALT_TYPE_AFS3: u32 = 10;
+
+/// One `krb5Key` value, **in Heimdal's layout** (`lib/hdb/hdb.asn1`):
+///
+/// ```text
+/// Key ::= SEQUENCE {
+///     mkvno[0] INTEGER OPTIONAL,      -- the master key this key is sealed under
+///     key[1]   EncryptionKey,
+///     salt[2]  Salt OPTIONAL }
+/// Salt ::= SEQUENCE { type[0] INTEGER, salt[1] OCTET STRING, opaque[2] OCTET STRING OPTIONAL }
+/// ```
+///
+/// **`[0]` is `mkvno`, not the key version.** Heimdal writes this value with
+/// `ASN1_MALLOC_ENCODE(Key, …)` (`hdb-ldap.c`) and takes the key's version from the separate
+/// `krb5KeyVersionNumber` attribute, so a value that puts `kvno` in `[0]` is read by Heimdal as a
+/// master-key number and vice versa. This crate wrote `[0] = kvno` until this was found; the reader
+/// below still accepts that shape, and [`LdapHdb::migrate_key_layout`] rewrites it.
 ///
 /// With `master`, the key material is written sealed — `encrypt(master_key, HDB_KU_MKEY, key_bytes)` —
-/// and the value records which master key sealed it. A directory is a copy of the realm's keys like any
-/// other store: `krb5Key` is readable by anyone the directory lets read the attribute, and a read-only
-/// account with `krb5Key` in its ACL holds every key it can see.
+/// and `[0]` records which master key did it. A directory is a copy of the realm's keys like any other
+/// store: `krb5Key` is readable by anyone the directory lets read the attribute.
 fn encode_key(
     key: &HdbKey,
     master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
@@ -844,62 +865,204 @@ fn encode_key(
         }
         None => (key.key.bytes().to_vec(), None),
     };
-    let mut parts = vec![
-        crate::der::field(0, crate::der::int(key.kvno as i64)),
-        crate::der::field(
-            1,
-            crate::der::seq(&[
-                crate::der::field(0, crate::der::int(key.key.enctype().id() as i64)),
-                crate::der::field(1, crate::der::octets(&material)),
-            ]),
-        ),
-    ];
-    if let Some(salt) = &key.salt {
-        parts.push(crate::der::field(2, crate::der::octets(salt)));
-    }
-    // `[3]`: which master key sealed this value. Written only when it is sealed, so a directory that
-    // holds plaintext keys — the common arrangement, protected by the directory's own ACL — is
-    // unchanged by this.
+    let mut parts = Vec::new();
+    // `mkvno` first, and only when the key is sealed — which is exactly when Heimdal writes it
+    // (`hdb_seal_key_mkey` sets it as it seals). That is also what makes the two layouts
+    // distinguishable on the way back in.
     if let Some(mkvno) = mkvno {
-        parts.push(crate::der::field(3, crate::der::int(i64::from(mkvno))));
+        parts.push(crate::der::field(0, crate::der::int(i64::from(mkvno))));
+    }
+    parts.push(crate::der::field(
+        1,
+        crate::der::seq(&[
+            crate::der::field(0, crate::der::int(key.key.enctype().id() as i64)),
+            crate::der::field(1, crate::der::octets(&material)),
+        ]),
+    ));
+    if let Some(salt) = &key.salt {
+        // The salt is a structure, not an octet string: `type` says how it was made, and a reader
+        // that took the bare octets would lose the type and misread ours as Heimdal's key field.
+        parts.push(crate::der::field(
+            2,
+            crate::der::seq(&[
+                crate::der::field(0, crate::der::int(i64::from(SALT_TYPE_PW))),
+                crate::der::field(1, crate::der::octets(salt)),
+            ]),
+        ));
     }
     Ok(crate::der::seq(&parts))
 }
 
-/// The key a `krb5Key` value holds, opening it when the value says it is sealed.
-fn decode_key(
-    value: &[u8],
-    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
-) -> Result<HdbKey> {
-    use crate::der::{Fields, Reader};
+/// Which layout a `krb5Key` value was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLayout {
+    /// Heimdal's: `mkvno[0] OPTIONAL, key[1], salt[2] Salt`.
+    Heimdal,
+    /// This crate's before the layout was fixed: `kvno[0], key[1], salt[2] OCTET STRING,
+    /// mkvno[3]`.
+    Legacy,
+}
+
+/// The `key[1]` field of a value, and the rest of what a reader needs to tell the layouts apart.
+struct KeyFields<'a> {
+    material: &'a [u8],
+    enctype: Enctype,
+    /// `[0]`: `mkvno` in Heimdal's layout, `kvno` in ours.
+    first: Option<u32>,
+    /// `[2]`: a `Salt` structure in Heimdal's layout, bare octets in ours.
+    salt: Option<Vec<u8>>,
+    /// `[3]`: our own `mkvno` field, which Heimdal has no place for.
+    legacy_mkvno: Option<u32>,
+    layout: KeyLayout,
+}
+
+/// Reads the parts of a `krb5Key` value without deciding what they mean.
+///
+/// **The layouts are told apart by their shape, not by a version number.** There is none to use: the
+/// value is an `ASN.1` `Key` in both cases. The two things that differ are `[0]` (integer in both, and
+/// meaningless without knowing which) and `[2]` (`Salt` is a `SEQUENCE`; our old salt was a bare
+/// `OCTET STRING`), plus our own `[3]`, which Heimdal does not write. So:
+///
+/// * `[3]` present → legacy, unambiguously;
+/// * `[2]` a `SEQUENCE` → Heimdal, unambiguously;
+/// * neither → decided by the key material: Heimdal writes `mkvno` only when it seals a key, so a
+///   **plaintext** key with a `[0]` is one of ours and its `[0]` is a version number.
+fn read_key<'a>(value: &'a [u8]) -> Result<KeyFields<'a>> {
+    use crate::der::Reader;
     let context = "krb5Key";
     let mut r = Reader::new(value);
-    let f = Fields::parse(context, r.expect_in(context, crate::der::SEQUENCE)?)?;
-    let kvno = f.u32(0, context)?;
-    let mut er = Reader::new(f.bytes(1, context)?);
-    let ef = Fields::parse(context, er.expect_in(context, crate::der::SEQUENCE)?)?;
-    let id = ef.int(0, context)? as i32;
-    let enctype = Enctype::from_id(id)
-        .ok_or_else(|| Error::Hdb(format!("enctype {id} is not one this KDC implements")))?;
-    let stored = ef.octets(1, context)?;
-    let mkvno = f
-        .opt_int(3, context)?
-        .map(|v| {
-            u32::try_from(v)
-                .map_err(|_| Error::Hdb(format!("{context}: mkvno {v} does not fit in 32 bits")))
-        })
-        .transpose()?;
-    // The value may be sealed, and a sealed blob is longer than the enctype accepts — so it is
-    // opened **before** `Key::new`, which would otherwise refuse it with a length error that says
-    // nothing about what is actually wrong.
-    let material = if crate::hdb::mkey::is_plain_key(stored, enctype) {
-        stored.to_vec()
+    let body = r.expect_in(context, crate::der::SEQUENCE)?;
+    let mut f = Reader::new(body);
+
+    let mut first = None;
+    let mut material: Option<&[u8]> = None;
+    let mut enctype = None;
+    let mut salt = None;
+    let mut salt_is_struct = false;
+    let mut legacy_mkvno = None;
+
+    while !f.is_empty() {
+        let field = f
+            .next_tlv(context)
+            .map_err(|e| Error::Hdb(format!("{context}: {e}")))?;
+        let number = field.tag & 0x1f;
+        if field.tag & 0xc0 != 0x80 {
+            return Err(Error::Hdb(format!(
+                "{context}: field {:#04x} is not a context tag",
+                field.tag
+            )));
+        }
+        let mut inner = Reader::new(field.content);
+        let value = inner
+            .next_tlv(context)
+            .map_err(|e| Error::Hdb(format!("{context} [{number}]: {e}")))?;
+        match number {
+            0 => {
+                first = Some(
+                    u32::try_from(
+                        crate::der::as_int(context, value.content)
+                            .map_err(|e| Error::Hdb(format!("{context}: {e}")))?,
+                    )
+                    .map_err(|_| Error::Hdb(format!("{context}: [0] does not fit in 32 bits")))?,
+                )
+            }
+            // `[1] EncryptionKey`: `value` is already the `EncryptionKey` SEQUENCE, because a
+            // constructed field's content begins with the inner value. `Fields` strips the context
+            // tags of its own fields, which is the difference between `keytype [0] INTEGER` decoding
+            // as 18 and decoding as 0x020112.
+            1 => {
+                let ef = crate::der::Fields::parse(context, value.content)?;
+                let id = ef.int(0, context)? as i32;
+                enctype = Some(Enctype::from_id(id).ok_or_else(|| {
+                    Error::Hdb(format!("enctype {id} is not one this KDC implements"))
+                })?);
+                material = Some(ef.octets(1, context)?);
+            }
+            // `[2]`: a `Salt` structure in Heimdal's layout, bare octets in ours. `value` is the
+            // SEQUENCE when it is a structure, and the tag is what tells them apart.
+            2 => {
+                if value.tag == crate::der::SEQUENCE {
+                    salt_is_struct = true;
+                    let sf = crate::der::Fields::parse(context, value.content)?;
+                    // `type[0]` is read and dropped: every salt this crate writes is `hdb-pw-salt`,
+                    // and the bytes are what a key was derived with.
+                    salt = Some(sf.octets(1, context)?.to_vec());
+                } else {
+                    salt = Some(value.content.to_vec());
+                }
+            }
+            3 => {
+                legacy_mkvno = Some(
+                    u32::try_from(
+                        crate::der::as_int(context, value.content)
+                            .map_err(|e| Error::Hdb(format!("{context}: {e}")))?,
+                    )
+                    .map_err(|_| Error::Hdb(format!("{context}: [3] does not fit in 32 bits")))?,
+                )
+            }
+            // A field this crate does not know: skipped, because refusing a value over a field that
+            // changes nothing here would refuse a directory another KDC wrote.
+            _ => {}
+        }
+    }
+
+    let enctype = enctype.ok_or_else(|| Error::Hdb(format!("{context}: no key field")))?;
+    let material = material.ok_or_else(|| Error::Hdb(format!("{context}: no key material")))?;
+    let sealed = !crate::hdb::mkey::is_plain_key(material, enctype);
+    let layout = if legacy_mkvno.is_some() || (!salt_is_struct && salt.is_some()) {
+        KeyLayout::Legacy
+    } else if salt_is_struct || sealed {
+        // A sealed key carries `mkvno` in `[0]`, which is Heimdal's arrangement.
+        KeyLayout::Heimdal
+    } else {
+        // No `[2]`, no `[3]`, plaintext key with a `[0]`: ours, with a version number in `[0]`.
+        match first {
+            Some(_) => KeyLayout::Legacy,
+            None => KeyLayout::Heimdal,
+        }
+    };
+    Ok(KeyFields {
+        material,
+        enctype,
+        first,
+        salt,
+        legacy_mkvno,
+        layout,
+    })
+}
+
+/// The key a `krb5Key` value holds.
+///
+/// `kvno` is the version from `krb5KeyVersionNumber`, which is where Heimdal keeps it. A **legacy**
+/// value carries its own version in `[0]`; it is used when the attribute is absent, because an entry
+/// written by us before the layout was fixed has no other source.
+fn decode_key(
+    value: &[u8],
+    kvno: Option<u32>,
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<HdbKey> {
+    let fields = read_key(value)?;
+    let plaintext = fields.material.len() == fields.enctype.key_len();
+    let (mkvno, kvno) = match fields.layout {
+        // Heimdal's layout has no version in the value at all — `[0]` is the master-key number, and
+        // only a sealed key has one, because Heimdal writes `mkvno` as it seals.
+        KeyLayout::Heimdal => (if plaintext { None } else { fields.first }, kvno),
+        // In the old layout `[0]` **was** the key's own version, so it wins over the attribute: the
+        // attribute is the entry's metadata, and an entry whose two disagree is an entry the caller
+        // has to hear about rather than one to paper over.
+        KeyLayout::Legacy => (fields.legacy_mkvno, fields.first.or(kvno)),
+    };
+
+    // A sealed blob is longer than the enctype accepts — so it is opened **before** `Key::new`,
+    // which would otherwise refuse it with a length error that says nothing about what is wrong.
+    let material = if crate::hdb::mkey::is_plain_key(fields.material, fields.enctype) {
+        fields.material.to_vec()
     } else {
         let (cipher, keys) = master.ok_or_else(|| {
             Error::Hdb(format!(
                 "a {}-octet {} key in {} is sealed under a master key{} and none was supplied",
-                stored.len(),
-                enctype.name(),
+                fields.material.len(),
+                fields.enctype.name(),
                 attrs::KEY,
                 match mkvno {
                     Some(kvno) => format!(" ({kvno})"),
@@ -907,13 +1070,19 @@ fn decode_key(
                 }
             ))
         })?;
-        keys.unseal(cipher, stored, mkvno, enctype)?
+        keys.unseal(cipher, fields.material, mkvno, fields.enctype)?
     };
-    let key = Key::new(enctype, material)?;
+    let key = Key::new(fields.enctype, material)?;
     Ok(HdbKey {
-        kvno,
+        kvno: kvno.ok_or_else(|| {
+            Error::Hdb(format!(
+                "{context}: a key with no version: {} is absent and the value cannot say",
+                attrs::KEY_VERSION_NUMBER,
+                context = "krb5Key"
+            ))
+        })?,
         key,
-        salt: f.opt_octets(2, context)?.map(<[u8]>::to_vec),
+        salt: fields.salt,
         // Cleared: the entry in memory holds plaintext, and `mkvno` describes the directory.
         mkvno: None,
     })
@@ -1017,6 +1186,59 @@ impl LdapHdb {
     /// The directory, for an embedder that needs to reach past the mapping.
     pub fn directory(&self) -> &Arc<dyn Directory> {
         &self.directory
+    }
+}
+
+impl LdapHdb {
+    /// Rewrites every `krb5Key` value this crate wrote in its **old** layout into Heimdal's.
+    ///
+    /// The old layout put the key's version in `[0]` — the position Heimdal uses for `mkvno` — and
+    /// the salt in `[2]` as a bare octet string where Heimdal expects a `Salt` structure. A directory
+    /// written by an older build of this crate therefore reads wrongly on a Heimdal KDC, and this is
+    /// the one-way fix.
+    ///
+    /// **Only the `krb5Key` values are touched.** Everything else in an entry is left exactly as the
+    /// directory returned it, because re-serializing the whole entry would drop attributes this
+    /// crate's mapping does not model — a directory usually has more in it than a KDC reads.
+    ///
+    /// Values already in Heimdal's layout are not written again, so a second run does nothing. A
+    /// backend with a master key also seals what it rewrites, which is how a directory that was
+    /// written in the clear ends up protected: the migration is the moment every key is in hand.
+    ///
+    /// Returns how many entries were rewritten, which is the number an operator wants in the log.
+    pub fn migrate_key_layout(&self) -> Result<u32> {
+        let mut rewritten = 0u32;
+        for principal in self.directory.list()? {
+            let Some(mut attributes) = self.directory.get(&principal)? else {
+                // Listed and then gone: another writer removed it between the two calls, and there is
+                // nothing to migrate. Not an error — a directory is not a snapshot.
+                continue;
+            };
+            let name = principal.to_string();
+            let kvno = attributes.number(attrs::KEY_VERSION_NUMBER, &name)?;
+            let mut changed = false;
+            let mut migrated = Vec::new();
+            for value in attributes.get(attrs::KEY) {
+                let fields = read_key(value)?;
+                if fields.layout == KeyLayout::Heimdal {
+                    migrated.push(value.clone());
+                    continue;
+                }
+                let key = decode_key(value, kvno, self.codec())?;
+                migrated.push(encode_key(&key, self.codec())?);
+                changed = true;
+            }
+            if !changed {
+                continue;
+            }
+            attributes.remove(attrs::KEY);
+            for value in migrated {
+                attributes.add(attrs::KEY, value);
+            }
+            self.directory.put(&principal, &attributes)?;
+            rewritten += 1;
+        }
+        Ok(rewritten)
     }
 }
 
@@ -1259,8 +1481,8 @@ mod tests {
                 ]),
             ),
         ]);
-        let opened =
-            decode_key(&value, Some((&OwnCipher, &keys))).expect("one of the keys opens it");
+        let opened = decode_key(&value, Some(1), Some((&OwnCipher, &keys)))
+            .expect("one of the keys opens it");
         assert_eq!(opened.key.bytes(), [0x5a; 32]);
     }
 
@@ -1554,19 +1776,36 @@ mod tests {
         assert!(err.contains("not a principal"), "{err}");
     }
 
+    /// A **legacy** value that carries a version newer than the attribute is refused.
+    ///
+    /// In Heimdal's layout the version is not in the value at all, so this contradiction cannot be
+    /// expressed — and Heimdal cannot detect it either. The check stays because a directory written by
+    /// an older build of this crate has values that do carry a version, and an entry whose attribute
+    /// was never moved forward is an entry whose keys nothing can match. The test builds that shape by
+    /// hand for exactly that reason.
     #[test]
-    fn a_key_newer_than_the_declared_kvno_is_refused() {
-        let mut entry = entry();
-        // A key at kvno 2 while the attribute still says 1.
+    fn a_legacy_key_newer_than_the_declared_kvno_is_refused() {
+        let mut attributes = Attributes::new();
+        attributes.set(attrs::PRINCIPAL_NAME, "alice@EXAMPLE.COM");
+        attributes.set(attrs::KEY_VERSION_NUMBER, "1");
+        attributes.set(attrs::AD_KEY_VERSION_NUMBER, "1");
         let key = OwnCipher
             .s2k(Enctype::Aes128Sha1, b"pw", b"EXAMPLE.COMalice", None)
             .unwrap();
-        entry.add_key(key, 2, None);
-        let mut attributes = to_attributes(&entry);
-        // Both spellings say 1 while a key is at 2: one fact, no contradiction,
-        // and the keys still newer than the entry claims.
-        attributes.set(attrs::KEY_VERSION_NUMBER, "1");
-        attributes.set(attrs::AD_KEY_VERSION_NUMBER, "1");
+        // The old layout: `kvno[0]`, and the value says 2 where the attribute says 1.
+        attributes.add(
+            attrs::KEY,
+            crate::der::seq(&[
+                crate::der::field(0, crate::der::int(2)),
+                crate::der::field(
+                    1,
+                    crate::der::seq(&[
+                        crate::der::field(0, crate::der::int(Enctype::Aes128Sha1.id() as i64)),
+                        crate::der::field(1, crate::der::octets(key.bytes())),
+                    ]),
+                ),
+            ]),
+        );
         let err = from_attributes(&attributes).unwrap_err().to_string();
         assert!(
             err.contains("kvno") && err.contains('2'),

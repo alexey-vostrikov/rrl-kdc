@@ -89,6 +89,12 @@ pub enum Step {
         reply_key: Key,
         /// A PA-DATA value to carry in the reply, when the mechanism has one to send.
         padata: Option<Vec<u8>>,
+        /// A cap on the ticket's lifetime, in seconds from now, when the mechanism knows of one.
+        ///
+        /// GSS pre-authentication has this: the ticket cannot outlive the context that
+        /// authenticated it (Heimdal's `_kdc_gss_endtime`). A mechanism that has no opinion says
+        /// `None`, and the realm's own times stand.
+        endtime_bound: Option<i64>,
     },
     /// This round did not verify. `code` is the `KDC_ERR_*` to return, so that a mechanism
     /// can say `KDC_ERR_ETYPE_NOSUPP` for a group it does not implement rather than the

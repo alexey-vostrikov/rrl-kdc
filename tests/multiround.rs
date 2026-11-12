@@ -117,6 +117,7 @@ impl Mechanism for Stub {
             }),
             // The client's second: done, but only if the round-one state really came back.
             b"carry-on-answer" if state == b"round-one" => Ok(Step::Done {
+                endtime_bound: None,
                 reply_key: request
                     .longterm
                     .first()

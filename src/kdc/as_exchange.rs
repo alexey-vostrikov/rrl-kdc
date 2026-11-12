@@ -730,6 +730,8 @@ impl Kdc {
         let (announced, announced_state) = self.preauth().announce_all(&context)?;
         let mut mechanism_key: Option<Key> = None;
         let mut mechanism_padata: Option<Vec<u8>> = None;
+        // A mechanism that knows how long its authentication lasts bounds the ticket by it.
+        let mut mechanism_bound: Option<i64> = None;
         if let Some((mechanism, value)) = self.preauth().requested(padata) {
             let resumed = self.resume_state(padata, now, config.realm(), Some(&cname));
             match mechanism.round(&context, &resumed, &value) {
@@ -744,9 +746,14 @@ impl Kdc {
                         state,
                     });
                 }
-                Ok(super::preauth::Step::Done { reply_key, padata }) => {
+                Ok(super::preauth::Step::Done {
+                    reply_key,
+                    padata,
+                    endtime_bound,
+                }) => {
                     mechanism_key = Some(reply_key);
                     mechanism_padata = padata;
+                    mechanism_bound = endtime_bound;
                 }
                 Ok(super::preauth::Step::Failed { code, text }) => {
                     return Err(Error::Kdc {
@@ -923,6 +930,14 @@ impl Kdc {
         let start = starttime(body, &client);
         let effective_start = start.unwrap_or(now);
         let endtime = endtime(config, body, &client, &server, effective_start);
+        // A mechanism's own bound (`Step::Done::endtime_bound`): GSS pre-authentication caps a
+        // ticket at the lifetime of the context that authenticated it. Like the PKINIT bound
+        // below, it only ever shortens — a mechanism cannot buy a longer ticket than the policy
+        // allows.
+        let endtime = match mechanism_bound {
+            Some(bound) if bound > 0 => endtime.min(effective_start.saturating_add(bound)),
+            _ => endtime,
+        };
         // `pkinit_max_life_bound`: Heimdal lets a realm cap what a certificate login buys, and it
         // is a cap on this exchange only — a password login is bounded by the policy above. The
         // bound never extends a lifetime, only shortens one.

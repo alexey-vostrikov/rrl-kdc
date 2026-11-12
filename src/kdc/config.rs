@@ -144,6 +144,12 @@ pub struct KdcConfig {
     gss_mechanisms_allowed: Vec<String>,
     /// `gss-cross-realm-mechanisms-allowed`: whether a token issued in another realm may be used.
     gss_cross_realm_mechanisms_allowed: bool,
+    /// `gss-require-bound-request`: whether a token that carries no channel binding is refused.
+    ///
+    /// On by default. A token bound to nothing answers no particular request, so a captured one
+    /// can be replayed into an AS-REQ of the attacker's choosing; the underlying acceptor takes
+    /// such a token, as MIT's does for a service, which is why this is the KDC's own decision.
+    gss_require_bound_request: bool,
     /// How long a kx509 certificate lives.
     ///
     /// A day by default: short enough that a revoked ticket stops mattering, long enough that a
@@ -197,6 +203,7 @@ impl KdcConfig {
             enable_gss_preauth: false,
             gss_mechanisms_allowed: Vec::new(),
             gss_cross_realm_mechanisms_allowed: false,
+            gss_require_bound_request: true,
             kx509_service: "kx509".to_owned(),
             kx509_max_life: 86_400,
             addresses: crate::address::AddressPolicy::default(),
@@ -386,6 +393,11 @@ impl KdcConfig {
     /// Whether a mechanism from another realm may be used.
     pub fn gss_cross_realm_mechanisms_allowed(&self) -> bool {
         self.gss_cross_realm_mechanisms_allowed
+    }
+
+    /// Whether a GSS token has to be bound to the request it answers.
+    pub fn gss_require_bound_request(&self) -> bool {
+        self.gss_require_bound_request
     }
 
     /// The first component a kx509 service ticket must name.
@@ -645,6 +657,10 @@ impl KdcConfig {
                 self.gss_cross_realm_mechanisms_allowed = parse_bool(value)?;
                 Ok(())
             }
+            "gss_require_bound_request" | "gss-require-bound-request" => {
+                self.gss_require_bound_request = parse_bool(value)?;
+                Ok(())
+            }
             "kx509_service" | "kx509-service" => {
                 let name = value.trim();
                 // A principal component: no slash (that would be two), no `@` (that would be a
@@ -839,6 +855,12 @@ mod tests {
         c.apply("gss_cross_realm_mechanisms_allowed", "yes")
             .unwrap();
         assert!(c.gss_cross_realm_mechanisms_allowed());
+
+        // A token bound to nothing is a token that answers no request, so the default refuses it
+        // and the option that lets one through has to be written down.
+        assert!(c.gss_require_bound_request());
+        c.apply("gss-require-bound-request", "false").unwrap();
+        assert!(!c.gss_require_bound_request());
     }
 
     /// The PKINIT options: Heimdal's defaults, both spellings of each name, and the two ends

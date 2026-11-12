@@ -39,6 +39,8 @@ pub mod preauth;
 mod tgs_exchange;
 
 pub mod fast;
+#[cfg(feature = "gss-preauth")]
+pub mod gss_hdb;
 pub mod gss_preauth;
 /// The change-password service (RFC 3244): protocol constants, the reply a
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
@@ -360,6 +362,21 @@ impl Kdc {
             self.preauth = std::mem::take(&mut self.preauth).with(Arc::new(mechanism));
         }
         self
+    }
+
+    /// The same KDC offering GSS pre-authentication, accepting tokens against its own `HDB`.
+    ///
+    /// The concrete acceptor for the common case: the realm's `krbtgt` key *is* the credential a
+    /// GSS context needs, so a realm does not have to build one. Refuses — rather than quietly not
+    /// offering the mechanism — when the realm's `krbtgt` entry has no usable key, because a KDC
+    /// that says `enable-gss-preauth` and then has nothing to accept with is a configuration
+    /// mistake worth hearing about at start-up.
+    #[cfg(feature = "gss-preauth")]
+    pub fn with_gss_preauth_hdb(self) -> crate::error::Result<Self> {
+        let acceptor =
+            gss_hdb::HdbGssAcceptor::new(std::sync::Arc::clone(&self.hdb), self.config.realm())?
+                .with_require_bound_request(self.config.gss_require_bound_request());
+        Ok(self.with_gss_preauth(std::sync::Arc::new(acceptor)))
     }
 
     /// The same KDC answering kx509, with `authority` signing the certificates.

@@ -41,6 +41,13 @@ base64 = { version = "0.22", optional = true }
 # resolver, no SPNEGO.
 rskrb5 = { version = "0.2", default-features = false, optional = true }
 
+# The GSS-API acceptor, for GSS pre-authentication (`gss-preauth`). A KDC that accepts a GSS token
+# is an ordinary Kerberos service for the length of that exchange, and this crate has no AP-REQ
+# acceptor of its own; the alternative was a second implementation of RFC 4121 accept that could
+# disagree with the one every other service in this family uses. `default-features = false` keeps
+# the async client and the resolver out: the KDC needs neither.
+rrl-krb5 = { package = "krb5", git = "https://github.com/alexey-vostrikov/rrl-krb5", branch = "main", default-features = false, optional = true }
+
 # PKINIT. `x509-parser` reads the certificate and its `id-pkinit-san` otherName;
 # `rsa` verifies the CMS signature and, in the key-transport mode, encrypts the
 # reply. The MODP groups of RFC 3526 need arithmetic wider than the language has,
@@ -87,6 +94,9 @@ kadmin = []
 # SPAKE pre-authentication (RFC 9588). Off by default: it adds a curve implementation and a
 # second way to log in, and a realm that has not thought about it should not grow one.
 spake = ["dep:curve25519-dalek"]
+# GSS pre-authentication (`kdc::gss_preauth`): the mechanism is always compiled, the concrete
+# acceptor over the realm's own HDB is not, because it brings the client crate in.
+gss-preauth = ["dep:rrl-krb5"]
 # OTP pre-authentication (RFC 6560). No dependency: the ASN.1 and the nonce check are this
 # crate's, and the one-time value is judged by a `Verifier` the caller supplies.
 otp = []

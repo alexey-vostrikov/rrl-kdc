@@ -313,6 +313,7 @@ impl<V: Verifier> Mechanism for Otp<V> {
         // AS path then strengthens it, because the request is armored — which is the "strengthened
         // if the KDC says so" the client's own documentation mentions.
         Ok(Step::Done {
+            endtime_bound: None,
             reply_key: armor.clone(),
             padata: None,
         })

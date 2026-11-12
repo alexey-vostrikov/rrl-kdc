@@ -506,6 +506,7 @@ fn finish(request: &Request<'_>, pending: &Pending, response: &[u8]) -> Result<S
     // RFC 9588 §4.5: the reply key becomes `K'[0]`, and there is no final PA-SPAKE message —
     // the ticket itself is the proof that the KDC accepted the exchange.
     Ok(Step::Done {
+        endtime_bound: None,
         reply_key: k0,
         padata: None,
     })

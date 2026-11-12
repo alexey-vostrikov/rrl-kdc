@@ -650,6 +650,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "krb5"
+version = "1.0.0"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb5?branch=main#4a7efba9f8742af67155053c29d3bff2520f70ba"
+dependencies = [
+ "aes",
+ "chrono",
+ "hmac",
+ "rand",
+ "rrl-crypto",
+ "rrl-krb-common",
+ "sha1",
+ "sha2 0.11.1",
+ "thiserror 1.0.69",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1122,7 +1140,8 @@ dependencies = [
  "curve25519-dalek",
  "hex",
  "hmac",
- "krb5",
+ "krb5 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "krb5 1.0.0 (git+https://github.com/alexey-vostrikov/rrl-krb5?branch=main)",
  "num-bigint",
  "num-traits",
  "p256",

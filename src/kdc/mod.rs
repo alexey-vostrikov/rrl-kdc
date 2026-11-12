@@ -30,7 +30,11 @@ mod as_exchange;
 // to issue against, so the module travels with the feature rather than half-existing.
 #[cfg(feature = "pkinit")]
 pub mod ca;
+// kx509 issues certificates, so it needs the same feature: without a certificate stack there is
+// nothing to sign with and nothing to hand back.
 pub mod cookie;
+#[cfg(feature = "pkinit")]
+pub mod kx509;
 pub mod preauth;
 mod tgs_exchange;
 
@@ -209,6 +213,16 @@ pub struct Kdc {
     /// would be worse than one that does not offer the feature.
     #[cfg(feature = "pkinit")]
     pkinit: Option<Arc<dyn pkinit::reply::PkinitSource>>,
+    /// The authority that signs certificates for kx509, when the realm offers it.
+    ///
+    /// `None` means the realm has no CA and answers kx509 with "not enabled": a KDC that accepted
+    /// the request and then failed would look like a broken server rather than a feature that was
+    /// never turned on.
+    #[cfg(feature = "pkinit")]
+    ca: Option<Arc<dyn ca::CertificateAuthority>>,
+    /// Who may have a certificate, and for what. [`ca::SelfIssued`] unless a realm says otherwise.
+    #[cfg(feature = "pkinit")]
+    csr_authorizer: Arc<dyn ca::CsrAuthorizer>,
     /// The realm key `PA-FX-COOKIE` is sealed under (RFC 6113 §5.4.2.3).
     ///
     /// `None` means this realm does not offer the cookie, and then it must not advertise one:
@@ -245,6 +259,10 @@ impl Kdc {
             identities: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
+            #[cfg(feature = "pkinit")]
+            ca: None,
+            #[cfg(feature = "pkinit")]
+            csr_authorizer: Arc::new(ca::SelfIssued),
             cookie_key: None,
             preauth: preauth::Registry::new(),
         }
@@ -321,6 +339,36 @@ impl Kdc {
             state.policy = self.config.pkinit_policy();
             state
         }))
+    }
+
+    /// The same KDC answering kx509, with `authority` signing the certificates.
+    #[cfg(feature = "pkinit")]
+    pub fn with_ca(mut self, authority: Arc<dyn ca::CertificateAuthority>) -> Self {
+        self.ca = Some(authority);
+        self
+    }
+
+    /// The same KDC deciding certificate requests with `authorizer`.
+    ///
+    /// The default is [`ca::SelfIssued`]: a principal may have a certificate for itself. A realm
+    /// with a rule of its own — a service that may be issued certificates for its aliases, say —
+    /// replaces it here rather than forking the exchange.
+    #[cfg(feature = "pkinit")]
+    pub fn with_csr_authorizer(mut self, authorizer: Arc<dyn ca::CsrAuthorizer>) -> Self {
+        self.csr_authorizer = authorizer;
+        self
+    }
+
+    /// The CA, when this realm has one.
+    #[cfg(feature = "pkinit")]
+    pub(super) fn ca(&self) -> Option<&Arc<dyn ca::CertificateAuthority>> {
+        self.ca.as_ref()
+    }
+
+    /// The authorizer in force.
+    #[cfg(feature = "pkinit")]
+    pub(super) fn csr_authorizer(&self) -> &dyn ca::CsrAuthorizer {
+        self.csr_authorizer.as_ref()
     }
 
     /// The same KDC issuing PACs, with `identities` answering who an account is.
@@ -497,6 +545,12 @@ impl Kdc {
     /// KDC that says nothing leaves the client waiting for a timeout and
     /// guessing. The Rust error is what the caller logs.
     pub fn handle_from(&self, request: &[u8], now: i64, peer: Option<IpAddr>) -> Vec<u8> {
+        // kx509 shares the port with the KDC and is recognised by its version prefix, not by an
+        // application tag (`kdc/kx509.rs`). Tried first because its prefix cannot be a KDC-REQ's.
+        #[cfg(feature = "pkinit")]
+        if let Some(reply) = self.handle_kx509(request, now) {
+            return reply;
+        }
         let req = match KdcReq::decode(request) {
             Ok(req) => req,
             Err(err) => return self.error(None, &Error::from(err), now),

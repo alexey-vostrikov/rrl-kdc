@@ -128,6 +128,18 @@ pub struct KdcConfig {
     /// `pkinit_principal_in_certificate`: whether the certificate must name the principal asked
     /// for, rather than merely authenticate somebody.
     pkinit_principal_in_certificate: bool,
+    /// The first component of the service principal a kx509 ticket must be for.
+    ///
+    /// `kx509` by default, as Heimdal's templates name it. A realm that publishes another name
+    /// changes it here; what matters is that it is *a* name, because a ticket for any service must
+    /// not be tradeable for a certificate.
+    kx509_service: String,
+    /// How long a kx509 certificate lives.
+    ///
+    /// A day by default: short enough that a revoked ticket stops mattering, long enough that a
+    /// client is not renewing a certificate every hour. A certificate's lifetime and a ticket's are
+    /// different questions, which is why this is not `max_life`.
+    kx509_max_life: i64,
     /// `strict-nametypes`: refuse a `krbtgt` name whose name type is neither `NT-SRV-INST` nor
     /// `NT-UNKNOWN`.
     ///
@@ -172,6 +184,8 @@ impl KdcConfig {
             pkinit_dh_min_bits: 2048,
             pkinit_max_life: None,
             pkinit_principal_in_certificate: true,
+            kx509_service: "kx509".to_owned(),
+            kx509_max_life: 86_400,
             addresses: crate::address::AddressPolicy::default(),
             transited_policy: TransitedPolicy::AlwaysCheck,
             transited_realms: None,
@@ -344,6 +358,16 @@ impl KdcConfig {
     /// `max-kdc-datagram-reply-length`: the largest reply this KDC sends over UDP.
     pub fn max_datagram_reply_length(&self) -> usize {
         self.max_datagram_reply_length
+    }
+
+    /// The first component a kx509 service ticket must name.
+    pub fn kx509_service(&self) -> &str {
+        &self.kx509_service
+    }
+
+    /// How long a kx509 certificate lives, in seconds.
+    pub fn kx509_max_life(&self) -> i64 {
+        self.kx509_max_life
     }
 
     /// Whatever this realm says about PKINIT, in the shape the reply half reads.
@@ -558,6 +582,26 @@ impl KdcConfig {
             }
             "pkinit_principal_in_certificate" | "pkinit-principal-in-certificate" => {
                 self.pkinit_principal_in_certificate = parse_bool(value)?;
+                Ok(())
+            }
+            "kx509_service" | "kx509-service" => {
+                let name = value.trim();
+                // A principal component: no slash (that would be two), no `@` (that would be a
+                // realm), and not empty (that would match nothing).
+                if name.is_empty() || name.contains('/') || name.contains('@') {
+                    return Err(Error::Config(format!(
+                        "option {name}: {value:?} is not one principal component"
+                    )));
+                }
+                self.kx509_service = name.to_owned();
+                Ok(())
+            }
+            "kx509_max_life" | "kx509-max-life" => {
+                let secs = parse_secs(value)?;
+                if secs <= 0 {
+                    return Err(Error::Config(format!("option {name} must be positive")));
+                }
+                self.kx509_max_life = secs;
                 Ok(())
             }
             "max-kdc-datagram-reply-length" | "max_kdc_datagram_reply_length" => {

@@ -142,7 +142,16 @@ fn is_anonymous(name: &Principal) -> bool {
 /// Refusing without the option is the point of the whole mechanism: resolving it would make
 /// the reply name a principal the client never sent, and a client that did not ask for
 /// `canonicalize` is entitled to reject exactly that.
-fn canonical_client_name(cname: &Principal, options: u32, realm: &str) -> Result<Principal> {
+///
+/// `require_canonicalize` is the deployment's choice to keep that refusal. Active Directory does
+/// not keep it, and Windows relies on that: a UPN logon arrives as an enterprise name with the
+/// `canonicalize` bit clear, so a realm that must accept one resolves the name anyway.
+fn canonical_client_name(
+    cname: &Principal,
+    options: u32,
+    realm: &str,
+    require_canonicalize: bool,
+) -> Result<Principal> {
     if cname.name_type != crate::name::NT_ENTERPRISE {
         return Ok(cname.clone());
     }
@@ -150,7 +159,7 @@ fn canonical_client_name(cname: &Principal, options: u32, realm: &str) -> Result
         code: codes::KDC_ERR_C_PRINCIPAL_UNKNOWN,
         text,
     };
-    if options & kdc_options::CANONICALIZE == 0 {
+    if require_canonicalize && options & kdc_options::CANONICALIZE == 0 {
         return Err(refuse(format!(
             "{cname} is an enterprise name (NT-ENTERPRISE) and the request did not set \
              the canonicalize option: resolving it would answer with a name the client \
@@ -626,7 +635,12 @@ impl Kdc {
         // RFC 6806 §6: an enterprise name is resolved to the principal it names, and the
         // reply carries that canonical name — which is only legal because the client asked
         // for it with `canonicalize`.
-        let cname = canonical_client_name(&cname, body.kdc_options, config.realm())?;
+        let cname = canonical_client_name(
+            &cname,
+            body.kdc_options,
+            config.realm(),
+            config.enterprise_requires_canonicalize(),
+        )?;
 
         // RFC 8062 §4.1: an anonymous client is answered before the directory is
         // consulted. There is no account behind `WELLKNOWN/ANONYMOUS`, and inventing one

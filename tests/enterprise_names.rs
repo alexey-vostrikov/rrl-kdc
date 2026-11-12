@@ -32,6 +32,11 @@ fn alice() -> Principal {
 }
 
 fn kdc() -> Kdc {
+    kdc_with(|config| config)
+}
+
+/// The same realm, with the configuration a test wants to change.
+fn kdc_with(tweak: impl FnOnce(KdcConfig) -> KdcConfig) -> Kdc {
     let cipher = OwnCipher;
     let db = MemoryHdb::new();
 
@@ -58,7 +63,7 @@ fn kdc() -> Kdc {
     // assertion here read as "the name resolved enough to be asked for a timestamp", which
     // is a weaker claim than "the name resolved to a ticket".
     Kdc::new(
-        KdcConfig::new(REALM).unwrap().with_require_preauth(false),
+        tweak(KdcConfig::new(REALM).unwrap().with_require_preauth(false)),
         Arc::new(db),
         Arc::new(OwnCipher),
     )
@@ -141,6 +146,23 @@ fn an_enterprise_name_without_the_option_is_refused() {
         text.contains("canonicalize"),
         "the refusal must point at the missing option: {text}"
     );
+}
+
+#[test]
+fn an_enterprise_name_resolves_without_the_option_when_the_realm_allows_it() {
+    // Active Directory resolves the name and answers with it, and Windows on a UPN logon does not
+    // set `canonicalize` (measured: `kdc-options` 0x40800010). A realm configured to accept such a
+    // client therefore resolves the name, and still refuses when the option is left on.
+    let reply = kdc_with(|config| config.with_enterprise_requires_canonicalize(false))
+        .handle(&enterprise_as_req(&format!("alice@{REALM}"), 0), NOW);
+    assert!(
+        msg::KrbError::decode(&reply).is_err(),
+        "an enterprise name must be answered when the realm resolves it: {:?}",
+        msg::KrbError::decode(&reply)
+    );
+    let (crealm, cname) = reply_identity(&reply);
+    assert_eq!(crealm, REALM);
+    assert_eq!(cname.to_string(), format!("alice@{REALM}"));
 }
 
 #[test]

@@ -51,8 +51,18 @@ pub struct KdcConfig {
     max_renewable_life: i64,
     /// How far a client's clock may differ from this KDC's.
     clockskew: i64,
+    /// Whether a request carries pre-authentication data. Defaults to `true`.
+    ///
     /// Heimdal's `require-preauth`: refuse an AS-REQ with no pre-authentication.
     require_preauth: bool,
+    /// Whether an enterprise name may only be resolved when the client set `canonicalize`.
+    ///
+    /// RFC 6806 §6 lets a KDC rename a client, and a client that did not ask is entitled to reject
+    /// the new name - so refusing is the safe default. Active Directory resolves the name anyway and
+    /// answers with it, and Windows sends an enterprise name for a UPN logon **without** setting
+    /// `canonicalize` (`kdc-options` 0x40800010, measured). A deployment that has to accept a
+    /// Windows logon therefore turns this off.
+    enterprise_requires_canonicalize: bool,
     /// Whether this realm issues anonymous tickets (RFC 8062).
     anonymous_pkinit: bool,
     /// Heimdal's `allowed_enctypes`, strongest first. The order is this KDC's
@@ -191,6 +201,7 @@ impl KdcConfig {
             max_renewable_life: DEFAULT_MAX_RENEWABLE_LIFE,
             clockskew: DEFAULT_CLOCKSKEW,
             require_preauth: true,
+            enterprise_requires_canonicalize: true,
             // Off by default: an anonymous ticket is an opening into the realm, and an
             // opening nobody configured is a surprise rather than a convenience.
             anonymous_pkinit: false,
@@ -246,6 +257,11 @@ impl KdcConfig {
     /// `require-preauth`.
     pub fn require_preauth(&self) -> bool {
         self.require_preauth
+    }
+
+    /// Whether an enterprise name is refused unless the client set `canonicalize`.
+    pub fn enterprise_requires_canonicalize(&self) -> bool {
+        self.enterprise_requires_canonicalize
     }
 
     /// Whether anonymous PKINIT is offered (RFC 8062).
@@ -324,6 +340,16 @@ impl KdcConfig {
     /// Sets `require-preauth`.
     pub fn with_require_preauth(mut self, yes: bool) -> Self {
         self.require_preauth = yes;
+        self
+    }
+
+    /// Resolves an enterprise name even when the client did not set `canonicalize`.
+    ///
+    /// Off by default, because renaming a client that did not ask is what RFC 6806 §6 warns about.
+    /// Active Directory does it anyway, and Windows relies on that: a UPN logon arrives as an
+    /// enterprise name with no `canonicalize` bit.
+    pub fn with_enterprise_requires_canonicalize(mut self, yes: bool) -> Self {
+        self.enterprise_requires_canonicalize = yes;
         self
     }
 
@@ -500,6 +526,10 @@ impl KdcConfig {
             }
             "require-preauth" | "require_preauth" => {
                 self.require_preauth = parse_bool(value)?;
+                Ok(())
+            }
+            "enterprise-requires-canonicalize" | "enterprise_requires_canonicalize" => {
+                self.enterprise_requires_canonicalize = parse_bool(value)?;
                 Ok(())
             }
             "check-ticket-addresses" | "check_ticket_addresses" => {

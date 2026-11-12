@@ -54,10 +54,27 @@
 //!   own because the structure has no per-key salt field — which is exactly why AD
 //!   can only represent one salt, and why Heimdal's `krb5Key` is the canonical form
 //!   here.
-//! * `Primary:Kerberos` (the pre-Windows-2008 structure) is **not** written: it
-//!   holds at most two keys and has no iteration count, so writing it for a
-//!   four-enctype entry would state something false. Readers that matter read the
-//!   newer property.
+//! * `Packages` **is** written, and it is not decoration: a reader is entitled to require it, and
+//!   Samba refuses the whole attribute without it (`"Primary:Packages missing"`). Its value is the
+//!   credential-type names from §3.1.1.8.11.2's table — `Kerberos-Newer-Keys`, **without** the
+//!   `Primary:` prefix — as UTF-16LE with a NUL between names and none after the last.
+//!
+//! # Why `Primary:Kerberos` is not written, and what that costs
+//!
+//! The pre-Windows-2008 structure cannot be written honestly here, and the reason is not size:
+//! §2.2.10.4 fixes `CredentialCount` at 2 and §2.2.10.5 allows `KeyType` to be only 1
+//! (`dec-cbc-crc`) or 3 (`des-cbc-md5`). Windows and Samba both fill it with exactly that pair —
+//! `ENCTYPE_DES_CBC_MD5` and `ENCTYPE_DES_CBC_CRC` (`samba/source4/dsdb/samdb/ldb_modules/
+//! password_hash.c`, `setup_primary_kerberos`). This crate implements no DES, so the only way to
+//! write those two entries would be to put AES material under a DES key type — a blob that parses
+//! and lies about what the bytes are, which is worse than an absent property.
+//!
+//! The cost is concrete and worth naming: **Samba still refuses this blob**, because after
+//! `Packages` it requires `Primary:Kerberos` too (`"Primary:Kerberos missing"`, with a comment that
+//! Windows 2008 R2 reboots on a password change without it). impacket, dissect, mimikatz and
+//! `secretsdump` read it, and AD itself would read it, so the projection is valid but incomplete for
+//! Samba. Closing that gap means implementing DES string-to-key, which is weak cryptography kept
+//! only for compatibility — a decision, not an oversight.
 //!
 //! # Verified against somebody else's parser
 //!
@@ -70,8 +87,19 @@
 use crate::crypto::Enctype;
 use crate::hdb::HdbEntry;
 
+/// The property that says which credential types this blob carries ([MS-SAMR] §3.1.1.8.11.2).
+///
+/// Not decoration: a reader is entitled to require it. Samba refuses a `supplementalCredentials`
+/// without it outright — `"Primary:Packages missing"` — when it decodes the attribute, so a blob
+/// that omits it is a blob Samba cannot read at all, whatever else is in it.
+pub const PROPERTY_PACKAGES: &str = "Packages";
+
 /// The property name an AD-shaped reader looks for.
 pub const PROPERTY_KERBEROS_NEWER_KEYS: &str = "Primary:Kerberos-Newer-Keys";
+
+/// The name this blob's credential type has inside `Packages` — the value from §3.1.1.8.11.2's
+/// table, which is the property name **without** its `Primary:` prefix.
+pub const PACKAGE_KERBEROS_NEWER_KEYS: &str = "Kerberos-Newer-Keys";
 
 /// The account's NT hash, the value a logon is checked against (MS-SAMR 2.2.10.1).
 pub const PROPERTY_NT_HASH: &str = "Primary:NT";
@@ -101,7 +129,28 @@ const KEY_DATA_NEW: usize = 24;
 /// the credentials and its older ones as the old credentials — which is the
 /// distinction AD draws and the reason a rotation is representable at all.
 pub fn supplemental_credentials(entry: &HdbEntry) -> Vec<u8> {
-    user_properties(&[(PROPERTY_KERBEROS_NEWER_KEYS, &kerberos_newer_keys(entry))])
+    user_properties(&[
+        (PROPERTY_PACKAGES, &packages(&[PACKAGE_KERBEROS_NEWER_KEYS])),
+        (PROPERTY_KERBEROS_NEWER_KEYS, &kerberos_newer_keys(entry)),
+    ])
+}
+
+/// The `Packages` value: the credential-type names, UTF-16LE, separated by a NUL, with **no**
+/// trailing NUL (§3.1.1.8.11.2 says the last character need not be one).
+///
+/// The names are the ones from that section's table and not the property names: `Kerberos-Newer-Keys`,
+/// not `Primary:Kerberos-Newer-Keys`. A reader that looks a name up in the table finds nothing under
+/// the prefixed spelling, and Samba — which parses this value to decide what the blob claims to
+/// hold — would then disagree with the properties beside it.
+fn packages(names: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+        out.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+    }
+    out
 }
 
 /// The same structure with the account's NT hash beside its Kerberos keys.
@@ -585,6 +634,27 @@ mod tests {
     use crate::hdb::HdbEntry;
     use crate::name::Principal;
 
+    /// Where the `Primary:Kerberos-Newer-Keys` value starts in `blob`, as an offset.
+    ///
+    /// The properties are not in a fixed order — `Packages` comes first here because it is what a
+    /// reader checks first — so a test that assumes the Kerberos value begins at the first property
+    /// would test the wrong bytes and, worse, still pass.
+    fn kerberos_property(blob: &[u8]) -> (usize, usize) {
+        let count = u16_at(blob, 110) as usize;
+        let mut at = 112;
+        for _ in 0..count {
+            let name_len = u16_at(blob, at) as usize;
+            let value_len = u16_at(blob, at + 2) as usize;
+            let name_at = at + 6;
+            let value_at = name_at + name_len;
+            if utf16(&blob[name_at..value_at]).expect("a name") == PROPERTY_KERBEROS_NEWER_KEYS {
+                return (value_at, value_len);
+            }
+            at = value_at + value_len;
+        }
+        panic!("no {PROPERTY_KERBEROS_NEWER_KEYS} property in the blob");
+    }
+
     fn entry() -> HdbEntry {
         let mut entry = HdbEntry::user(Principal::parse("alice@EXAMPLE.COM").unwrap());
         for enctype in Enctype::ALL {
@@ -614,7 +684,7 @@ mod tests {
             "Reserved4 is 96 zero octets"
         );
         assert_eq!(u16_at(&blob, 108), 0x50, "PropertySignature");
-        assert_eq!(u16_at(&blob, 110), 1, "one property");
+        assert_eq!(u16_at(&blob, 110), 2, "Packages and the keys");
         // `Length` counts from offset 12 up to the final Reserved5 octet.
         assert_eq!(
             u32_at(&blob, 4) as usize,
@@ -669,6 +739,9 @@ mod tests {
     #[test]
     fn the_property_name_is_utf16_and_the_value_is_hexadecimal_text() {
         let blob = supplemental_credentials(&entry());
+        let count = u16_at(&blob, 110) as usize;
+        assert_eq!(count, 2, "{PROPERTY_PACKAGES} and the keys");
+        // The first property, whatever it is called: the point of this test is the encoding.
         let name_len = u16_at(&blob, 112) as usize;
         let value_len = u16_at(&blob, 114) as usize;
         let name: Vec<u16> = blob[118..118 + name_len]
@@ -677,11 +750,16 @@ mod tests {
             .iter()
             .map(|c| u16::from_le_bytes(*c))
             .collect();
+        assert_eq!(String::from_utf16(&name).unwrap(), PROPERTY_PACKAGES);
+
+        // The keys' value, which is the one that has to be hexadecimal text.
+        let (value_at, key_value_len) = kerberos_property(&blob);
+        let value = &blob[value_at..value_at + key_value_len];
         assert_eq!(
-            String::from_utf16(&name).unwrap(),
-            PROPERTY_KERBEROS_NEWER_KEYS
+            value_len % 2,
+            0,
+            "the first property's length is whole octets"
         );
-        let value = &blob[118 + name_len..118 + name_len + value_len];
         assert!(
             value.iter().all(|b| b.is_ascii_hexdigit()),
             "the property value is the hexadecimal text of the octets"
@@ -835,7 +913,7 @@ mod tests {
         // and a reader must not choke on.
         let entry = HdbEntry::user(Principal::parse("svc@EXAMPLE.COM").unwrap());
         let blob = supplemental_credentials(&entry);
-        assert_eq!(u16_at(&blob, 110), 1, "the property is present");
+        assert_eq!(u16_at(&blob, 110), 2, "Packages and an empty key set");
         let inner = kerberos_newer_keys(&entry);
         assert_eq!(u16_at(&inner, 4), 0, "no credentials");
         assert_eq!(u16_at(&inner, 8), 0);
@@ -928,8 +1006,7 @@ mod tests {
     #[test]
     fn a_property_value_that_is_not_hexadecimal_is_refused() {
         let mut blob = supplemental_credentials(&entry());
-        let name_len = u16_at(&blob, 112) as usize;
-        let value_at = 118 + name_len;
+        let value_at = kerberos_property(&blob).0;
         blob[value_at] = b'z';
         assert_eq!(credentials(&blob), Err(AdBlobError::NotHex));
     }
@@ -940,8 +1017,7 @@ mod tests {
         // key material from the wrong offsets and produce a key that decrypts
         // nothing, long after the reason is gone.
         let mut blob = supplemental_credentials(&entry());
-        let name_len = u16_at(&blob, 112) as usize;
-        let value_at = 118 + name_len;
+        let value_at = kerberos_property(&blob).0;
         // First two octets of the hex text are the revision's low byte.
         blob[value_at..value_at + 4].copy_from_slice(b"0300");
         assert_eq!(credentials(&blob), Err(AdBlobError::UnknownRevision(3)));
@@ -950,8 +1026,7 @@ mod tests {
     #[test]
     fn a_key_offset_outside_the_buffer_is_refused() {
         let mut blob = supplemental_credentials(&entry());
-        let name_len = u16_at(&blob, 112) as usize;
-        let value_at = 118 + name_len;
+        let value_at = kerberos_property(&blob).0;
         // The first `KERB_KEY_DATA_NEW` starts at octet 24 of the credential, and
         // its key offset is at +20: hex text position 2 * (24 + 20).
         let at = value_at + 2 * (CREDENTIAL_HEADER + 20);
@@ -962,8 +1037,7 @@ mod tests {
     #[test]
     fn an_unknown_enctype_is_refused_by_number() {
         let mut blob = supplemental_credentials(&entry());
-        let name_len = u16_at(&blob, 112) as usize;
-        let value_at = 118 + name_len;
+        let value_at = kerberos_property(&blob).0;
         // Enctype is at +12 of the key entry.
         let at = value_at + 2 * (CREDENTIAL_HEADER + 12);
         // `17000000` is `des3-cbc-sha1` (16) — deliberately a number this crate does not implement.
@@ -979,8 +1053,7 @@ mod tests {
         // key that nothing can decrypt with. Which enctype the first entry holds
         // depends on the sort order, so the assertion is about the length.
         let mut blob = supplemental_credentials(&entry());
-        let name_len = u16_at(&blob, 112) as usize;
-        let value_at = 118 + name_len;
+        let value_at = kerberos_property(&blob).0;
         let at = value_at + 2 * (CREDENTIAL_HEADER + 16);
         blob[at..at + 8].copy_from_slice(b"1f000000");
         match credentials(&blob) {
@@ -1028,6 +1101,77 @@ mod tests {
     /// Offsets rather than a sentence: the header is 108 octets, then the signature pair, then the
     /// count. A count written one field early is read as the signature, and the reader then believes
     /// the blob holds eighty properties.
+    /// `Packages` names what the blob carries, with the name from §3.1.1.8.11.2's table — the
+    /// property name without its `Primary:` prefix — and not with the property name itself.
+    ///
+    /// Samba parses this value to decide what the blob claims to hold, and refuses the whole
+    /// attribute when the property is missing (`"Primary:Packages missing"`). The prefixed spelling
+    /// is the mistake that looks right: it is the only other name in sight, and a reader that looks
+    /// it up in the table finds nothing.
+    #[test]
+    fn packages_names_the_credential_type_from_the_tables_spelling() {
+        let blob = supplemental_credentials(&entry());
+        // `PropertyValue` is hexadecimal **text** for every property (§2.2.10.2), `Packages`
+        // included: the octets are UTF-16, and the text on the wire is their hex. Samba does the
+        // same decode — `strhex_to_data_blob` — before it parses the names.
+        let raw = unhex(property_value(&blob, PROPERTY_PACKAGES).expect("Packages is written"))
+            .expect("hexadecimal text");
+
+        // UTF-16LE, and the names are the ones from the table.
+        assert_eq!(raw.len() % 2, 0, "UTF-16 is whole units");
+        let units: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let text = String::from_utf16(&units).expect("valid UTF-16");
+        assert_eq!(text, PACKAGE_KERBEROS_NEWER_KEYS);
+        assert_eq!(text, "Kerberos-Newer-Keys");
+        assert!(
+            !text.starts_with("Primary:"),
+            "the table's names carry no property prefix"
+        );
+
+        // Every name in `Packages` has a property beside it, spelled `Primary:<name>`; a name
+        // without a property is a claim the blob does not keep, and a property without a name is
+        // one a reader will not look for.
+        for name in text.split('\0') {
+            let property = format!("Primary:{name}");
+            assert!(
+                property_value(&blob, &property).is_ok(),
+                "Packages says {name:?} but there is no {property} property"
+            );
+        }
+        // And the keys really are reachable through the property the name points at.
+        assert!(!credentials(&blob).expect("the keys read").is_empty());
+    }
+
+    /// A blob with no trailing NUL after the last name, which is what the specification allows and
+    /// what AD writes: a reader that requires the terminator, or writes one, disagrees with every
+    /// directory in the field.
+    #[test]
+    fn packages_has_no_trailing_nul() {
+        let value = packages(&[PACKAGE_KERBEROS_NEWER_KEYS]);
+        assert_eq!(value.len(), PACKAGE_KERBEROS_NEWER_KEYS.len() * 2);
+        assert_eq!(
+            &value[value.len() - 2..],
+            b"s\0".as_slice(),
+            "the last unit is the final 's', not a NUL"
+        );
+
+        // Two names are separated by one NUL, and by exactly one.
+        let two = packages(&["Kerberos", PACKAGE_KERBEROS_NEWER_KEYS]);
+        let units: Vec<u16> = two
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let text = String::from_utf16(&units).expect("valid UTF-16");
+        assert_eq!(text, "Kerberos\0Kerberos-Newer-Keys");
+    }
+
     #[test]
     fn the_property_count_sits_after_the_signature() {
         let one = user_properties(&[(PROPERTY_NT_HASH, &[0xab; 16])]);

@@ -29,29 +29,32 @@ except ImportError:  # pragma: no cover - the caller reports this
 PROPERTY_NAME = "Primary:Kerberos-Newer-Keys"
 
 
-def parse_property(blob_path, blob):
-    """The single property's value, as octets."""
+def parse_properties(blob_path, blob, expected_count):
+    """Every property as a dict of name -> value octets."""
     properties, count, tail = samr.unpack_user_properties(blob)
     if properties["PropertySignature"] != 0x50:
         raise SystemExit(
             f"{blob_path.name}: PropertySignature is "
             f"{properties['PropertySignature']:#x}, not 0x50"
         )
-    if count != 1:
-        raise SystemExit(f"{blob_path.name}: expected 1 property, impacket found {count}")
+    if count != expected_count:
+        raise SystemExit(
+            f"{blob_path.name}: expected {expected_count} properties, impacket found {count}"
+        )
 
+    found = {}
     at = 0
-    name_len, value_len, reserved = struct.unpack_from("<HHH", tail, at)
-    at += 6
-    name = tail[at : at + name_len].decode("utf-16le")
-    at += name_len
-    value_hex = tail[at : at + value_len].decode("ascii")
-    at += value_len
-    if reserved != 0:
-        raise SystemExit(f"{blob_path.name}: USER_PROPERTY.Reserved is {reserved}, not 0")
-    if name != PROPERTY_NAME:
-        raise SystemExit(f"{blob_path.name}: property is {name!r}, not {PROPERTY_NAME!r}")
-    return binascii.unhexlify(value_hex)
+    for _ in range(count):
+        name_len, value_len, reserved = struct.unpack_from("<HHH", tail, at)
+        at += 6
+        name = tail[at : at + name_len].decode("utf-16le")
+        at += name_len
+        value_hex = tail[at : at + value_len].decode("ascii")
+        at += value_len
+        if reserved != 0:
+            raise SystemExit(f"{blob_path.name}: USER_PROPERTY.Reserved is {reserved}, not 0")
+        found[name] = binascii.unhexlify(value_hex)
+    return found
 
 
 def check_length(blob_path, blob):
@@ -86,7 +89,26 @@ def read_case(blob_path):
             raise SystemExit(f"{blob_path.name}: {len(blob)} octets, expected 111")
         return None, 0
 
-    payload = parse_property(blob_path, blob)
+    properties = parse_properties(blob_path, blob, 2)
+
+    # `Packages` must name the credential type the blob actually carries, with the spelling from
+    # §3.1.1.8.11.2's table — the property name without its `Primary:` prefix. A reader decides what
+    # the blob claims to hold from this value, and Samba refuses the attribute outright when it is
+    # missing.
+    if "Packages" not in properties:
+        raise SystemExit(f"{blob_path.name}: no Packages property")
+    names = [n for n in properties["Packages"].decode("utf-16le").split("\x00") if n]
+    if names != ["Kerberos-Newer-Keys"]:
+        raise SystemExit(f"{blob_path.name}: Packages says {names}")
+    for name in names:
+        if f"Primary:{name}" not in properties:
+            raise SystemExit(
+                f"{blob_path.name}: Packages names {name!r} but there is no Primary:{name} property"
+            )
+
+    if PROPERTY_NAME not in properties:
+        raise SystemExit(f"{blob_path.name}: no {PROPERTY_NAME} property")
+    payload = properties[PROPERTY_NAME]
     credential = samr.KERB_STORED_CREDENTIAL_NEW(payload)
     if credential["Revision"] != 4:
         raise SystemExit(f"{blob_path.name}: revision {credential['Revision']}, not 4")

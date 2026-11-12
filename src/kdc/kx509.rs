@@ -32,7 +32,6 @@ use std::sync::Arc;
 
 use crate::crypto::Cipher;
 use crate::crypto::usage;
-use crate::der;
 use crate::error::{Error, codes};
 use crate::hdb::HdbEntry;
 use crate::msg::{ApReq, EncTicketPart};
@@ -41,136 +40,15 @@ use crate::name::Principal;
 use super::Kdc;
 use super::ca::{self, CertificateAuthority, Csr};
 
-/// The version prefix of every kx509 request: 2.0, as four octets.
-pub const VERSION: [u8; 4] = [0x00, 0x00, 0x02, 0x00];
-
-/// `[APPLICATION 35]`, the tag of `Kx509CSRPlus`.
-///
-/// Spelled out because it is the one tag in this protocol that is neither universal nor `[n]`, and a
-/// reader who has not met an `APPLICATION` tag in a Kerberos message before will look for one.
-pub const APP_CSR_PLUS: u8 = 0x60 | 35;
-
-/// Client-side permanent problem (RFC 6717 §4): the request will not work if repeated.
-pub const STATUS_CLIENT_BAD: i32 = 1;
-/// Server-side permanent problem: the KDC is misconfigured, not overloaded.
-pub const STATUS_SERVER_BAD: i32 = 4;
-/// Where Kerberos protocol errors start, as Heimdal numbers them (RFC 6717 leaves the field open).
-pub const KRB_ERROR_BASE: i32 = 1000;
-
-/// A decoded `Kx509Request`.
-#[derive(Debug, Clone)]
-pub struct Request {
-    /// An AP-REQ, or empty for the availability probe.
-    pub authenticator: Vec<u8>,
-    /// `HMAC-SHA1(session_key, version || pk-key)`.
-    pub pk_hash: Vec<u8>,
-    /// A `Kx509CSRPlus`, or a bare `SubjectPublicKeyInfo`.
-    pub pk_key: Vec<u8>,
-}
-
-impl Request {
-    /// Whether `data` begins with the kx509 version, and so is a request rather than a KDC-REQ.
-    pub fn claims(data: &[u8]) -> bool {
-        data.starts_with(&VERSION)
-    }
-
-    /// Decodes the DER after the version prefix.
-    pub fn decode(data: &[u8]) -> crate::Result<Request> {
-        let rest = data.strip_prefix(&VERSION[..]).ok_or_else(|| {
-            Error::NotARequest("a kx509 request begins with the version 00 00 02 00".into())
-        })?;
-        let mut r = der::Reader::new(rest);
-        let seq = r
-            .next_tlv("Kx509Request")
-            .map_err(|e| Error::NotARequest(format!("kx509: {e}")))?;
-        if seq.tag != der::SEQUENCE {
-            return Err(Error::NotARequest("Kx509Request is not a SEQUENCE".into()));
-        }
-        let mut f = der::Reader::new(seq.content);
-        let field = |r: &mut der::Reader<'_>, what: &'static str| -> crate::Result<Vec<u8>> {
-            let tlv = r
-                .next_tlv(what)
-                .map_err(|e| Error::NotARequest(format!("kx509 {what}: {e}")))?;
-            if tlv.tag != der::OCTET_STRING {
-                return Err(Error::NotARequest(format!(
-                    "kx509 {what} is not an OCTET STRING"
-                )));
-            }
-            Ok(tlv.content.to_vec())
-        };
-        Ok(Request {
-            authenticator: field(&mut f, "authenticator")?,
-            pk_hash: field(&mut f, "pk-hash")?,
-            pk_key: field(&mut f, "pk-key")?,
-        })
-    }
-}
-
-/// A `Kx509Response` under construction, and its DER.
-#[derive(Debug, Clone, Default)]
-pub struct Response {
-    /// `error-code`, zero for success.
-    pub error_code: i32,
-    /// The reply MAC, present whenever the request was authenticated.
-    pub hash: Option<Vec<u8>>,
-    /// The certificate chain, DER.
-    pub certificate: Option<Vec<u8>>,
-    /// A message for the client's operator.
-    pub text: Option<String>,
-}
-
-impl Response {
-    /// An error answer with no MAC: what a probe, or a request that could not be authenticated, gets.
-    pub fn error(code: i32, text: impl Into<String>) -> Response {
-        Response {
-            error_code: code,
-            text: Some(text.into()),
-            ..Response::default()
-        }
-    }
-
-    /// The DER of the response.
-    ///
-    /// `error-code` is always written, even when it is zero and the ASN.1 says `DEFAULT`: the reply
-    /// MAC covers its DER content, and a client that found the field absent would have to guess
-    /// whether the KDC fed it zero or nothing. Both sides write it, both sides feed it.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut fields = vec![der::field(0, der::int(i64::from(self.error_code)))];
-        if let Some(hash) = &self.hash {
-            fields.push(der::field(1, der::octets(hash)));
-        }
-        if let Some(cert) = &self.certificate {
-            fields.push(der::field(2, der::octets(cert)));
-        }
-        if let Some(text) = &self.text {
-            // `VisibleString`.
-            fields.push(der::field(3, der::tlv(0x1a, text.as_bytes())));
-        }
-        der::seq(&fields)
-    }
-}
-
-/// `HMAC-SHA1(key, parts)` — RFC 6717's MAC, whatever the enctype is.
-fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-    use hmac::{Hmac, KeyInit, Mac};
-    let mut mac = <Hmac<sha1::Sha1> as KeyInit>::new_from_slice(key)
-        .expect("HMAC accepts a key of any length");
-    for part in parts {
-        mac.update(part);
-    }
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// The DER content of an `INTEGER`, which is what the reply MAC covers (RFC 6717 §3).
-fn int_content(v: i32) -> Vec<u8> {
-    let encoded = der::int(i64::from(v));
-    // Strip the tag and the length: the value's content is what RFC 6717 names, "exclusive of the
-    // tag and length".
-    let mut r = der::Reader::new(&encoded);
-    r.next_tlv("INTEGER")
-        .map(|tlv| tlv.content.to_vec())
-        .unwrap_or_default()
-}
+// The wire protocol — both directions, the framing, the two MACs and the CSR wrapper — lives in
+// `rrl_krb_common::kx509`, because the client is in another crate and the MACs have no room for
+// interpretation. What is here is the KDC's side of it: who may ask, what gets signed, and what the
+// answer says when it cannot be. The names are re-exported so that a caller of this module does not
+// have to know which crate a given constant came from.
+pub use rrl_krb_common::kx509::{
+    APP_CSR_PLUS, KRB_ERROR_BASE, Request, Response, STATUS_CLIENT_BAD, STATUS_SERVER_BAD, VERSION,
+    csr_from_plus, hmac_sha1, plus_from_csr,
+};
 
 impl Kdc {
     /// Answers a kx509 request, or `None` when the request is not one.
@@ -233,8 +111,7 @@ impl Kdc {
         // The payload's own MAC, over the version and the key material — the whole reason the
         // request carries an AP-REQ at all: the ticket says who, the MAC says that whoever built
         // this payload holds the session key.
-        let expected = hmac_sha1(session_key.bytes(), &[&VERSION, &parsed.pk_key]);
-        if parsed.pk_hash != expected {
+        if !parsed.verify_mac(session_key.bytes()) {
             return Response::error(
                 KRB_ERROR_BASE + codes::KDC_ERR_PREAUTH_FAILED,
                 "the kx509 request MAC does not verify",
@@ -247,8 +124,8 @@ impl Kdc {
         // realm that issued one would be issuing certificates anybody could claim.
         let csr_der = match csr_from_plus(&parsed.pk_key) {
             Ok(der) => der,
-            Err(text) => {
-                return Response::error(STATUS_CLIENT_BAD, text).encode();
+            Err(e) => {
+                return Response::error(STATUS_CLIENT_BAD, format!("{e}")).encode();
             }
         };
         let csr = match Csr::parse(&csr_der) {
@@ -280,19 +157,18 @@ impl Kdc {
         // RFC 6717 §3: the MAC covers the certificate's DER, not the encoding of the field that
         // carries it. Feeding the OCTET STRING's own tag and length here would produce a MAC no
         // client computes — Heimdal feeds `rep->certificate->data` for the same reason.
-        let hash = hmac_sha1(
-            session_key.bytes(),
-            &[&VERSION, &int_content(0), &issued.certificate],
-        );
-        Response {
+        let mut response = Response {
             error_code: 0,
-            hash: Some(hash),
+            hash: None,
             // The certificate's own DER: `encode` puts it in the field's OCTET STRING, and wrapping
             // it here would make the field carry an OCTET STRING inside an OCTET STRING.
             certificate: Some(issued.certificate),
             text: None,
-        }
-        .encode()
+        };
+        // Computed from the finished response, so that the MAC covers exactly what the encoding
+        // will carry: a second place that assembled the same fields could disagree with it.
+        response.hash = Some(response.mac(session_key.bytes()));
+        response.encode()
     }
 
     /// Verifies the AP-REQ and returns the ticket's session key and client.
@@ -412,40 +288,6 @@ fn open_ticket(
 /// A bare `SubjectPublicKeyInfo` is refused by name: it carries no proof of possession, and
 /// [`super::ca::Csr`] exists precisely so that a certificate is never issued for a key its holder
 /// has not demonstrated.
-fn csr_from_plus(pk_key: &[u8]) -> std::result::Result<Vec<u8>, String> {
-    let mut r = der::Reader::new(pk_key);
-    let plus = r
-        .next_tlv("pk-key")
-        .map_err(|e| format!("the pk-key: {e}"))?;
-    if plus.tag != APP_CSR_PLUS {
-        return Err(format!(
-            "the pk-key is tag {:#04x}, and this KDC accepts only a Kx509CSRPlus \
-             ([APPLICATION 35]): a bare public key carries no proof that its sender holds the \
-             private half",
-            plus.tag
-        ));
-    }
-    // The module is `EXPLICIT TAGS`, so `[APPLICATION 35] SEQUENCE { … }` is the wrapper around a
-    // SEQUENCE — not a SET-like implicit tag. An encoder that read the type as implicitly tagged
-    // would put the OCTET STRING straight in; both are accepted, because the tag alone cannot say
-    // which was meant and refusing the other would refuse a working client.
-    let mut f = der::Reader::new(plus.content);
-    let first = f.next_tlv("csr").map_err(|e| format!("the csr: {e}"))?;
-    let csr = if first.tag == der::SEQUENCE {
-        let mut inner = der::Reader::new(first.content);
-        inner.next_tlv("csr").map_err(|e| format!("the csr: {e}"))?
-    } else {
-        first
-    };
-    if csr.tag != der::OCTET_STRING {
-        return Err(format!(
-            "a Kx509CSRPlus carries the CSR as an OCTET STRING, not {:#04x}",
-            csr.tag
-        ));
-    }
-    Ok(csr.content.to_vec())
-}
-
 /// The service principal a realm's kx509 clients are told to ask for.
 pub fn service_principal(realm: &str, host: &str) -> crate::Result<Principal> {
     Principal::parse(&format!("kx509/{host}@{realm}")).map_err(Error::from)

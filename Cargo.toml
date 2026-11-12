@@ -54,9 +54,9 @@ aes = { version = "0.9", optional = true }
 # Elliptic-curve Diffie-Hellman for PKINIT (RFC 5349). Three crates because each curve is its own
 # crate, the same three the client (`rrl-krb5`) uses — one implementation of each curve between the
 # two sides of an exchange is the property that makes an interop test mean anything.
-p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdh"] }
-p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdh"] }
-p521 = { version = "0.14", optional = true, default-features = false, features = ["ecdh"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+p521 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
 num-bigint = { version = "0.4", default-features = false, optional = true }
 # The curve arithmetic for SPAKE (RFC 9588). Not a Kerberos profile: unlike RFC 3961, where
 # this crate owns every octet, edwards25519 multiplication fails subtly rather than loudly when

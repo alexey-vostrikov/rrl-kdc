@@ -25,6 +25,11 @@
 pub mod config;
 
 mod as_exchange;
+// The CA front end needs the certificate machinery: an ECDSA possession proof reuses the curve
+// code, and a SAN is an `id-pkinit-san` otherName. A build without `pkinit` has no certificate stack
+// to issue against, so the module travels with the feature rather than half-existing.
+#[cfg(feature = "pkinit")]
+pub mod ca;
 pub mod cookie;
 pub mod preauth;
 mod tgs_exchange;

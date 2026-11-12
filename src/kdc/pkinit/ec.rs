@@ -209,6 +209,34 @@ impl KeyPair {
     }
 }
 
+/// Verifies an ECDSA signature over an already-computed digest.
+///
+/// `digest` is the hash, not the message: ECDSA signs a digest, and hashing here would verify a
+/// hash of a hash, which fails for every input and reads like a wrong key. `signature` is the DER
+/// `ECDSA-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`) that every CSR and certificate carries.
+///
+/// A point that is not on `curve` is a `false`, not an error: the caller is asking whether this
+/// signature verifies under this key, and a key that is not a key does not verify anything.
+pub fn verify(curve: Curve, point: &[u8], digest: &[u8], signature: &[u8]) -> bool {
+    macro_rules! attempt {
+        ($m:ident) => {{
+            let Ok(key) = $m::ecdsa::VerifyingKey::from_sec1_bytes(point) else {
+                return false;
+            };
+            let Ok(sig) = $m::ecdsa::DerSignature::from_bytes(signature) else {
+                return false;
+            };
+            use $m::ecdsa::signature::hazmat::PrehashVerifier;
+            key.verify_prehash(digest, &sig).is_ok()
+        }};
+    }
+    match curve {
+        Curve::P256 => attempt!(p256),
+        Curve::P384 => attempt!(p384),
+        Curve::P521 => attempt!(p521),
+    }
+}
+
 /// `field_len` octets from `rng`, with P-521's top bits cleared.
 ///
 /// A P-521 scalar is 521 bits, so the first octet has seven bits at most; the other two curves have
@@ -322,6 +350,62 @@ mod tests {
         );
         // And a value that is not a point at all.
         assert!(p256.agree(&[0x04; 65]).is_err(), "garbage is not a point");
+    }
+
+    /// A signature over a digest verifies, and a different digest does not — the property the CSR
+    /// possession check rests on, on every curve.
+    #[test]
+    fn a_signature_verifies_over_the_digest_it_covers() {
+        for curve in [Curve::P256, Curve::P384, Curve::P521] {
+            let pair = KeyPair::generate(curve, &rng()).expect("a pair");
+            let digest = [
+                0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+                0xcc, 0xdd, 0xee, 0xff, 0x00,
+            ];
+            let sig: Vec<u8> = match &pair.secret {
+                Secret::P256(sk) => {
+                    use p256::ecdsa::signature::hazmat::PrehashSigner as _;
+                    let signing =
+                        p256::ecdsa::SigningKey::from_slice(&sk.to_bytes()).expect("a key");
+                    let s: p256::ecdsa::DerSignature =
+                        signing.sign_prehash(&digest).expect("signs");
+                    s.as_bytes().to_vec()
+                }
+                Secret::P384(sk) => {
+                    use p384::ecdsa::signature::hazmat::PrehashSigner as _;
+                    let signing =
+                        p384::ecdsa::SigningKey::from_slice(&sk.to_bytes()).expect("a key");
+                    let s: p384::ecdsa::DerSignature =
+                        signing.sign_prehash(&digest).expect("signs");
+                    s.as_bytes().to_vec()
+                }
+                Secret::P521(sk) => {
+                    use p521::ecdsa::signature::hazmat::PrehashSigner as _;
+                    let signing =
+                        p521::ecdsa::SigningKey::from_slice(&sk.to_bytes()).expect("a key");
+                    let s: p521::ecdsa::DerSignature =
+                        signing.sign_prehash(&digest).expect("signs");
+                    s.as_bytes().to_vec()
+                }
+            };
+            assert!(
+                verify(curve, pair.point(), &digest, &sig),
+                "{curve:?}: a signature over this digest must verify"
+            );
+            let mut other = digest;
+            other[0] ^= 0xff;
+            assert!(
+                !verify(curve, pair.point(), &other, &sig),
+                "{curve:?}: a signature must not verify over another digest"
+            );
+            // And a point from another curve does not verify anything.
+            let elsewhere = KeyPair::generate(Curve::P256, &rng()).expect("a pair");
+            if curve != Curve::P256 {
+                assert!(!verify(Curve::P256, pair.point(), &digest, &sig));
+                assert!(!verify(curve, elsewhere.point(), &digest, &sig));
+            }
+        }
     }
 
     /// `namedCurve` is what a client sends; an explicitly parameterised curve is refused, because

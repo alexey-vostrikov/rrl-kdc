@@ -26,12 +26,25 @@
 //! decided on — after canonicalization, after an alias, after `PA-FOR-USER`. Recording the request's
 //! spelling would be a record of what was asked rather than of what was granted.
 //!
+//! # Three layers, and why there are three
+//!
+//! * [`Record`] is the decision, as data. Everything above can be replaced without changing it.
+//! * [`Audit`] takes records. A deployment that batches, samples, signs or ships them to a collector
+//!   implements this, and the KDC calls nothing else.
+//! * [`AuditDriver`] takes **lines**. It exists because most places an audit trail goes are not
+//!   `std::io::Write` — `syslog(3)` is a C function returning nothing, journald frames fields over a
+//!   socket, a collector is an HTTP client. Each is a few lines behind the trait, and none of them
+//!   can be a `Write` without inventing an error type the caller then has to ignore.
+//!
+//! [`StreamAudit`] is the bridge a deployment usually wants: `Audit` over a driver, one line per
+//! record. It is not the only way — it is the shortest one that is durable by default.
+//!
 //! # A sink cannot fail
 //!
-//! [`Audit::record`] returns nothing. A log file that is full must not refuse a login the realm
-//! would otherwise grant: an audit trail is evidence, and evidence that can be switched off by
-//! filling a disk is not evidence. A sink that wants to report a write failure reports it on its
-//! own channel, where it does not become an authentication decision.
+//! [`Audit::record`] and [`AuditDriver::emit`] return nothing. A log file that is full must not
+//! refuse a login the realm would otherwise grant: an audit trail is evidence, and evidence that can
+//! be switched off by filling a disk is not evidence. A sink that wants to report a write failure
+//! reports it on its own channel, where it does not become an authentication decision.
 
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -149,19 +162,45 @@ impl Audit for Collector {
     }
 }
 
-/// A sink that writes one line per record to anything that takes bytes — a file, a pipe, a syslog
-/// socket wrapped by the deployment.
+/// Where a line of audit goes: a file, a pipe, syslog, journald, an HTTP collector.
 ///
-/// **Each line is flushed before the record is considered taken.** An audit trail that sits in a
-/// buffer when the process dies is a trail missing exactly the records that matter — the last ones,
-/// before whatever killed it. The cost is a write syscall per request, which a KDC that issues
-/// thousands of tickets a second will feel; that is the trade this sink makes, and a deployment that
-/// wants batching writes its own [`Audit`] over the same [`Record`].
-pub struct StreamAudit<W: std::io::Write + Send> {
+/// A trait rather than `std::io::Write`, because most of the places a deployment would want to put
+/// an audit trail are not writers. `syslog(3)` is a C function that takes a string and returns
+/// nothing; journald's native protocol is a socket that frames fields, not lines; a collector is an
+/// HTTP client. Each of those is three lines behind this trait and none of them can be expressed as
+/// a `Write` without inventing an error type the caller would then have to ignore — which is the
+/// same reason [`Audit::record`] cannot fail, one level down.
+pub trait AuditDriver: Send + Sync {
+    /// Takes one line, **without** a trailing newline.
+    ///
+    /// Returns nothing: a driver that cannot write has nowhere to report it that is not the
+    /// authentication path. It reports on its own channel, or not at all.
+    fn emit(&self, line: &str);
+}
+
+/// Any closure is a driver, which is what makes a deployment's own sink short: a syslog call, a
+/// channel send, a counter in a test.
+impl<F> AuditDriver for F
+where
+    F: Fn(&str) + Send + Sync,
+{
+    fn emit(&self, line: &str) {
+        self(line);
+    }
+}
+
+/// A driver over anything that takes bytes, flushing after every line.
+///
+/// **The flush is the point.** An audit trail that sits in a buffer when the process dies is a trail
+/// missing exactly the records that matter — the last ones, before whatever killed it. The cost is a
+/// write syscall per request, which a KDC issuing thousands of tickets a second will feel; a
+/// deployment that wants batching writes its own [`Audit`] over the same [`Record`], where the
+/// trade is visible rather than hidden in a sink that claims to be durable.
+pub struct ToWriter<W: std::io::Write + Send> {
     out: Mutex<W>,
 }
 
-impl<W: std::io::Write + Send> StreamAudit<W> {
+impl<W: std::io::Write + Send> ToWriter<W> {
     /// Wraps `out`.
     pub fn new(out: W) -> Self {
         Self {
@@ -169,25 +208,49 @@ impl<W: std::io::Write + Send> StreamAudit<W> {
         }
     }
 
-    /// The sink back, for a caller that wants to close it or read what it wrote.
+    /// The writer back, for a caller that wants to close it or read what it wrote.
     pub fn into_inner(self) -> W {
         self.out
             .into_inner()
-            .expect("a stream audit's lock is never held across a panic")
+            .expect("a writer driver's lock is never held across a panic")
     }
 }
 
-impl<W: std::io::Write + Send> Audit for StreamAudit<W> {
-    fn record(&self, record: &Record) {
-        // A write failure is swallowed: `Audit::record` cannot fail, because a full disk must not
-        // refuse a login the realm would grant. The deployment's own logging is where a failure
-        // belongs — and a sink that cannot write is a deployment problem, not an authentication
-        // decision.
+impl<W: std::io::Write + Send> AuditDriver for ToWriter<W> {
+    fn emit(&self, line: &str) {
+        // A write failure is swallowed here for the same reason the trait returns nothing: a full
+        // disk must not refuse a login the realm would grant.
         let Ok(mut out) = self.out.lock() else {
             return;
         };
-        let _ = writeln!(out, "{record}");
+        let _ = writeln!(out, "{line}");
         let _ = out.flush();
+    }
+}
+
+/// A sink that renders each record as one line and hands it to a driver.
+///
+/// One line, because that is what every log collector in existence can index: a multi-line record is
+/// one event split into several, and the next record's first line arrives in the middle of it.
+pub struct StreamAudit<D: AuditDriver> {
+    driver: D,
+}
+
+impl<D: AuditDriver> StreamAudit<D> {
+    /// Wraps `driver`.
+    pub fn new(driver: D) -> Self {
+        Self { driver }
+    }
+
+    /// The driver back.
+    pub fn into_driver(self) -> D {
+        self.driver
+    }
+}
+
+impl<D: AuditDriver> Audit for StreamAudit<D> {
+    fn record(&self, record: &Record) {
+        self.driver.emit(&record.to_string());
     }
 }
 
@@ -313,30 +376,23 @@ mod tests {
         assert_eq!(ats, vec![10, 20, 30]);
     }
 
-    /// The stream sink writes one flushed line per record, in order.
+    /// A closure is a driver, and it receives one line per record, in order, with no newline.
+    ///
+    /// This is the shape a deployment's own sink takes — a syslog call, a channel send, a counter —
+    /// and the absence of a trailing newline is part of the contract: the driver decides how lines
+    /// are framed, because journald and a file disagree about it.
     #[test]
-    fn a_stream_sink_writes_one_line_per_record() {
-        // A writer that records what it was given and when it was flushed: the flush is the
-        // property that matters, and a `Vec<u8>` alone cannot show it.
-        #[derive(Clone)]
-        struct Tap(std::sync::Arc<Mutex<(String, usize)>>);
-        impl Write for Tap {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0
+    fn a_closure_is_a_driver() {
+        let lines = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = std::sync::Arc::clone(&lines);
+            StreamAudit::new(move |line: &str| {
+                lines
                     .lock()
-                    .unwrap()
-                    .0
-                    .push_str(&String::from_utf8_lossy(bytes));
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                self.0.lock().unwrap().1 += 1;
-                Ok(())
-            }
-        }
-
-        let log = std::sync::Arc::new(Mutex::new((String::new(), 0usize)));
-        let sink = StreamAudit::new(Tap(std::sync::Arc::clone(&log)));
+                    .expect("a test's lock is never poisoned")
+                    .push(line.to_owned());
+            })
+        };
         for at in [1, 2] {
             sink.record(&Record {
                 at,
@@ -349,17 +405,56 @@ mod tests {
                 code: None,
             });
         }
-        let (text, flushes) = log.lock().unwrap().clone();
+        let lines = lines.lock().expect("a test's lock").clone();
         assert_eq!(
-            text,
-            "at=1 as issued client=alice@EXAMPLE.COM realm=EXAMPLE.COM\n\
-             at=2 as issued client=alice@EXAMPLE.COM realm=EXAMPLE.COM\n",
-            "one line per record, in order"
+            lines,
+            vec![
+                "at=1 as issued client=alice@EXAMPLE.COM realm=EXAMPLE.COM",
+                "at=2 as issued client=alice@EXAMPLE.COM realm=EXAMPLE.COM",
+            ],
+            "one line per record, in order, and the driver adds no framing of its own"
         );
-        assert_eq!(
-            flushes, 2,
-            "each line was flushed before the record was taken"
-        );
+    }
+
+    /// The writer adapter writes one line and flushes it before the record is considered taken.
+    ///
+    /// The flush is what makes the trail durable, and a `Vec<u8>` cannot show it: the test counts
+    /// flushes rather than inspecting bytes.
+    #[test]
+    fn the_writer_driver_flushes_every_line() {
+        #[derive(Clone)]
+        struct Tap(std::sync::Arc<Mutex<(String, usize)>>);
+        impl Write for Tap {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("a test's lock")
+                    .0
+                    .push_str(&String::from_utf8_lossy(bytes));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.lock().expect("a test's lock").1 += 1;
+                Ok(())
+            }
+        }
+
+        let log = std::sync::Arc::new(Mutex::new((String::new(), 0usize)));
+        let sink = StreamAudit::new(ToWriter::new(Tap(std::sync::Arc::clone(&log))));
+        sink.record(&Record {
+            at: 7,
+            exchange: Exchange::Tgs,
+            client: None,
+            service: None,
+            realm: "EXAMPLE.COM".into(),
+            peer: None,
+            outcome: Outcome::Refused,
+            code: Some(crate::error::codes::KDC_ERR_POLICY),
+        });
+
+        let (text, flushes) = log.lock().expect("a test's lock").clone();
+        assert_eq!(text, "at=7 tgs refused realm=EXAMPLE.COM code=12\n");
+        assert_eq!(flushes, 1, "flushed before the record was taken");
     }
 
     /// A record prints as one line, and a refusal names its code.

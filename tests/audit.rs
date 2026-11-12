@@ -203,6 +203,61 @@ fn an_undecodable_request_is_recorded_too() {
     assert!(records[0].code.is_some(), "and the code is the one sent");
 }
 
+/// The whole path end to end through a driver: a closure receives one line per decision, and the
+/// lines say what the records said.
+///
+/// This is the shape a deployment takes — a `syslog` call, a channel, a counter — and testing it
+/// through the engine rather than through the types is what proves the wiring: a `StreamAudit` that
+/// nobody handed to a `Kdc` would pass every test in the module above.
+#[test]
+fn a_driver_receives_one_line_per_decision() {
+    use rrl_kdc::kdc::audit::StreamAudit;
+    use std::sync::Mutex;
+
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = StreamAudit::new({
+        let lines = Arc::clone(&lines);
+        move |line: &str| {
+            lines
+                .lock()
+                .expect("a test's lock is never poisoned")
+                .push(line.to_owned())
+        }
+    });
+    let kdc = kdc(Arc::new(sink) as Arc<dyn Audit>);
+
+    // One granted, one refused: two decisions, two lines.
+    kdc.handle_from(
+        &as_req(
+            "alice",
+            vec![(PA_ENC_TIMESTAMP, enc_timestamp(PASSWORD.as_bytes()))],
+        ),
+        NOW,
+        Some("192.0.2.9".parse().unwrap()),
+    );
+    kdc.handle_from(&as_req("nobody", Vec::new()), NOW, None);
+
+    let lines = lines.lock().expect("a test's lock").clone();
+    assert_eq!(lines.len(), 2, "two requests, two lines: {lines:?}");
+    assert_eq!(
+        lines[0],
+        format!(
+            "at={NOW} as issued client=alice@EXAMPLE.COM service=krbtgt/EXAMPLE.COM@EXAMPLE.COM \
+             realm=EXAMPLE.COM peer=192.0.2.9"
+        )
+    );
+    assert!(
+        lines[1].contains("as refused") && lines[1].contains("client=nobody@EXAMPLE.COM"),
+        "the refusal names who asked: {}",
+        lines[1]
+    );
+    assert!(
+        lines[1].contains(&format!("code={}", codes::KDC_ERR_C_PRINCIPAL_UNKNOWN)),
+        "and the code the client got: {}",
+        lines[1]
+    );
+}
+
 /// A realm with no sink records nothing and answers exactly as before.
 ///
 /// The default is silence, and silence must not change a decision: an audit trail that altered

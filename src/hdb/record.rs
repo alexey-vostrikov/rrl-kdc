@@ -260,6 +260,32 @@ pub fn encode_with(
             ),
         ]));
     }
+    if let Some(nt_hash) = &entry.nt_hash {
+        // `NT-Hash ::= SEQUENCE { mkvno [0] INTEGER OPTIONAL, value [1] OCTET STRING }`, this
+        // crate's extension 17 — Heimdal's `HDB-extension` CHOICE ends in `...`, and Heimdal has no
+        // field for an NT hash at all (its `hdb.asn1` is Kerberos-only), so there is nothing of
+        // Heimdal's to be compatible with here.
+        //
+        // `mkvno` is what makes the bytes unambiguous: present means the value is sealed under that
+        // master key, absent means sixteen octets of plaintext. Deciding by length would work today
+        // and break the moment an enctype's overhead made a sealed blob sixteen octets long.
+        let (value, mkvno) = match master {
+            Some((cipher, keys)) => {
+                let (sealed, kvno) = keys.seal(cipher, nt_hash)?;
+                (sealed, Some(kvno))
+            }
+            None => (nt_hash.to_vec(), None),
+        };
+        let mut fields = Vec::new();
+        if let Some(mkvno) = mkvno {
+            fields.push(der::field(0, der::int(i64::from(mkvno))));
+        }
+        fields.push(der::field(1, der::octets(&value)));
+        extensions.push(der::seq(&[
+            der::field(0, der::int(0)),
+            der::field(1, der::seq(&[der::field(17, der::seq(&fields))])),
+        ]));
+    }
     if !extensions.is_empty() {
         parts.push(der::field(13, der::seq(&extensions)));
     }
@@ -428,11 +454,13 @@ pub fn decode_with(
         aliases,
         policy,
         strings,
-    } = read_extensions(&f, ctx, &principal.realm)?;
+        nt_hash,
+    } = read_extensions(&f, ctx, &principal.realm, master)?;
 
     Ok(HdbEntry {
         principal,
         keys,
+        nt_hash,
         constrained_delegation: delegation_acl,
         aliases,
         policy,
@@ -472,19 +500,27 @@ struct Extensions {
     aliases: Option<Aliases>,
     policy: Option<String>,
     strings: Vec<(String, String)>,
+    nt_hash: Option<[u8; 16]>,
 }
 
-fn read_extensions(f: &Fields<'_>, ctx: &'static str, realm: &str) -> Result<Extensions> {
+fn read_extensions(
+    f: &Fields<'_>,
+    ctx: &'static str,
+    realm: &str,
+    master: Option<(&dyn crate::crypto::Cipher, &crate::hdb::mkey::MasterKeys)>,
+) -> Result<Extensions> {
     let mut delegation = None;
     let mut aliases = None;
     let mut policy = None;
     let mut strings = Vec::new();
+    let mut nt_hash = None;
     if f.opt_bytes(13).is_none() {
         return Ok(Extensions {
             delegation: None,
             aliases: None,
             policy: None,
             strings,
+            nt_hash: None,
         });
     }
     let mut r = Reader::new(f.bytes(13, ctx)?);
@@ -569,12 +605,43 @@ fn read_extensions(f: &Fields<'_>, ctx: &'static str, realm: &str) -> Result<Ext
                 ));
             }
         }
+
+        if choice.opt_bytes(17).is_some() {
+            // This crate's extension, `NT-Hash ::= SEQUENCE { mkvno [0] INTEGER OPTIONAL,
+            // value [1] OCTET STRING }`. `mkvno` says the value is sealed, and its absence says
+            // sixteen plaintext octets — a distinction the record has to carry itself, because a
+            // password-equivalent secret that a reader mistook for plaintext would be worse than
+            // one it refused.
+            let mut nr = Reader::new(choice.bytes(17, ctx)?);
+            let nf = Fields::parse(ctx, nr.expect_in(ctx, der::SEQUENCE)?)?;
+            let mkvno = nf.opt_int(0, ctx)?.map(|v| v as u32);
+            let value = nf.octets(1, ctx)?;
+            let material = match mkvno {
+                Some(mkvno) => {
+                    let (cipher, keys) = master.ok_or_else(|| {
+                        Error::Hdb(format!(
+                            "{ctx}: the NT hash is sealed under master key {mkvno} and none was \
+                             supplied"
+                        ))
+                    })?;
+                    keys.unseal_bytes(cipher, value, Some(mkvno), 16, "NT hash")?
+                }
+                None => value.to_vec(),
+            };
+            nt_hash = Some(material.as_slice().try_into().map_err(|_| {
+                Error::Hdb(format!(
+                    "{ctx}: an NT hash is sixteen octets, this one is {}",
+                    material.len()
+                ))
+            })?);
+        }
     }
     Ok(Extensions {
         delegation,
         aliases,
         policy,
         strings,
+        nt_hash,
     })
 }
 
@@ -599,6 +666,74 @@ mod tests {
         e.max_renew = Some(604_800);
         e.modified = 1_700_000_000;
         e
+    }
+
+    /// The NT hash survives the record, plaintext and sealed, and the two are told apart by the
+    /// record rather than by a length.
+    ///
+    /// A sealed hash that a reader mistook for plaintext would hand out a password-equivalent secret
+    /// that is really ciphertext — and one that a reader mistook for sealed would refuse a record it
+    /// could read. `mkvno` is what makes it unambiguous.
+    #[test]
+    fn the_nt_hash_round_trips_plain_and_sealed() {
+        use crate::crypto::Cipher;
+        use crate::hdb::mkey::MasterKeys;
+        let e = entry();
+        let hash = rrl_crypto::nt::hash_password("pw");
+        assert_eq!(e.nt_hash, Some(hash), "recorded when the password was set");
+
+        // Plaintext: sixteen octets in the extension and no `mkvno`, which is what a realm with no
+        // master key gets — the same as its Kerberos keys, and just as visible in the file.
+        let plain = encode(&e);
+        assert_eq!(decode(&plain).unwrap().nt_hash, Some(hash));
+        assert!(
+            plain.windows(16).any(|w| w == hash),
+            "without a master key nothing is sealed, and the record says so"
+        );
+
+        // Sealed: the same record under a master key holds no plaintext hash, and only that key
+        // opens it.
+        let master = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let keys = MasterKeys::single(master, 7);
+        let sealed = encode_with(&e, Some((&OwnCipher, &keys))).expect("sealed");
+        assert!(
+            !sealed.windows(16).any(|w| w == hash),
+            "a sealed record must not carry the hash in the clear"
+        );
+        let back = decode_with(&sealed, Some((&OwnCipher, &keys))).expect("opened");
+        assert_eq!(back.nt_hash, Some(hash), "and it comes back");
+
+        // Without the master key the hash is refused, by name, rather than read as ciphertext.
+        //
+        // The keys are dropped for this: they are sealed under the same master key, and the record
+        // would be refused on the first of them instead — which is correct, and would prove nothing
+        // about the hash.
+        let mut only_hash = e.clone();
+        only_hash.keys.clear();
+        let sealed_hash = encode_with(&only_hash, Some((&OwnCipher, &keys))).expect("sealed");
+        assert_eq!(
+            decode_with(&sealed_hash, Some((&OwnCipher, &keys)))
+                .expect("opened")
+                .nt_hash,
+            Some(hash)
+        );
+        let err = decode(&sealed_hash)
+            .expect_err("a sealed hash cannot be read without the master key")
+            .to_string();
+        assert!(err.contains("NT hash") && err.contains('7'), "{err}");
+    }
+
+    /// An entry with no NT hash writes no extension at all, so a record for a principal that never
+    /// had a password is byte-for-byte what this crate wrote before the field existed.
+    #[test]
+    fn an_entry_without_an_nt_hash_gains_no_extension() {
+        let mut e = entry();
+        e.nt_hash = None;
+        let without = encode(&e);
+        e.nt_hash = Some([0u8; 16]);
+        let with = encode(&e);
+        assert!(with.len() > without.len());
+        assert_eq!(decode(&without).unwrap().nt_hash, None);
     }
 
     /// Aliases survive the record, including the case-insensitivity switch: both are what a

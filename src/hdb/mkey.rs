@@ -170,6 +170,52 @@ impl MasterKeys {
         mkvno: Option<u32>,
         enctype: Enctype,
     ) -> Result<Vec<u8>> {
+        self.open(cipher, sealed, mkvno, &|open: &[u8]| {
+            if open.len() != enctype.key_len() {
+                return Err(Error::Hdb(format!(
+                    "a key sealed as {} opened to {} octets, and that enctype takes {}",
+                    enctype.name(),
+                    open.len(),
+                    enctype.key_len()
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    /// Opens `sealed` and checks that the result is `expected_len` octets.
+    ///
+    /// For material that is sealed like a key but is not a key of any enctype: an account's NT hash
+    /// is sixteen octets and there is no enctype to name it by. The length check is not decoration —
+    /// a value that opens to another length means the record is about something else, and a caller
+    /// that took it would act on the wrong bytes.
+    pub fn unseal_bytes(
+        &self,
+        cipher: &dyn Cipher,
+        sealed: &[u8],
+        mkvno: Option<u32>,
+        expected_len: usize,
+        what: &str,
+    ) -> Result<Vec<u8>> {
+        self.open(cipher, sealed, mkvno, &|open: &[u8]| {
+            if open.len() != expected_len {
+                return Err(Error::Hdb(format!(
+                    "a sealed {what} opened to {} octets, and a {what} is {expected_len}",
+                    open.len()
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    /// The one place that chooses the master key and opens; `check` says what the result must be.
+    fn open(
+        &self,
+        cipher: &dyn Cipher,
+        sealed: &[u8],
+        mkvno: Option<u32>,
+        check: &dyn Fn(&[u8]) -> Result<()>,
+    ) -> Result<Vec<u8>> {
         match mkvno {
             Some(kvno) => {
                 let mkey = self.get(Some(kvno)).ok_or_else(|| {
@@ -181,7 +227,9 @@ impl MasterKeys {
                         }
                     ))
                 })?;
-                unseal_key(cipher, &mkey.key, sealed, enctype)
+                let open = open_sealed(cipher, &mkey.key, sealed)?;
+                check(&open)?;
+                Ok(open)
             }
             // A database written before the master key was introduced says nothing about the
             // version. Every key in the set is tried, and a set that opens none of them reports that
@@ -189,8 +237,11 @@ impl MasterKeys {
             None => {
                 let mut last = None;
                 for mkey in &self.keys {
-                    match unseal_key(cipher, &mkey.key, sealed, enctype) {
-                        Ok(open) => return Ok(open),
+                    match open_sealed(cipher, &mkey.key, sealed) {
+                        Ok(open) => {
+                            check(&open)?;
+                            return Ok(open);
+                        }
                         Err(e) => last = Some(e),
                     }
                 }
@@ -209,6 +260,19 @@ pub fn seal_key(cipher: &dyn Cipher, master: &Key, key_bytes: &[u8]) -> Result<V
         .map_err(|e| Error::Hdb(format!("sealing a key under the master key: {e}")))
 }
 
+/// `decrypt(master_key, HDB_KU_MKEY, sealed)`, with the one message a caller can act on: a tag that
+/// does not verify means the wrong master key or a corrupt record, and telling them apart is not
+/// possible from here.
+fn open_sealed(cipher: &dyn Cipher, master: &Key, sealed: &[u8]) -> Result<Vec<u8>> {
+    cipher.decrypt(master, HDB_KU_MKEY, sealed).map_err(|_| {
+        Error::Hdb(
+            "a sealed key does not open under this master key: the tag does not verify, so the \
+                 master key is the wrong one or the record is corrupt"
+                .into(),
+        )
+    })
+}
+
 /// The inverse, which refuses unless the tag verifies.
 pub fn unseal_key(
     cipher: &dyn Cipher,
@@ -216,13 +280,7 @@ pub fn unseal_key(
     sealed: &[u8],
     enctype: Enctype,
 ) -> Result<Vec<u8>> {
-    let open = cipher.decrypt(master, HDB_KU_MKEY, sealed).map_err(|_| {
-        Error::Hdb(
-            "a sealed key does not open under this master key: the tag does not verify, so the \
-                 master key is the wrong one or the record is corrupt"
-                .into(),
-        )
-    })?;
+    let open = open_sealed(cipher, master, sealed)?;
     if open.len() != enctype.key_len() {
         return Err(Error::Hdb(format!(
             "a key sealed as {} opened to {} octets, and that enctype takes {}",

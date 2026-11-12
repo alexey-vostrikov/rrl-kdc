@@ -160,6 +160,20 @@ pub struct HdbEntry {
     pub principal: Principal,
     /// The keys, at most one per (kvno, enctype).
     pub keys: Vec<HdbKey>,
+    /// The account's NT hash (`NTOWFv1`), if one was derived from the password it was set with.
+    ///
+    /// This is a **password-equivalent secret**: whoever holds it can authenticate as the account
+    /// over NTLM and derive a Netlogon session key (`netr_ServerAuthenticate3`) without ever
+    /// learning the password, which is what a pass-the-hash attack is. It is kept because a Windows
+    /// estate cannot do without it — a machine account whose hash is missing cannot establish a
+    /// secure channel — and because a directory written by Samba or AD carries it in
+    /// `sambaNTPassword`, so a KDC that refused to hold it could only serve directories it wrote
+    /// itself.
+    ///
+    /// It is **sealed at rest** wherever the keys are, by the same master key, and it is never
+    /// derived from the Kerberos keys: no amount of AES arithmetic recovers `MD4(UTF-16LE(password))`.
+    /// That is why it can only be recorded at the moment a cleartext password is in hand.
+    pub nt_hash: Option<[u8; 16]>,
     /// `kvno` (`[1]` in `hdb.asn1`): the key version this entry is at.
     ///
     /// A field rather than a maximum over `keys`, because the two are not the
@@ -240,6 +254,7 @@ impl HdbEntry {
         HdbEntry {
             principal,
             keys: Vec::new(),
+            nt_hash: None,
             kvno: 0,
             flags: flags::CLIENT
                 | flags::INITIAL
@@ -316,6 +331,7 @@ impl HdbEntry {
         HdbEntry {
             principal,
             keys: Vec::new(),
+            nt_hash: None,
             kvno: 0,
             flags: flags::SERVER,
             valid_start: None,
@@ -338,6 +354,7 @@ impl HdbEntry {
         HdbEntry {
             principal: Principal::krbtgt(realm),
             keys: Vec::new(),
+            nt_hash: None,
             kvno: 0,
             flags: flags::SERVER | flags::FORWARDABLE | flags::PROXIABLE | flags::RENEWABLE,
             valid_start: None,
@@ -416,7 +433,42 @@ impl HdbEntry {
         // Through `add_key`, so that the entry's version cannot stay behind the
         // key it just gained.
         self.add_key(key, kvno, Some(salt));
+        self.derive_nt_hash(password);
         Ok(())
+    }
+
+    /// Records the account's NT hash from the password it was just given.
+    ///
+    /// `NTOWFv1` is `MD4` over the password's **UTF-16LE** octets, so it can only be taken from text.
+    /// A password that is not valid UTF-8 has no canonical UTF-16 encoding — and a caller that has
+    /// the octets already (a machine account's password is 120 random octets sent as UTF-16LE, which
+    /// are not UTF-8 by construction) must use [`HdbEntry::set_nt_hash`] with
+    /// `rrl_crypto::nt::hash`. This leaves the hash untouched in that case rather than hashing a
+    /// spelling nobody sent: a wrong hash is worse than an absent one, because an absent one makes a
+    /// secure channel fail loudly at the first attempt while a wrong one fails somewhere else.
+    fn derive_nt_hash(&mut self, password: &[u8]) {
+        if let Ok(text) = std::str::from_utf8(password) {
+            self.nt_hash = Some(rrl_crypto::nt::hash_password(text));
+        }
+    }
+
+    /// Sets the NT hash explicitly, for a caller holding the password's UTF-16LE octets.
+    ///
+    /// The octets are hashed here rather than trusted from the caller so that the one place that
+    /// knows what an NT hash is over stays the one place: `rrl_crypto::nt::hash` refuses an odd
+    /// number of octets, which is not a password anyone encoded as UTF-16.
+    pub fn set_nt_hash_utf16(&mut self, utf16: &[u8]) -> Result<()> {
+        self.nt_hash = Some(rrl_crypto::nt::hash(utf16)?);
+        Ok(())
+    }
+
+    /// Sets the NT hash from sixteen octets a caller already has — a directory migration, or a
+    /// record read back from a store.
+    ///
+    /// Sixteen is the only length an `NTOWFv1` has, so a different one is a defect in the caller
+    /// rather than something to truncate.
+    pub fn set_nt_hash(&mut self, hash: [u8; 16]) {
+        self.nt_hash = Some(hash);
     }
 
     /// Adds a raw key at `kvno` — what a keytab import does.
@@ -475,6 +527,9 @@ impl HdbEntry {
             let key = cipher.s2k(enctype, password, &salt, None)?;
             updated.add_key(key, next, Some(salt));
         }
+        // The hash follows the password: a rotation that left the old hash behind would leave an
+        // NTLM logon working with the password the operator just changed.
+        updated.derive_nt_hash(password);
         Ok(updated)
     }
 }
@@ -863,6 +918,91 @@ mod tests {
         assert_eq!(e.kvno(), 2);
         assert_eq!(e.enctypes(), vec![Enctype::Aes256Sha1, Enctype::Aes128Sha1]);
         assert!(e.key_for(Enctype::Aes256Sha384).is_none());
+    }
+
+    /// A password set through `add_password_key` records the NT hash, and it is the published value
+    /// for that password — `MD4(UTF-16LE("Password"))` from MS-NLMP 3.3.1.
+    ///
+    /// Recorded here rather than only in `rrl_crypto::nt`: what this test pins is that the entry
+    /// takes the hash from the password it was given, at the moment it is given, because there is no
+    /// later moment — the cleartext is gone once the keys exist.
+    #[test]
+    fn setting_a_password_records_its_nt_hash() {
+        let mut entry = HdbEntry::user(Principal::parse("alice@EXAMPLE.COM").unwrap());
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"Password", 1)
+            .expect("a key");
+        assert_eq!(
+            entry.nt_hash,
+            Some([
+                0xa4, 0xf4, 0x9c, 0x40, 0x65, 0x10, 0xbd, 0xca, 0xb6, 0x82, 0x4e, 0xe7, 0xc3, 0x0f,
+                0xd8, 0x52
+            ]),
+            "the NT hash of \"Password\", from MS-NLMP 3.3.1"
+        );
+    }
+
+    /// A password that is not text leaves the hash alone rather than hashing something nobody sent.
+    ///
+    /// `NTOWFv1` is defined over UTF-16LE, so octets that are not UTF-8 have no canonical UTF-16
+    /// form. A caller in that position — a machine account, whose password is 120 random octets — has
+    /// the UTF-16LE octets already and calls `set_nt_hash_utf16`.
+    #[test]
+    fn a_password_that_is_not_utf8_leaves_the_hash_unset() {
+        let mut entry = HdbEntry::user(Principal::parse("MACHINE$@EXAMPLE.COM").unwrap());
+        let random = [0xffu8, 0xfe, 0x00, 0x80, 0x9f];
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, &random, 1)
+            .expect("the keys are still derived: s2k takes octets");
+        assert_eq!(entry.nt_hash, None, "no hash rather than a hash of a guess");
+
+        // And the caller who has the UTF-16LE octets can set it, computed by the one place that
+        // knows what an NT hash is taken over.
+        let utf16: Vec<u8> = "Password"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        entry.set_nt_hash_utf16(&utf16).expect("even octets");
+        assert_eq!(
+            entry.nt_hash.map(|h| h[0]),
+            Some(0xa4),
+            "the hash of \"Password\""
+        );
+    }
+
+    /// A rotation moves the hash with the password.
+    ///
+    /// Leaving the old hash behind would keep an NTLM logon working with the password the operator
+    /// just changed — the one thing a password change is supposed to stop.
+    #[test]
+    fn a_rotation_replaces_the_nt_hash() {
+        let mut entry = HdbEntry::user(Principal::parse("alice@EXAMPLE.COM").unwrap());
+        entry
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"first", 1)
+            .expect("a key");
+        let first = entry.nt_hash.expect("recorded");
+        let rotated = entry.rekey(&OwnCipher, b"second").expect("a rotation");
+        let second = rotated.nt_hash.expect("recorded");
+        assert_ne!(first, second, "a new password is a new hash");
+        assert_eq!(
+            second,
+            rrl_crypto::nt::hash_password("second"),
+            "and it is the hash of the new password"
+        );
+        assert_eq!(rotated.kvno(), 2, "at the new version");
+    }
+
+    /// An odd number of UTF-16 octets is refused, because it is not a password anybody encoded that
+    /// way — and hashing it would produce a value no client computes.
+    #[test]
+    fn an_odd_number_of_utf16_octets_is_refused() {
+        let mut entry = HdbEntry::user(Principal::parse("alice@EXAMPLE.COM").unwrap());
+        let err = entry
+            .set_nt_hash_utf16(b"odd")
+            .expect_err("three octets is not a UTF-16LE password")
+            .to_string();
+        assert!(err.contains("UTF-16"), "{err}");
+        assert_eq!(entry.nt_hash, None, "and nothing was recorded");
     }
 
     #[test]

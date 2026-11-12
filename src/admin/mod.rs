@@ -249,6 +249,9 @@ impl Admin {
         let mut entry = HdbEntry {
             principal: principal.clone(),
             keys: Vec::new(),
+            // A principal created here has no password yet, so there is no hash to record: `None`
+            // is "not derived", not "no hash".
+            nt_hash: None,
             kvno: 0,
             flags: new.role.flags()
                 | entry_flags::INITIAL

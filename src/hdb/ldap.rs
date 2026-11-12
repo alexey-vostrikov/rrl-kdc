@@ -102,6 +102,15 @@ pub mod attrs {
     /// structure. Written here as a projection of `krb5Key`, never read: see
     /// [`crate::hdb::ad_blob`].
     pub const AD_SUPPLEMENTAL_CREDENTIALS: &str = "supplementalCredentials";
+
+    /// The account's NT hash, in the attribute Samba writes it to.
+    ///
+    /// `sambaNTPassword` and not `unicodePwd`: `unicodePwd` holds the same secret but only ever
+    /// accepts a cleartext password over an encrypted channel, so a directory cannot be given a
+    /// hash through it. Samba's attribute is the one an estate actually keeps, thirty-two
+    /// hexadecimal digits in **upper** case, and it is what a domain migration or an NTLM logon
+    /// reads.
+    pub const SAMBA_NT_PASSWORD: &str = "sambaNTPassword";
 }
 
 /// `userAccountControl` bits ([MS-ADTS] 2.2.9), the ones that describe a Kerberos
@@ -354,6 +363,12 @@ pub fn to_attributes_with(
             crate::hdb::ad_blob::supplemental_credentials(entry),
         );
     }
+    // The NT hash, in the spelling Samba writes and reads: thirty-two hexadecimal digits, upper
+    // case. Absent when the entry has none — a hash invented to fill the attribute would be a hash
+    // no logon ever matches, which is worse than an attribute a reader finds missing.
+    if let Some(nt_hash) = &entry.nt_hash {
+        out.set(attrs::SAMBA_NT_PASSWORD, nt_hash_hex(nt_hash).into_bytes());
+    }
 
     for class in OBJECT_CLASSES {
         out.add("objectClass", class.as_bytes());
@@ -478,9 +493,19 @@ pub fn from_attributes_with(
     // entry whose keys are newer than its attribute is caught above rather than
     // silently preferred.
     let kvno = declared_kvno.unwrap_or_else(|| keys.iter().map(|k| k.kvno).max().unwrap_or(0));
+    // The NT hash is read as Samba wrote it. It is **not** a Kerberos key and it is not sealed by
+    // this backend: the attribute exists for tools that expect to find a plaintext hash there, and
+    // sealing it would make it unreadable to exactly those tools. A deployment that cannot keep a
+    // password-equivalent secret in its directory must not write the attribute at all — which is a
+    // policy, so it is stated here rather than decided silently.
+    let nt_hash = match attributes.text(attrs::SAMBA_NT_PASSWORD, &name)? {
+        Some(text) => Some(nt_hash_from_hex(&name, text.trim())?),
+        None => None,
+    };
     Ok(HdbEntry {
         principal,
         keys,
+        nt_hash,
         kvno,
         flags,
         // A directory has no column for Heimdal's HDB extensions, and inventing one would put
@@ -1153,6 +1178,47 @@ pub struct LdapHdb {
     cipher: Arc<dyn crate::crypto::Cipher>,
 }
 
+/// The NT hash as Samba spells it: thirty-two hexadecimal digits, **upper** case.
+fn nt_hash_hex(hash: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in hash {
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out
+}
+
+/// The inverse, refusing anything that is not exactly sixteen octets of hexadecimal.
+///
+/// Strict on purpose: the attribute holds a password-equivalent secret, and a value that is
+/// truncated, padded or shorter than sixteen octets is a value no logon matches. Reporting it beats
+/// storing a hash that will fail somewhere else.
+fn nt_hash_from_hex(name: &str, text: &str) -> Result<[u8; 16]> {
+    let bad = |why: &str| {
+        Error::Hdb(format!(
+            "{name}: {} holds {why}; a hexadecimal NT hash is 32 digits",
+            attrs::SAMBA_NT_PASSWORD
+        ))
+    };
+    if text.len() != 32 {
+        return Err(bad(&format!("{} characters", text.len())));
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let digit = |b: u8| match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        };
+        let (hi, lo) = (digit(pair[0]), digit(pair[1]));
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => out[i] = hi << 4 | lo,
+            _ => return Err(bad("a character that is not a hexadecimal digit")),
+        }
+    }
+    Ok(out)
+}
+
 impl LdapHdb {
     /// An `HDB` over `directory`.
     pub fn new(directory: Arc<dyn Directory>) -> Self {
@@ -1417,6 +1483,73 @@ mod tests {
             .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 1)
             .unwrap();
         entry
+    }
+
+    /// The NT hash travels as Samba writes it — thirty-two upper-case hexadecimal digits — and comes
+    /// back as the same sixteen octets.
+    ///
+    /// Upper case matters: Samba writes it that way, and a comparison an operator makes between a
+    /// directory and a `secretsdump` line is a text comparison. Lower case would parse equally well
+    /// and would disagree with every other tool in sight.
+    #[test]
+    fn the_nt_hash_is_written_as_samba_spells_it() {
+        let entry = entry();
+        let hash = entry.nt_hash.expect("recorded from the password");
+        let attributes = to_attributes(&entry);
+        let written = attributes
+            .first(attrs::SAMBA_NT_PASSWORD)
+            .expect("the attribute is present");
+        assert_eq!(written.len(), 32, "thirty-two hexadecimal digits");
+        assert_eq!(
+            std::str::from_utf8(written).unwrap(),
+            "8CC19B6A8CFEAC299C2871C86B38DE28",
+            "\"pw\" as Samba writes it: MD4 of its UTF-16LE octets, upper case. \
+             Checkable with printf 'pw' | iconv -f utf-8 -t utf-16le | openssl dgst -md4 -provider legacy"
+        );
+        assert!(
+            written
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b)),
+            "and every digit is upper case"
+        );
+
+        // Read back, it is the same sixteen octets.
+        let back = from_attributes(&attributes).expect("reads");
+        assert_eq!(back.nt_hash, Some(hash));
+    }
+
+    /// A value that is not thirty-two hexadecimal digits is refused with the attribute's name,
+    /// rather than stored as a hash that will fail at the first logon.
+    #[test]
+    fn a_malformed_nt_hash_is_refused() {
+        for bad in [
+            "",
+            "abc",
+            &"A".repeat(31),
+            &"A".repeat(33),
+            &format!("{}Z", "A".repeat(31)),
+        ] {
+            let mut attributes = to_attributes(&entry());
+            attributes.set(attrs::SAMBA_NT_PASSWORD, bad.as_bytes().to_vec());
+            let err = from_attributes(&attributes)
+                .expect_err("a malformed hash must not read")
+                .to_string();
+            assert!(
+                err.contains(attrs::SAMBA_NT_PASSWORD),
+                "the message must name the attribute: {err}"
+            );
+        }
+    }
+
+    /// An entry with no hash writes no attribute: an invented hash is one no logon ever matches, and
+    /// a reader that finds the attribute missing learns something true.
+    #[test]
+    fn an_entry_without_a_hash_writes_no_attribute() {
+        let mut entry = entry();
+        entry.nt_hash = None;
+        let attributes = to_attributes(&entry);
+        assert!(!attributes.has(attrs::SAMBA_NT_PASSWORD));
+        assert_eq!(from_attributes(&attributes).unwrap().nt_hash, None);
     }
 
     /// A sealed directory value: no key in the clear, and the entry reads back with its key.

@@ -138,6 +138,8 @@ fn main() {
     let mut machine_entry = HdbEntry {
         principal: machine_principal.clone(),
         keys: Vec::new(),
+        // Filled by `add_password_key` below, from the machine password this stand generated.
+        nt_hash: None,
         kvno: 0,
         flags: rrl_kdc::hdb::flags::SERVER
             | rrl_kdc::hdb::flags::CLIENT

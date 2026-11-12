@@ -102,6 +102,11 @@ impl AcceptorContext {
             crate::crypto::Enctype::Aes128Sha1 | crate::crypto::Enctype::Aes256Sha1 => 12,
             crate::crypto::Enctype::Aes128Sha256 => 16,
             crate::crypto::Enctype::Aes256Sha384 => 24,
+            // RFC 4121 §7 lists no RC4-HMAC: `kadmin` over RPCSEC_GSS is AES in every real
+            // deployment, and inventing a 16-octet tag for an enctype the RFC does not cover would
+            // produce tokens no peer accepts. The caller refuses before this point (a key of that
+            // enctype does not reach a context), so the number is unreachable rather than wrong.
+            crate::crypto::Enctype::Rc4Hmac => 0,
         }
     }
 

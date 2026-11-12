@@ -23,10 +23,13 @@ pub mod ad_blob;
 pub mod keytab;
 #[cfg(feature = "hdb-ldap")]
 pub mod ldap;
+pub mod mkey;
 pub mod policy;
 pub mod record;
+// Heimdal's `HDB_entry` DER: what a propagation carries, and what a slave stores.
 #[cfg(feature = "hdb-redb")]
 pub mod redb_store;
+pub mod value;
 
 pub use keytab::Keytab;
 #[cfg(feature = "hdb-ldap")]

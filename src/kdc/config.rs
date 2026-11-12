@@ -996,7 +996,10 @@ mod tests {
         assert!(c.apply("require-preauth", "maybe").is_err());
         assert!(c.apply("max_life", "0").is_err());
         assert!(c.apply("max_life", "-5").is_err());
-        assert!(c.apply("allowed_enctypes", "rc4-hmac").is_err());
+        // `rc4-hmac` is a real enctype now, so it parses — and `des3-cbc-sha1` is still not
+        // implemented, which is what the strict parse exists to say.
+        assert!(c.apply("allowed_enctypes", "des3-cbc-sha1").is_err());
+        assert!(c.apply("allowed_enctypes", "rc4-hmac").is_ok());
         assert!(c.apply("clockskew", "soon").is_err());
     }
 }

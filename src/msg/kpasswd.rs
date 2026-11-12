@@ -143,6 +143,12 @@ pub struct EncKrbPrivPart {
     /// `s-address`: where the sender says it is. A server that checked this
     /// would be checking a claim, not a fact; it is echoed for the reply.
     pub s_address: Option<HostAddress>,
+    /// `r-address`: where the sender believes the receiver is.
+    ///
+    /// Compared against the receiver's own address where the receiver knows it (hprop compares it
+    /// with the socket's local address): a message addressed to another host is one that reached
+    /// the wrong place, and using it there would be acting on somebody else's traffic.
+    pub r_address: Option<HostAddress>,
 }
 
 impl EncKrbPrivPart {
@@ -160,6 +166,9 @@ impl EncKrbPrivPart {
         }
         if let Some(addr) = &self.s_address {
             parts.push(der::field(4, addr.encode()));
+        }
+        if let Some(addr) = &self.r_address {
+            parts.push(der::field(5, addr.encode()));
         }
         der::cons(der::app(ENC_KRB_PRIV_PART), &[der::seq(&parts)])
     }
@@ -189,6 +198,15 @@ impl EncKrbPrivPart {
                     )?)
                 }
             },
+            r_address: match f.opt_bytes(5) {
+                None => None,
+                Some(_) => {
+                    let mut r = Reader::new(f.bytes(5, "EncKrbPrivPart")?);
+                    Some(HostAddress::decode_content(
+                        r.expect_in("EncKrbPrivPart", der::SEQUENCE)?,
+                    )?)
+                }
+            },
         })
     }
 }
@@ -207,6 +225,7 @@ pub fn seal_krb_priv(
         usec: Some(0),
         seq_number: seq,
         s_address: None,
+        r_address: None,
     };
     let enc = EncryptedData::seal(cipher, key, usage::KRB_PRIV_ENCPART, None, &part.encode())?;
     Ok(der::cons(
@@ -217,6 +236,37 @@ pub fn seal_krb_priv(
             der::field(3, enc.encode()),
         ])],
     ))
+}
+
+/// Opens a `KRB-PRIV` in `key` and returns the whole part.
+///
+/// The part and not just its `user-data`, because the fields around it are the freshness argument:
+/// `timestamp` is what stops a captured message being replayed, and `s_address`/`r_address` are what
+/// stops one from being used somewhere it was not sent. A caller that only wants the payload uses
+/// [`open_krb_priv`], which is this with the fields dropped.
+pub fn open_krb_priv_part(
+    cipher: &dyn crate::crypto::Cipher,
+    key: &Key,
+    message: &[u8],
+) -> Result<EncKrbPrivPart> {
+    let f = Fields::parse_app("KRB-PRIV", KRB_PRIV, message)?;
+    let msg_type = f.int(1, "KRB-PRIV")?;
+    if msg_type != KRB_PRIV as i64 {
+        return Err(Error::Protocol(format!(
+            "KRB-PRIV msg-type is {msg_type}, expected {KRB_PRIV}"
+        )));
+    }
+    let mut r = Reader::new(f.bytes(3, "KRB-PRIV")?);
+    let enc = EncryptedData::decode_content(
+        "KRB-PRIV.enc-part",
+        r.expect_in("KRB-PRIV", der::SEQUENCE)?,
+    )?;
+    let plain = cipher
+        .decrypt(key, usage::KRB_PRIV_ENCPART, &enc.cipher)
+        .map_err(|_| {
+            Error::Protocol("the KRB-PRIV does not decrypt in the key it was sealed with".into())
+        })?;
+    EncKrbPrivPart::decode(&plain)
 }
 
 /// Opens a `KRB-PRIV` in `key` and returns its `user-data` and sequence number.

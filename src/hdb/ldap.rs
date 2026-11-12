@@ -640,6 +640,11 @@ pub fn enctypes_to_ad_bits(etypes: &[Enctype]) -> u32 {
             Enctype::Aes256Sha1 => etype_bits::AES256_SHA1,
             Enctype::Aes128Sha256 => etype_bits::AES128_SHA2,
             Enctype::Aes256Sha384 => etype_bits::AES256_SHA2,
+            // Nothing, deliberately. The bit exists in MS-KILE, and setting it would tell a domain
+            // controller this account is issued RC4 — a claim this KDC does not make unless the
+            // realm lists the enctype, and one that no client should negotiate from a mask. The
+            // comment above the function says exactly this; the arm makes it true.
+            Enctype::Rc4Hmac => 0,
         };
     }
     bits

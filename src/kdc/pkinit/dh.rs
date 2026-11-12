@@ -316,6 +316,10 @@ pub fn key_len(enctype: crate::crypto::Enctype) -> usize {
     match enctype {
         Aes128Sha1 | Aes128Sha256 => 16,
         Aes256Sha1 | Aes256Sha384 => 32,
+        // RFC 4556 §3.2.3.1 derives the reply key from the exchange as an RFC 3961 key, and RC4-HMAC
+        // has no place in it: a PKINIT login never negotiates this enctype, so the arm exists only so
+        // that adding it to the enum is a decision here rather than a compile error somewhere else.
+        Rc4Hmac => 16,
     }
 }
 

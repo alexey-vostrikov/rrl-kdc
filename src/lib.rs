@@ -48,6 +48,7 @@ pub mod address;
 pub mod admin;
 /// The principal database, shaped after Heimdal's `lib/hdb/hdb.asn1`.
 pub mod hdb;
+pub mod hprop;
 /// `kadmind`: MIT's kadm5 RPC protocol, for a stock `kadmin` client.
 #[cfg(feature = "kadmin")]
 pub mod kadmin;

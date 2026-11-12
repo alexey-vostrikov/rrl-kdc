@@ -147,6 +147,15 @@ pub enum Error {
     /// The database could not be read or written.
     Hdb(String),
 
+    #[error("hprop: {0}")]
+    /// A database propagation was refused or broke: a version the peer does not speak, an entry
+    /// that will not decode, a stream that ended before its commit.
+    ///
+    /// Its own variant rather than [`Error::Protocol`]: a propagation's failures are between two
+    /// KDCs, not between a client and this one, and the two are logged and answered differently —
+    /// there is no ticket being asked for and no `KDC_ERR_*` to return.
+    Hprop(String),
+
     #[error("password policy: {0}")]
     /// The password breaks a rule of the policy its principal is under.
     PasswordPolicy(#[from] crate::hdb::policy::Breach),
@@ -311,7 +320,9 @@ impl Error {
             Error::Preauth { code, .. } => *code,
             Error::PreauthFailed(_) => KDC_ERR_PREAUTH_FAILED,
             Error::Skew { .. } => KRB_AP_ERR_SKEW,
-            Error::Hdb(_) | Error::Config(_) | Error::Io(_) => KDC_ERR_SVC_UNAVAILABLE,
+            Error::Hdb(_) | Error::Config(_) | Error::Io(_) | Error::Hprop(_) => {
+                KDC_ERR_SVC_UNAVAILABLE
+            }
         }
     }
 
@@ -321,6 +332,7 @@ impl Error {
         !matches!(
             self,
             Error::Hdb(_)
+                | Error::Hprop(_)
                 | Error::Config(_)
                 | Error::Io(_)
                 | Error::Crypto(_)
@@ -360,6 +372,10 @@ impl Error {
             // Its own kind, and not "forbidden": the caller may change the password and try
             // again, which is a different answer from "you are not allowed".
             Error::PasswordPolicy(_) => "password_policy",
+            // A propagation's failures have their own vocabulary: the peer is another KDC, not a
+            // client, and "the database could not be installed" is not an answer to a ticket
+            // request.
+            Error::Hprop(_) => "hprop",
             Error::Preauth { .. } | Error::PreauthFailed(_) => "preauth",
             Error::Kdc { .. } => "policy",
             Error::Skew { .. } => "clock_skew",

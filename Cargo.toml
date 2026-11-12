@@ -138,6 +138,12 @@ required-features = ["hdb-ldap"]
 name = "pkinit-fixture"
 required-features = ["pkinit"]
 
+# The hprop stand writes a redb database, because what it demonstrates is a propagation being
+# installed into a file — the arrangement a slave actually runs.
+[[example]]
+name = "hprop-stand"
+required-features = ["hdb-redb"]
+
 [[example]]
 name = "pkinit-reply"
 required-features = ["pkinit"]

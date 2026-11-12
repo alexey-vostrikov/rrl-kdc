@@ -530,6 +530,9 @@ pub fn ad_enctype_name(enctype: Enctype) -> &'static str {
         Enctype::Aes256Sha1 => "aes256-cts-hmac-sha1-96",
         Enctype::Aes128Sha256 => "aes128-cts-hmac-sha256-128",
         Enctype::Aes256Sha384 => "aes256-cts-hmac-sha384-192",
+        // AD calls it `RC4_HMAC_MD5`, and the name is the whole point of this function: a log line
+        // that says `rc4-hmac` beats one that says `23`.
+        Enctype::Rc4Hmac => "rc4-hmac",
     }
 }
 
@@ -825,8 +828,11 @@ mod tests {
         let value_at = 118 + name_len;
         // Enctype is at +12 of the key entry.
         let at = value_at + 2 * (CREDENTIAL_HEADER + 12);
-        blob[at..at + 8].copy_from_slice(b"17000000");
-        assert_eq!(credentials(&blob), Err(AdBlobError::UnknownEnctype(23)));
+        // `17000000` is `des3-cbc-sha1` (16) — deliberately a number this crate does not implement.
+        // It used to be 23, and 23 is `rc4-hmac`, which is implemented now: the test would have
+        // started asserting that a supported enctype is refused.
+        blob[at..at + 8].copy_from_slice(b"10000000");
+        assert_eq!(credentials(&blob), Err(AdBlobError::UnknownEnctype(16)));
     }
 
     #[test]

@@ -150,10 +150,19 @@ fn the_enctype_list_is_parsed_by_name_and_by_number() {
         &[Enctype::Aes256Sha1, Enctype::Aes256Sha384]
     );
 
-    // An enctype this KDC does not implement is refused at startup, not ignored:
-    // a realm that quietly drops aes256 for rc4 is a realm that issues rc4.
-    let err = set("allowed-enctypes", "rc4-hmac").unwrap_err().to_string();
-    assert!(err.contains("rc4"), "{err}");
+    // An enctype this KDC does not implement is refused at startup, not ignored. RC4 used to be the
+    // example here; it is implemented now, so the example is `des3-cbc-sha1` — the point of the
+    // strict parse is unchanged, and a realm that quietly dropped a name it did not know would be a
+    // realm that issues something nobody asked for.
+    let err = set("allowed-enctypes", "des3-cbc-sha1")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("des3"), "{err}");
+
+    // RC4 parses, because a realm may have to accept a key or a ticket that carries it. It is not a
+    // default and never appears in `Enctype::ALL`, so a realm that wants it has to say so.
+    let config = set("allowed-enctypes", "rc4-hmac").expect("a listed enctype");
+    assert_eq!(config.allowed_enctypes(), &[Enctype::Rc4Hmac]);
 }
 
 #[test]

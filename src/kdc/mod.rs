@@ -22,6 +22,7 @@
 //! behaviour cannot be pinned to an instant cannot be tested, and every check in
 //! here — ticket lifetimes, clock skew, expiry — is about an instant.
 
+pub mod ap_req;
 pub mod config;
 
 mod as_exchange;

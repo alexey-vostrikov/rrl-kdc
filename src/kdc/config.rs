@@ -134,6 +134,16 @@ pub struct KdcConfig {
     /// changes it here; what matters is that it is *a* name, because a ticket for any service must
     /// not be tradeable for a certificate.
     kx509_service: String,
+    /// `enable-gss-preauth`: whether GSS tokens are accepted as pre-authentication.
+    ///
+    /// Off by default, like every mechanism that is a way *in*: a realm that has not decided about
+    /// GSS has not decided to accept it.
+    enable_gss_preauth: bool,
+    /// `gss-mechanisms-allowed`: the mechanism OIDs a client may name. Empty means every one the
+    /// realm's acceptor knows.
+    gss_mechanisms_allowed: Vec<String>,
+    /// `gss-cross-realm-mechanisms-allowed`: whether a token issued in another realm may be used.
+    gss_cross_realm_mechanisms_allowed: bool,
     /// How long a kx509 certificate lives.
     ///
     /// A day by default: short enough that a revoked ticket stops mattering, long enough that a
@@ -184,6 +194,9 @@ impl KdcConfig {
             pkinit_dh_min_bits: 2048,
             pkinit_max_life: None,
             pkinit_principal_in_certificate: true,
+            enable_gss_preauth: false,
+            gss_mechanisms_allowed: Vec::new(),
+            gss_cross_realm_mechanisms_allowed: false,
             kx509_service: "kx509".to_owned(),
             kx509_max_life: 86_400,
             addresses: crate::address::AddressPolicy::default(),
@@ -358,6 +371,21 @@ impl KdcConfig {
     /// `max-kdc-datagram-reply-length`: the largest reply this KDC sends over UDP.
     pub fn max_datagram_reply_length(&self) -> usize {
         self.max_datagram_reply_length
+    }
+
+    /// Whether GSS pre-authentication is offered.
+    pub fn enable_gss_preauth(&self) -> bool {
+        self.enable_gss_preauth
+    }
+
+    /// The GSS mechanisms a client may name; empty means the acceptor decides.
+    pub fn gss_mechanisms_allowed(&self) -> &[String] {
+        &self.gss_mechanisms_allowed
+    }
+
+    /// Whether a mechanism from another realm may be used.
+    pub fn gss_cross_realm_mechanisms_allowed(&self) -> bool {
+        self.gss_cross_realm_mechanisms_allowed
     }
 
     /// The first component a kx509 service ticket must name.
@@ -584,6 +612,39 @@ impl KdcConfig {
                 self.pkinit_principal_in_certificate = parse_bool(value)?;
                 Ok(())
             }
+            "enable_gss_preauth" | "enable-gss-preauth" => {
+                self.enable_gss_preauth = parse_bool(value)?;
+                Ok(())
+            }
+            "gss_mechanisms_allowed" | "gss-mechanisms-allowed" => {
+                // A comma-separated list of OIDs. Each has to look like one: a name in this list
+                // would match no token, and the realm would think it had allowed something.
+                let mut allowed = Vec::new();
+                for part in value.split(',') {
+                    let oid = part.trim();
+                    if oid.is_empty() {
+                        continue;
+                    }
+                    if !oid.split('.').all(|p| p.parse::<u64>().is_ok()) {
+                        return Err(Error::Config(format!(
+                            "option {name}: {oid:?} is not an OID"
+                        )));
+                    }
+                    allowed.push(oid.to_owned());
+                }
+                if allowed.is_empty() {
+                    return Err(Error::Config(format!(
+                        "option {name}: an empty list reads as \"no mechanisms\", and the way to \
+                         turn the mechanism off is enable-gss-preauth"
+                    )));
+                }
+                self.gss_mechanisms_allowed = allowed;
+                Ok(())
+            }
+            "gss_cross_realm_mechanisms_allowed" | "gss-cross-realm-mechanisms-allowed" => {
+                self.gss_cross_realm_mechanisms_allowed = parse_bool(value)?;
+                Ok(())
+            }
             "kx509_service" | "kx509-service" => {
                 let name = value.trim();
                 // A principal component: no slash (that would be two), no `@` (that would be a
@@ -731,6 +792,53 @@ mod tests {
         assert!(err.contains("not implemented"), "{err}");
         assert!(c.apply("enable-pkinit", "true").is_err());
         assert!(c.apply("enable_fast", "true").is_err());
+    }
+
+    /// The GSS pre-authentication options: off by default, a list of OIDs, and the cross-realm switch.
+    #[test]
+    fn the_gss_options_are_off_by_default_and_the_list_is_a_list_of_oids() {
+        let mut c = KdcConfig::new("R").unwrap();
+        assert!(
+            !c.enable_gss_preauth(),
+            "a way in is not on until a realm says so"
+        );
+        assert!(
+            c.gss_mechanisms_allowed().is_empty(),
+            "empty means the acceptor decides"
+        );
+        assert!(!c.gss_cross_realm_mechanisms_allowed());
+
+        c.apply("enable_gss_preauth", "true").unwrap();
+        assert!(c.enable_gss_preauth());
+        c.apply("enable-gss-preauth", "false").unwrap();
+        assert!(!c.enable_gss_preauth());
+
+        c.apply(
+            "gss_mechanisms_allowed",
+            "1.2.840.113554.1.2.2, 1.3.6.1.5.2.5",
+        )
+        .unwrap();
+        assert_eq!(
+            c.gss_mechanisms_allowed(),
+            &[
+                "1.2.840.113554.1.2.2".to_string(),
+                "1.3.6.1.5.2.5".to_string()
+            ]
+        );
+
+        // A name is not an OID, and would match no token ever.
+        assert!(c.apply("gss_mechanisms_allowed", "kerberos").is_err());
+        // An empty list is refused with the alternative named: the way to turn the mechanism off is
+        // its own option.
+        let err = c
+            .apply("gss_mechanisms_allowed", " ")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enable-gss-preauth"), "{err}");
+
+        c.apply("gss_cross_realm_mechanisms_allowed", "yes")
+            .unwrap();
+        assert!(c.gss_cross_realm_mechanisms_allowed());
     }
 
     /// The PKINIT options: Heimdal's defaults, both spellings of each name, and the two ends

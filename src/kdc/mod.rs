@@ -39,6 +39,7 @@ pub mod preauth;
 mod tgs_exchange;
 
 pub mod fast;
+pub mod gss_preauth;
 /// The change-password service (RFC 3244): protocol constants, the reply a
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
 pub mod kpasswd;
@@ -339,6 +340,26 @@ impl Kdc {
             state.policy = self.config.pkinit_policy();
             state
         }))
+    }
+
+    /// The same KDC offering GSS pre-authentication, accepting tokens through `acceptor`.
+    ///
+    /// The realm's policy (`enable-gss-preauth`, `gss-mechanisms-allowed`,
+    /// `gss-cross-realm-mechanisms-allowed`) is read **here**, so this is called after the
+    /// configuration is final; a mechanism built before the options were applied would carry the
+    /// defaults and silently ignore them.
+    pub fn with_gss_preauth(mut self, acceptor: Arc<dyn gss_preauth::GssAcceptor>) -> Self {
+        let config = self.config.clone();
+        if config.enable_gss_preauth() {
+            let mechanism = gss_preauth::GssPreauth::new(
+                acceptor,
+                config.gss_mechanisms_allowed().to_vec(),
+                config.gss_cross_realm_mechanisms_allowed(),
+                config.realm(),
+            );
+            self.preauth = std::mem::take(&mut self.preauth).with(Arc::new(mechanism));
+        }
+        self
     }
 
     /// The same KDC answering kx509, with `authority` signing the certificates.

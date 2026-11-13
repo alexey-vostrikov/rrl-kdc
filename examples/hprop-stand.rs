@@ -41,6 +41,10 @@ fn main() {
         Some("hpropd") => serve_hpropd(&args[1], &args[2], &realm).expect("hpropd runs"),
         Some("dump") => dump(&args[1]).expect("the database is readable"),
         Some("mkey") => write_master_key(&args[1], &realm).expect("the master key is written"),
+        // The sending half: `push <dir> <addr>`. The ticket is minted here from the seeded realm,
+        // because a stand that had to log in first would need a Kerberos client and the point of the
+        // exercise is the propagation; a real master gets its ticket from a `kinit -k`.
+        Some("push") => push(&args[1], &args[2], &realm, &host).expect("the push runs"),
         Some("seal") => seal_probe(&args[1], &args[2]).expect("the probe runs"),
         Some("unseal") => unseal_probe(&args[1], &args[2]).expect("the probe runs"),
         _ => {
@@ -187,6 +191,73 @@ fn serve_kdc(
     }
 }
 
+/// Pushes the seeded realm into a receiver at `addr`.
+///
+/// The ticket for `hprop/HOST` is built here rather than obtained through an AS and a TGS exchange:
+/// this binary is a stand for the propagation, and a Kerberos client is the one thing it does not
+/// have. What it proves is the stream, the AP-REQ, the subkeys and the acknowledgement.
+fn push(dir: &str, addr: &str, realm: &str, host: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use rrl_kdc::hprop::push::{Pusher, ServiceTicket};
+    use rrl_kdc::msg::{EncTicketPart, EncryptedData, Ticket, tkt_flags};
+
+    let db = MemoryHdb::new();
+    for entry in entries(realm, host) {
+        db.store(entry)?;
+    }
+    let service = Principal::parse(&format!("{}/{host}@{realm}", hprop::SERVICE))?;
+    let service_key = db
+        .fetch(&service)?
+        .ok_or("the seeded realm has no hprop service")?
+        .key_for(Enctype::Aes256Sha1)
+        .ok_or("the service has no AES-256 key")?
+        .key
+        .clone();
+
+    let now = hprop::now();
+    let session_key = OwnCipher.random(Enctype::Aes256Sha1)?;
+    let part = EncTicketPart {
+        flags: tkt_flags::INITIAL | tkt_flags::PRE_AUTHENT,
+        session_key: session_key.clone(),
+        crealm: realm.to_owned(),
+        cname: Principal::parse(&format!("{CLIENT_NAME}@{realm}"))?,
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime: now - 60,
+        starttime: None,
+        endtime: now + 3600,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let ticket = ServiceTicket {
+        ticket: Ticket {
+            realm: realm.to_owned(),
+            sname: service,
+            enc: EncryptedData::seal(
+                &OwnCipher,
+                &service_key,
+                rrl_kdc::crypto::usage::KDC_REP_TICKET,
+                Some(1),
+                &part.encode(),
+            )?,
+        }
+        .encode(),
+        session_key,
+    };
+
+    let pusher = Pusher::new(
+        realm,
+        Principal::parse(&format!("{CLIENT_NAME}@{realm}"))?,
+        std::sync::Arc::new(OwnCipher),
+    );
+    let summary = pusher.push_to(addr, &db, &ticket, now)?;
+    println!("pushed {} entries to {addr}", summary.entries);
+    // The directory is written to by `seed`; `push` reads the same seeded realm and needs nothing
+    // from it, but the argument stays so that both commands are called the same way.
+    let _ = dir;
+    Ok(())
+}
+
 fn serve_hpropd(db_path: &str, addr: &str, realm: &str) -> Result<(), Box<dyn std::error::Error>> {
     // The receiver authenticates the master with the same keys the master's own database holds, so
     // it seeds itself with the two principals rather than taking a keytab: a slave that cannot find
@@ -247,7 +318,17 @@ fn serve_hpropd(db_path: &str, addr: &str, realm: &str) -> Result<(), Box<dyn st
 }
 
 fn dump(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let db = rrl_kdc::hdb::redb_store::RedbHdb::open(path)?;
+    // A slave that was given a master key holds sealed records, and reading them without one is a
+    // refusal by design (`a 60-octet key ... is sealed under master key 1`). `HPROR_MKEY` is the same
+    // variable `hpropd` was told, so a dump of a sealed database takes the same argument.
+    let db = match std::env::var("HPROR_MKEY") {
+        Ok(keys) => rrl_kdc::hdb::redb_store::RedbHdb::open_sealed(
+            path,
+            rrl_kdc::hdb::mkey::MasterKeys::from_keytab(&keys)?,
+            std::sync::Arc::new(OwnCipher),
+        )?,
+        Err(_) => rrl_kdc::hdb::redb_store::RedbHdb::open(path)?,
+    };
     let mut count = 0;
     let mut next = db.first()?;
     while let Some(principal) = next {

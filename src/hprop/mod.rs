@@ -40,6 +40,7 @@ use crate::kdc::ap_req;
 use crate::msg::kpasswd::{open_krb_priv_part, seal_krb_priv};
 use crate::name::Principal;
 
+pub mod push;
 pub mod replica;
 pub mod sendauth;
 

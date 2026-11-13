@@ -73,8 +73,10 @@
 //! `Packages` it requires `Primary:Kerberos` too (`"Primary:Kerberos missing"`, with a comment that
 //! Windows 2008 R2 reboots on a password change without it). impacket, dissect, mimikatz and
 //! `secretsdump` read it, and AD itself would read it, so the projection is valid but incomplete for
-//! Samba. Closing that gap means implementing DES string-to-key, which is weak cryptography kept
-//! only for compatibility — a decision, not an oversight.
+//! Samba. Closing that gap would mean implementing DES string-to-key, which is weak cryptography
+//! kept only for compatibility, and that decision has been taken the other way: **DES is not
+//! implemented, and this property will not be written**. A realm that must feed Samba should not
+//! use this projection rather than get a structure that parses and lies.
 //!
 //! # Verified against somebody else's parser
 //!

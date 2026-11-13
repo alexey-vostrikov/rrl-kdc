@@ -171,18 +171,41 @@ that does not move reads as a claim about the code:
   **`PA-REQ-ENC-PA-REP`** (RFC 6806 §11), **SPAKE** (RFC 9588, `edwards25519`) and
   **OTP** (RFC 6560, FAST OTP).
 
-Outside the intent: the Heimdal CA and its issuance protocols (`kdc/ca.c`, `kx509.c`,
-`bx509.c`, `httpkadmind`), JWT and token validators, `mit_dump`, and `announce`. These serve
-"Kerberos as a certificate authority", which is not what this crate is for. Of the seven,
-only two are worth revisiting: **PKINIT key transport** and **PKINIT with elliptic curves**
-(`lib/krb5/pkinit-ec.c`) are refused today by name, and a client is entitled to ask for
-either.
+Outside the intent: `bx509d`, `httpkadmind`, JWT and token validators, and `announce`. These
+serve "Kerberos as a certificate authority over HTTP", which is not what this crate is for.
+`kdc/ca.c` and `kx509.c` are **in**: a certificate for a ticket is a login method, and it is
+done (`kdc::ca`, `kdc::kx509`).
+
+## Decisions taken, so that nobody reopens them by accident
+
+Three things were on the gap list and are now **closed as deprecated** rather than pending. Each
+says why, because "not done" and "decided against" look identical in a table and only one of them
+needs revisiting.
+
+* **`mit_dump`** (loading an MIT KDC's dump into the HDB) — decided against. Migration from MIT
+  is a one-off, and a dump format is a private MIT layout with no specification to hold it: the
+  code that would read it could be broken by any MIT release and nobody would file a bug against
+  this crate, they would file it against their migration. A migration is better served by
+  `kadmin addprinc`/`ktadd` over the wire, which both implementations already speak.
+* **DES, and with it `Primary:Kerberos` in `supplementalCredentials`** — decided against. The
+  1987 enctypes are weak by construction, and every deployment that matters has AES. Writing
+  `Primary:Kerberos` would require DES string-to-key purely to fill a structure defined as two
+  DES keys (§2.2.10.4), and the cost is stated where it belongs: the projection is valid for
+  impacket, dissect, mimikatz and AD, and **Samba refuses it** without that property. A realm
+  that must feed Samba should not use this projection.
+* **An OTLP exporter** — not here. `kdc::audit` defines the seam (`AuditDriver`, plus
+  `Record::attributes`/`severity_number` mapped to the OpenTelemetry semantic conventions), and
+  the exporter that speaks protobuf or HTTP belongs in the service that ships it, where the
+  transport dependencies live. A protocol crate with a gRPC stack in its dependency tree is a
+  crate every embedder has to audit.
 
 ## Enctypes
 
-Only the AES four: 17/18 (RFC 3962) and 19/20 (RFC 8009). DES3 and RC4 are
+Only the AES four: 17/18 (RFC 3962) and 19/20 (RFC 8009). DES, DES3 and RC4 are
 refused rather than silently downgraded — a configuration naming `rc4-hmac`
-fails at startup instead of being quietly given AES.
+fails at startup instead of being quietly given AES. `rc4-hmac` (23) exists in `rrl-crypto`
+as an opt-in for a Windows estate that needs it, but it is **not** in this KDC's enctype set:
+an AD forest moving off RC4 wants the KDC to stop issuing it, not to keep doing so.
 
 ## Two crypto backends
 

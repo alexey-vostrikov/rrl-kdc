@@ -122,7 +122,15 @@ impl Keytab {
 
     /// Parses keytab bytes.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        Self::parse_with(data, &mut Vec::new())
+        let mut skipped = Vec::new();
+        let keytab = Self::parse_with(data, &mut skipped)?;
+        // Skipping is not what a caller of `parse` asked for. Without this the lenient path would
+        // have made every strict caller lenient by accident — a keytab that lost a key in silence
+        // is the failure this method exists to prevent.
+        match skipped.first() {
+            Some(id) => Err(Error::UnsupportedEnctype(*id)),
+            None => Ok(keytab),
+        }
     }
 
     /// Parses keytab bytes, skipping entries whose enctype this crate does not implement.
@@ -330,6 +338,104 @@ mod tests {
         v51.extend_from_slice(&body);
         let back = Keytab::parse(&v51).unwrap();
         assert_eq!(back.entries().len(), 1);
+    }
+
+    /// The bytes of one keytab entry, built by hand so that an enctype this crate does not
+    /// implement can appear in a file: `Key::new` refuses to make one, and that is the point.
+    fn raw_entry(realm: &str, components: &[&str], enctype: u16, key: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(components.len() as u16).to_be_bytes());
+        body.extend_from_slice(&(realm.len() as u16).to_be_bytes());
+        body.extend_from_slice(realm.as_bytes());
+        for component in components {
+            body.extend_from_slice(&(component.len() as u16).to_be_bytes());
+            body.extend_from_slice(component.as_bytes());
+        }
+        body.extend_from_slice(&1u32.to_be_bytes()); // name type
+        body.extend_from_slice(&1_700_000_000u32.to_be_bytes()); // timestamp
+        body.push(1); // kvno
+        body.extend_from_slice(&enctype.to_be_bytes());
+        body.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        body.extend_from_slice(key);
+        body
+    }
+
+    fn keytab_of(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&VERSION_52.to_be_bytes());
+        for entry in entries {
+            out.extend_from_slice(&(entry.len() as u32).to_be_bytes());
+            out.extend_from_slice(entry);
+        }
+        out
+    }
+
+    /// A file with an enctype this crate does not implement is refused whole by `parse`.
+    ///
+    /// That is the right answer for service keys: an entry dropped in silence is a service that
+    /// cannot authenticate, and the operator has no way to see it happened.
+    #[test]
+    fn an_unsupported_enctype_is_refused_whole() {
+        let bytes = keytab_of(&[raw_entry("R", &["host", "h"], 16, &[0x11; 24])]);
+        match Keytab::parse(&bytes) {
+            Err(Error::UnsupportedEnctype(16)) => {}
+            other => panic!("expected UnsupportedEnctype(16), got {other:?}"),
+        }
+    }
+
+    /// The lenient entry point returns the keys it can use and names the ones it skipped.
+    ///
+    /// A master key stash is the caller this exists for, and the entry after the skipped one has to
+    /// survive: the length prefix tells the reader where each entry ends, so skipping cannot
+    /// desynchronise the stream.
+    #[test]
+    fn the_lenient_parse_skips_only_the_unimplemented_and_keeps_going() {
+        let cipher = OwnCipher;
+        let key = cipher.random(Enctype::Aes256Sha1).unwrap();
+        let mut usable = Keytab::new();
+        usable.add(KeytabEntry {
+            principal: Principal::parse("K/M@R").unwrap(),
+            key: key.clone(),
+            kvno: 2,
+            timestamp: 1_700_000_000,
+        });
+
+        // The unsupported entry first, so a reader that gave up on it would lose the good one too.
+        let mut entries = vec![raw_entry("R", &["K", "M"], 16, &[0x22; 24])];
+        let good = usable.to_bytes();
+        entries.push(good[6..].to_vec());
+
+        let (parsed, skipped) = Keytab::parse_skipping_unsupported(&keytab_of(&entries)).unwrap();
+        assert_eq!(skipped, vec![16], "the enctype that was skipped, by number");
+        assert_eq!(
+            parsed.entries().len(),
+            1,
+            "and the usable entry is still there"
+        );
+        assert_eq!(parsed.entries()[0].key, key);
+        assert_eq!(parsed.entries()[0].kvno, 2);
+    }
+
+    /// A malformed entry is not skippable: it is a broken file, not an unsupported enctype.
+    ///
+    /// The enctype here is one this crate implements, so the entry gets past the skip check and the
+    /// truncated key is what fails. An unsupported enctype would be skipped before the key length
+    /// was ever read, and the test would pass for the wrong reason — which is how this one was
+    /// written the first time.
+    #[test]
+    fn a_malformed_entry_is_still_refused_by_the_lenient_parse() {
+        let mut truncated = raw_entry(
+            "R",
+            &["K", "M"],
+            Enctype::Aes256Sha1.id() as u16,
+            &[0x33; 32],
+        );
+        truncated.truncate(truncated.len() - 4);
+        let bytes = keytab_of(&[truncated]);
+        match Keytab::parse_skipping_unsupported(&bytes) {
+            Err(Error::Hdb(text)) if text.contains("truncated") => {}
+            other => panic!("a short key must not read as a small one: {other:?}"),
+        }
     }
 
     #[test]

@@ -123,11 +123,23 @@ impl MasterKeys {
                 .collect();
         }
         if keys.is_empty() {
-            return Err(Error::Hdb(format!(
-                "{}: no {} principal in it, so it does not hold a master key",
-                path.display(),
-                MASTER_PRINCIPAL
-            )));
+            // Two different facts, and telling them apart is the whole point of keeping the skipped
+            // ids. A stash that names no `K/M` at all is the wrong file. A stash whose only `K/M`
+            // entry is in an enctype this crate does not implement is the right file and a realm
+            // this KDC cannot serve — and it is the second that a real Heimdal stash produces, so
+            // "no K/M principal in it" would send an operator looking for the wrong thing.
+            return Err(Error::Hdb(match unsupported.as_slice() {
+                [] => format!(
+                    "{}: no {MASTER_PRINCIPAL} principal in it, so it does not hold a master key",
+                    path.display()
+                ),
+                ids => format!(
+                    "{}: the only {MASTER_PRINCIPAL} entries are enctypes this crate does not \
+                     implement ({ids:?}), so no master key here can seal or open an entry — a realm \
+                     created by Heimdal's own `kstash` defaults is des3-cbc-sha1 (16)",
+                    path.display()
+                ),
+            }));
         }
         keys.sort_by_key(|k| std::cmp::Reverse(k.kvno));
         Ok(MasterKeys { keys, unsupported })
@@ -359,6 +371,101 @@ mod tests {
 
     fn master() -> Key {
         OwnCipher.random(Enctype::Aes256Sha1).expect("a key")
+    }
+
+    /// The bytes of one keytab entry, built by hand so that an enctype this crate does not
+    /// implement can be written into a stash: `Key::new` refuses to make such a key, and a real
+    /// `kstash --random-key` produces exactly that.
+    fn raw_master_entry(realm: &str, enctype: u16, key: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes()); // K, M
+        body.extend_from_slice(&(realm.len() as u16).to_be_bytes());
+        body.extend_from_slice(realm.as_bytes());
+        for component in ["K", "M"] {
+            body.extend_from_slice(&(component.len() as u16).to_be_bytes());
+            body.extend_from_slice(component.as_bytes());
+        }
+        body.extend_from_slice(&1u32.to_be_bytes()); // name type
+        body.extend_from_slice(&1_700_000_000u32.to_be_bytes());
+        body.push(1); // kvno
+        body.extend_from_slice(&enctype.to_be_bytes());
+        body.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        body.extend_from_slice(key);
+        body
+    }
+
+    fn stash_file(entries: &[Vec<u8>], name: &str) -> std::path::PathBuf {
+        let mut bytes = 0x0502u16.to_be_bytes().to_vec();
+        for entry in entries {
+            bytes.extend_from_slice(&(entry.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(entry);
+        }
+        let path =
+            std::env::temp_dir().join(format!("rrl-mkey-{name}-{}.keytab", std::process::id()));
+        std::fs::write(&path, bytes).expect("the stash is written");
+        path
+    }
+
+    /// A stash of AES master keys loads, and reports that nothing was skipped.
+    #[test]
+    fn a_stash_of_usable_keys_loads_and_reports_no_gaps() {
+        let aes = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        write_keytab(
+            std::env::temp_dir().join(format!("rrl-mkey-aes-{}.keytab", std::process::id())),
+            "EXAMPLE.COM",
+            &[(aes.clone(), 3)],
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("rrl-mkey-aes-{}.keytab", std::process::id()));
+        let keys = MasterKeys::from_keytab(&path).unwrap();
+        assert_eq!(keys.keys().len(), 1);
+        assert_eq!(keys.keys()[0].kvno, 3, "newest first");
+        assert_eq!(keys.unsupported(), &[] as &[i32]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A stash whose AES key sits next to a `des3` one loads the AES key and names the `des3`.
+    ///
+    /// This is the shape a migraton meets: Heimdal may seal different entries under different
+    /// master keys, and the ones this crate cannot read have to be visible rather than fatal.
+    #[test]
+    fn a_mixed_stash_loads_what_it_can_and_names_what_it_cannot() {
+        let aes = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let path = stash_file(
+            &[
+                raw_master_entry("EXAMPLE.COM", 16, &[0x44; 24]),
+                raw_master_entry("EXAMPLE.COM", Enctype::Aes256Sha1.id() as u16, aes.bytes()),
+            ],
+            "mixed",
+        );
+        let keys = MasterKeys::from_keytab(&path).unwrap();
+        assert_eq!(keys.unsupported(), &[16], "des3 is named, not swallowed");
+        assert_eq!(keys.keys().len(), 1, "and the AES key is usable");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A stash that holds nothing but `des3` fails with the reason, not with "no K/M principal".
+    ///
+    /// The distinction is the whole point of keeping the skipped ids: the second message sends an
+    /// operator to look for the wrong file, while this one names the decision that produced it.
+    #[test]
+    fn a_des3_only_stash_says_which_decision_refused_it() {
+        let path = stash_file(&[raw_master_entry("EXAMPLE.COM", 16, &[0x55; 24])], "des3");
+        let err = MasterKeys::from_keytab(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("does not implement") && text.contains("16"),
+            "the refusal names the enctype: {text}"
+        );
+        assert!(
+            text.contains("des3-cbc-sha1"),
+            "and the format that produced it: {text}"
+        );
+        assert!(
+            !text.contains("no K/M principal"),
+            "the principal is there; its enctype is the problem: {text}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     /// A sealed key is the enctype's overhead longer than the key itself — 60 octets for AES-256 —

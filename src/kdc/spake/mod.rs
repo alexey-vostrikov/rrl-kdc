@@ -44,10 +44,9 @@
 //! subtly wrong rather than obviously broken, and the crate already takes `rsa` for PKINIT for
 //! the same reason.
 
-use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
-use curve25519_dalek::scalar::Scalar;
+mod group;
 
-use crate::crypto::{Cipher, Enctype, Key};
+use crate::crypto::{Cipher, Key};
 use crate::der;
 use crate::error::{Error, Result};
 
@@ -62,20 +61,9 @@ pub const KU_SPAKE: u32 = 65;
 /// `SF-NONE`: no second factor. Its presence is the whole validation.
 const SF_NONE: i64 = 1;
 
-/// edwards25519, the only group this module implements.
-pub const GROUP_EDWARDS25519: i32 = 1;
-
-/// The KDC's mask constant M (RFC 9588 §12.2.2.1).
-const M_CONSTANT: [u8; 32] = [
-    0xd0, 0x48, 0x03, 0x2c, 0x6e, 0xa0, 0xb6, 0xd6, 0x97, 0xdd, 0xc2, 0xe8, 0x6b, 0xda, 0x85, 0xa3,
-    0x3a, 0xda, 0xc9, 0x20, 0xf1, 0xbf, 0x18, 0xe1, 0xb0, 0xc6, 0xd1, 0x66, 0xa5, 0xce, 0xcd, 0xaf,
-];
-
-/// The client's mask constant N (RFC 9588 §12.2.2.1).
-const N_CONSTANT: [u8; 32] = [
-    0xd3, 0xbf, 0xb5, 0x18, 0xf4, 0x4f, 0x34, 0x30, 0xf2, 0x9d, 0x0c, 0x92, 0xaf, 0x50, 0x38, 0x65,
-    0xa1, 0xed, 0x32, 0x81, 0xdc, 0x69, 0xb3, 0x5d, 0xd8, 0x68, 0xba, 0x85, 0xf8, 0x86, 0xc4, 0xab,
-];
+/// The id the old, single-group code named. Kept because a realm's configuration and the tests
+/// refer to it, and because the group module's constant carries the same value.
+pub const GROUP_EDWARDS25519: i32 = group::EDWARDS25519;
 
 /// Which mask a party applies: the KDC's `M` or the client's `N`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,118 +72,25 @@ enum Mask {
     N,
 }
 
-impl Mask {
-    fn constant(self) -> EdwardsPoint {
-        let bytes = match self {
-            Mask::M => M_CONSTANT,
-            Mask::N => N_CONSTANT,
-        };
-        // The registry constants are curve points; a build where they are not is a build whose
-        // tables are wrong, and that is not something a login should be able to continue past.
-        CompressedEdwardsY(bytes)
-            .decompress()
-            .expect("the SPAKE mask constants are edwards25519 points")
-    }
-}
-
 /// The multiplier `w` from the initial reply key: `PRF+(K, "SPAKEsecret" || group)`.
 ///
 /// The pepper binds the mask to the group, so a client and a KDC that disagree about the group
 /// derive different masks and the exchange cannot complete by accident.
-fn w_bytes(cipher: &dyn Cipher, ikey: &Key, group: i32) -> Result<Vec<u8>> {
+fn w_bytes(cipher: &dyn Cipher, ikey: &Key, group: &dyn group::Group) -> Result<Vec<u8>> {
     let _ = cipher;
     let mut seed = b"SPAKEsecret".to_vec();
-    seed.extend_from_slice(&group.to_be_bytes());
+    seed.extend_from_slice(&group.id().to_be_bytes());
+    // The registry's multiplier length, not a constant: P-384 and P-521 take 48 octets, and a
+    // 32-octet pepper would derive a different `w` — the exchange would fail at the last step with
+    // nothing to point at.
     Ok(crate::crypto::kdf::prf_plus(
         ikey.enctype(),
         ikey.bytes(),
         &seed,
-        32,
+        group.multiplier_len(),
     )?)
 }
 
-/// `w` reduced modulo the group order, the way both sides use it as a scalar.
-fn w_scalar(w: &[u8]) -> Result<Scalar> {
-    let bytes: [u8; 32] = w
-        .try_into()
-        .map_err(|_| Error::Protocol("a SPAKE multiplier is 32 octets".into()))?;
-    Ok(Scalar::from_bytes_mod_order(bytes))
-}
-
-/// `x·G + w·mask`, compressed — the value a party sends as its public key.
-///
-/// `private` is the *reduced* secret, and the cofactor is applied to the point rather than to
-/// the scalar. That is not a shortcut: a `Scalar` in this library is a value modulo the group
-/// order, so multiplying one by eight reduces again — and the order is odd, so the product is
-/// no longer a multiple of eight in integer terms, which is exactly the property RFC 9588 §10.1
-/// wants. Scaling the point gives `8r·G` exactly, with no reduction anywhere.
-fn public_value(private: &Scalar, w: &[u8], mask: Mask) -> Result<[u8; 32]> {
-    let masked = mask.constant() * w_scalar(w)?;
-    Ok((EdwardsPoint::mul_base(private).mul_by_cofactor() + masked)
-        .compress()
-        .to_bytes())
-}
-
-/// `private·(peer − w·mask)`, compressed — the shared value both sides end up with.
-///
-/// An octet string that is not a curve point is refused rather than fed to the arithmetic: a
-/// value off the curve is what an invalid-curve attack is made of (RFC 9588 §10.1).
-fn shared_value(private: &Scalar, w: &[u8], peer: &[u8], mask: Mask) -> Result<[u8; 32]> {
-    let bytes: [u8; 32] = peer
-        .try_into()
-        .map_err(|_| Error::Protocol("a SPAKE public value is 32 octets".into()))?;
-    let point = CompressedEdwardsY(bytes)
-        .decompress()
-        .ok_or_else(|| Error::Protocol("a SPAKE public value is not a curve point".into()))?;
-    let unmasked = point - mask.constant() * w_scalar(w)?;
-    // The same cofactor reasoning as in `public_value`: the point is scaled, the scalar is not.
-    Ok((unmasked * private).mul_by_cofactor().compress().to_bytes())
-}
-
-/// A random secret scalar, reduced modulo the group order.
-///
-/// The cofactor is applied where the scalar meets a point ([`public_value`], [`shared_value`]),
-/// never here: see the comment there for why multiplying this value by eight would not do what
-/// RFC 9588 §10.1 asks. The requirement is real — without cofactor clearing a malicious peer
-/// can steer `K` into a small subgroup and learn a few bits of `w` per exchange, which is enough
-/// to grind a password offline over several attempts.
-fn random_scalar(cipher: &dyn Cipher) -> Result<Scalar> {
-    let bytes = cipher.random(Enctype::Aes256Sha1)?;
-    let seed: [u8; 32] = bytes
-        .bytes()
-        .try_into()
-        .map_err(|_| Error::Protocol("a random scalar is 32 octets".into()))?;
-    Ok(Scalar::from_bytes_mod_order(seed))
-}
-
-/// The group's hash for the transcript (edwards25519 uses SHA-256).
-fn hash(parts: &[&[u8]]) -> Vec<u8> {
-    use sha2::Digest;
-    let mut d = sha2::Sha256::new();
-    for part in parts {
-        d.update(part);
-    }
-    d.finalize().to_vec()
-}
-
-/// The transcript hash after the challenge: `H(H(zeros || support || challenge) || …)`.
-///
-/// RFC 9588 §6: the hash starts at zeros, is updated with the client's support message and the
-/// KDC's challenge together, and is updated again with the client's public value. Both of the
-/// first two inputs are the PA-SPAKE *values as they travelled*, tags included — so the KDC has
-/// to keep the octets it sent rather than rebuild them.
-fn transcript_after_challenge(support: &[u8], challenge: &[u8]) -> Vec<u8> {
-    let zeros = [0u8; 32];
-    hash(&[&zeros, support, challenge])
-}
-
-/// The same hash, after the client's public value.
-fn transcript_final(thash: &[u8], client_public: &[u8]) -> Vec<u8> {
-    hash(&[thash, client_public])
-}
-
-/// `K'[n]`: the reply key (`n = 0`) and the second-factor keys (RFC 9588 §7).
-///
 /// The chain is `H("SPAKEkey" || group || enctype || w || K || thash || body || n || block)`,
 /// truncated to the enctype's seed length and then put through `KRB-FX-CF2` with the initial
 /// reply key. The `body` is the `KDC-REQ-BODY` of the request being answered, so a reply key is
@@ -203,7 +98,7 @@ fn transcript_final(thash: &[u8], client_public: &[u8]) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 fn derive_key(
     ikey: &Key,
-    group: i32,
+    group: &dyn group::Group,
     w: &[u8],
     k: &[u8],
     thash: &[u8],
@@ -215,9 +110,9 @@ fn derive_key(
     let mut seed = Vec::with_capacity(seed_len + 32);
     let mut block: u8 = 1;
     while seed.len() < seed_len {
-        seed.extend_from_slice(&hash(&[
+        seed.extend_from_slice(&group.hash(&[
             b"SPAKEkey",
-            &group.to_be_bytes(),
+            &group.id().to_be_bytes(),
             &enctype.id().to_be_bytes(),
             w,
             k,
@@ -231,6 +126,27 @@ fn derive_key(
     seed.truncate(seed_len);
     let hkey = crate::crypto::kdf::cf2(ikey.bytes(), "SPAKE", enctype, &seed, "keyderiv")?;
     Ok(Key::new(enctype, hkey)?)
+}
+
+/// `H(H(zero || support || challenge) || client pubkey)` — RFC 9588 §6.
+///
+/// The zero prefix is the transcript's initial value: "All bits are set to zero in the initial
+/// value", and the hash of that plus the first input is the first update. The hash is the group's
+/// own, so a P-384 exchange hashes ten more octets than a P-256 one at every step — and the result
+/// reaches `K'[n]`, which is why picking the wrong one is a different key rather than a formatting
+/// problem.
+fn transcript_after_challenge(
+    group: &dyn group::Group,
+    support: &[u8],
+    challenge: &[u8],
+) -> Vec<u8> {
+    let zero = vec![0u8; group.hash(&[]).len()];
+    group.hash(&[&zero, support, challenge])
+}
+
+/// The final transcript hash: the first update and the client's public value.
+fn transcript_final(group: &dyn group::Group, first: &[u8], client_public: &[u8]) -> Vec<u8> {
+    group.hash(&[first, client_public])
 }
 
 /// The `SPAKESupport` a client sent: the groups it prefers, in order.
@@ -310,7 +226,9 @@ fn decode_response(value: &[u8]) -> Result<Response> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Pending {
     group: i32,
-    private: [u8; 32],
+    /// The KDC's secret scalar, as octets: its width is the group's, and a fixed array would pin
+    /// this state to edwards25519.
+    private: Vec<u8>,
     challenge: Vec<u8>,
     support: Vec<u8>,
 }
@@ -318,7 +236,7 @@ struct Pending {
 impl Pending {
     fn encode(&self) -> Vec<u8> {
         der::seq(&[
-            der::field(0, der::int(GROUP_EDWARDS25519 as i64)),
+            der::field(0, der::int(self.group as i64)),
             der::field(1, der::octets(&self.private)),
             der::field(2, der::octets(&self.challenge)),
             der::field(3, der::octets(&self.support)),
@@ -329,15 +247,17 @@ impl Pending {
         let mut r = der::Reader::new(state);
         let f = der::Fields::parse("SPAKE state", r.expect_in("SPAKE state", der::SEQUENCE)?)?;
         let group = f.int(0, "SPAKE state")? as i32;
-        if group != GROUP_EDWARDS25519 {
-            return Err(Error::Protocol(format!(
-                "SPAKE state names group {group}, and this KDC resumes only {GROUP_EDWARDS25519}"
-            )));
+        // A state naming a group this build does not have is a cookie from another build, and
+        // resuming it with the wrong arithmetic would compute a key nobody else has.
+        let implementation = group::by_id(group).ok_or_else(|| {
+            Error::Protocol(format!(
+                "SPAKE state names group {group}, which this KDC does not implement"
+            ))
+        })?;
+        let private = f.octets(1, "SPAKE state")?.to_vec();
+        if private.len() != implementation.multiplier_len().max(32) && private.len() < 32 {
+            return Err(Error::Protocol("SPAKE state has a short scalar".into()));
         }
-        let private: [u8; 32] = f
-            .octets(1, "SPAKE state")?
-            .try_into()
-            .map_err(|_| Error::Protocol("SPAKE state has a short scalar".into()))?;
         Ok(Pending {
             group,
             private,
@@ -410,32 +330,41 @@ impl Mechanism for Spake {
 /// The client's support message: pick a group and answer with a challenge.
 fn challenge(request: &Request<'_>, support: &[u8]) -> Result<Step> {
     let groups = decode_support(support)?;
-    if !groups.contains(&GROUP_EDWARDS25519) {
-        // The one refusal a client acts on by trying another method rather than failing the
-        // login (its code paths treat `PREAUTH_FAILED` after a support message as "no group in
-        // common"). Naming the groups it asked for is what an operator needs to see.
+    // The client's order, first we implement (RFC 9588 §4.2). `None` is the one refusal a client
+    // acts on by trying another method rather than failing the login, and naming the groups it
+    // asked for is what an operator needs to see.
+    let Some(id) = group::first_supported(&groups) else {
         return Ok(Step::Failed {
             code: crate::error::codes::KDC_ERR_PREAUTH_FAILED,
             text: format!(
-                "this realm offers edwards25519 only, and the client asked for {groups:?}"
+                "this realm offers {:?}, and the client asked for {groups:?}",
+                group::ALL
+                    .iter()
+                    .filter_map(|id| group::name(*id))
+                    .collect::<Vec<_>>()
             ),
         });
-    }
+    };
+    let implementation = group::by_id(id)
+        .ok_or_else(|| Error::Protocol(format!("group {id} has no implementation")))?;
     let ikey = request
         .longterm
         .first()
         .ok_or_else(|| Error::Protocol("SPAKE needs a long-term key".into()))?;
 
-    let w = w_bytes(request.cipher, ikey, GROUP_EDWARDS25519)?;
-    let private = random_scalar(request.cipher)?;
-    let public = public_value(&private, &w, Mask::M)?;
-    let challenge_message = encode_challenge(GROUP_EDWARDS25519, &public);
+    let w = w_bytes(request.cipher, ikey, implementation.as_ref())?;
+    // Checked at the source: `PRF+` produces the registry's length, and a mismatch here would
+    // otherwise reach the arithmetic as a scalar nobody validated.
+    implementation.multiplier(&w)?;
+    let private = implementation.random_multiplier(request.cipher)?;
+    let public = implementation.public_value(&private, &w, Mask::M)?;
+    let challenge_message = encode_challenge(id, &public);
 
     // The client sends its own value next; the transcript needs the support message and the
     // challenge exactly as they travelled, so both are remembered rather than rebuilt.
     let pending = Pending {
-        group: GROUP_EDWARDS25519,
-        private: private.to_bytes(),
+        group: id,
+        private,
         challenge: challenge_message.clone(),
         support: support.to_vec(),
     };
@@ -452,19 +381,18 @@ fn finish(request: &Request<'_>, pending: &Pending, response: &[u8]) -> Result<S
         .first()
         .ok_or_else(|| Error::Protocol("SPAKE needs a long-term key".into()))?;
     let response = decode_response(response)?;
-    if response.pubkey.len() != 32 {
-        return Ok(Step::Failed {
-            code: crate::error::codes::KDC_ERR_PREAUTH_FAILED,
-            text: format!(
-                "an edwards25519 public value is 32 octets, and this one is {}",
-                response.pubkey.len()
-            ),
-        });
-    }
-
-    let w = w_bytes(request.cipher, ikey, pending.group)?;
-    let private = Scalar::from_bytes_mod_order(pending.private);
-    let k = match shared_value(&private, &w, &response.pubkey, Mask::N) {
+    let implementation = group::by_id(pending.group).ok_or_else(|| {
+        Error::Protocol(format!(
+            "SPAKE state names group {}, which this KDC does not implement",
+            pending.group
+        ))
+    })?;
+    let w = w_bytes(request.cipher, ikey, implementation.as_ref())?;
+    implementation.multiplier(&w)?;
+    // The length check is the group's, not a constant: a client that answered with an
+    // edwards25519-sized value after being given a P-384 challenge is confused, and the arithmetic
+    // would refuse it anyway with a message about points rather than about the exchange.
+    let k = match implementation.shared_value(&pending.private, &w, &response.pubkey, Mask::N) {
         Ok(k) => k,
         Err(err) => {
             return Ok(Step::Failed {
@@ -475,11 +403,32 @@ fn finish(request: &Request<'_>, pending: &Pending, response: &[u8]) -> Result<S
     };
 
     let thash = transcript_final(
-        &transcript_after_challenge(&pending.support, &pending.challenge),
+        implementation.as_ref(),
+        &transcript_after_challenge(
+            implementation.as_ref(),
+            &pending.support,
+            &pending.challenge,
+        ),
         &response.pubkey,
     );
-    let k0 = derive_key(ikey, pending.group, &w, &k, &thash, request.body, 0)?;
-    let k1 = derive_key(ikey, pending.group, &w, &k, &thash, request.body, 1)?;
+    let k0 = derive_key(
+        ikey,
+        implementation.as_ref(),
+        &w,
+        &k,
+        &thash,
+        request.body,
+        0,
+    )?;
+    let k1 = derive_key(
+        ikey,
+        implementation.as_ref(),
+        &w,
+        &k,
+        &thash,
+        request.body,
+        1,
+    )?;
 
     // The second factor is the proof: it is only readable by someone who knows the password,
     // because only they can compute the mask and therefore `K`.
@@ -515,6 +464,12 @@ fn finish(request: &Request<'_>, pending: &Pending, response: &[u8]) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curve25519_dalek::scalar::Scalar;
+
+    /// The group the module's edwards25519 implementation is, for the vector below.
+    fn ed() -> Box<dyn group::Group> {
+        group::by_id(group::EDWARDS25519).expect("edwards25519 is implemented")
+    }
 
     fn hex32(s: &str) -> [u8; 32] {
         hex::decode(s).unwrap().try_into().unwrap()
@@ -550,12 +505,12 @@ mod tests {
         )) * inv8;
 
         assert_eq!(
-            public_value(&x, &w, Mask::M).unwrap(),
+            ed().public_value(&x.to_bytes(), &w, Mask::M).unwrap(),
             hex32("18f511e750c97b592acd30db7d9e5fca660389102e6bf610c1bfbed4616c8362"),
             "T = x·G + w·M"
         );
         assert_eq!(
-            public_value(&y, &w, Mask::N).unwrap(),
+            ed().public_value(&y.to_bytes(), &w, Mask::N).unwrap(),
             hex32("5d10705e0d1e43d5dbf30240ccfbde4a0230c70d4c79147ab0b317edad2f8ae7"),
             "S = y·G + w·N"
         );
@@ -564,12 +519,12 @@ mod tests {
         let t = hex32("18f511e750c97b592acd30db7d9e5fca660389102e6bf610c1bfbed4616c8362");
         let expected = hex32("25bde0d875f0feb5755f45ba5e857889d916ecf7476f116aa31dc3e037ec4292");
         assert_eq!(
-            shared_value(&x, &w, &s, Mask::N).unwrap(),
+            ed().shared_value(&x.to_bytes(), &w, &s, Mask::N).unwrap(),
             expected,
             "the KDC's K = x·(S − w·N)"
         );
         assert_eq!(
-            shared_value(&y, &w, &t, Mask::M).unwrap(),
+            ed().shared_value(&y.to_bytes(), &w, &t, Mask::M).unwrap(),
             expected,
             "and the client's K = y·(T − w·M) is the same point"
         );
@@ -582,14 +537,15 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            transcript_after_challenge(&support, &challenge_bytes),
+            transcript_after_challenge(ed().as_ref(), &support, &challenge_bytes),
             hex::decode("22bb2271e34d329d52073c70b1d1187973181f0bc7614266bb79ee80d3335175")
                 .unwrap(),
             "the transcript after the challenge"
         );
         assert_eq!(
             transcript_final(
-                &transcript_after_challenge(&support, &challenge_bytes),
+                ed().as_ref(),
+                &transcript_after_challenge(ed().as_ref(), &support, &challenge_bytes),
                 &hex32("5d10705e0d1e43d5dbf30240ccfbde4a0230c70d4c79147ab0b317edad2f8ae7")
             ),
             hex::decode("eaaa08807d0616026ff51c849efbf35ba0ce3c5300e7d486da46351b13d4605b")
@@ -629,7 +585,7 @@ mod tests {
     fn a_pending_state_round_trips() {
         let pending = Pending {
             group: GROUP_EDWARDS25519,
-            private: [7u8; 32],
+            private: vec![7u8; 32],
             challenge: vec![1, 2, 3],
             support: vec![4, 5],
         };
@@ -661,14 +617,10 @@ mod tests {
         // Not every 32 octets are a compressed edwards25519 point: decompression needs a square
         // root to exist, and for this value it does not (checked outside this crate — most
         // values, including all-bits-set, *are* on the curve, which is why this one is named).
-        let err = shared_value(
-            &Scalar::from_bytes_mod_order([1u8; 32]),
-            &[2u8; 32],
-            &[0x02u8; 32],
-            Mask::N,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = ed()
+            .shared_value(&[1u8; 32], &[2u8; 32], &[0x02u8; 32], Mask::N)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("curve point"), "{err}");
     }
 }

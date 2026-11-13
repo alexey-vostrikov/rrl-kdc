@@ -162,13 +162,23 @@ fn a_challenge_refuses_a_client_that_names_only_groups_we_do_not_implement() {
     // The one refusal a client acts on by trying another method. It must be `PREAUTH_FAILED`
     // and it must name the groups asked for, because "pre-authentication failed" with no detail
     // is what an operator cannot act on.
+    //
+    // The ids are deliberately unregistered: this test used to name 3 and 4, which were the NIST
+    // curves this crate did not implement — and it kept passing for the wrong reason until they
+    // were implemented, at which point it was asserting that P-384/P-521 are absent. A group id
+    // nobody has assigned cannot drift like that.
     let kdc = kdc();
-    let reply = kdc.handle(&as_req(vec![(151, support(&[3, 4]))]), NOW);
+    let reply = kdc.handle(&as_req(vec![(151, support(&[98, 99]))]), NOW);
     let err = rrl_kdc::msg::KrbError::decode(&reply).expect("a KRB-ERROR");
     assert_eq!(err.code, rrl_kdc::error::codes::KDC_ERR_PREAUTH_FAILED);
     let text = err.e_text.unwrap_or_default();
-    assert!(text.contains("edwards25519"), "{text}");
-    assert!(text.contains('3') && text.contains('4'), "{text}");
+    for implemented in ["edwards25519", "P-256", "P-384", "P-521"] {
+        assert!(
+            text.contains(implemented),
+            "the refusal lists what the realm does have ({implemented}): {text}"
+        );
+    }
+    assert!(text.contains("98") && text.contains("99"), "{text}");
 }
 
 #[test]

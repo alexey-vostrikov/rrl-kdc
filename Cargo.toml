@@ -93,7 +93,7 @@ hdb-ldap = []
 kadmin = []
 # SPAKE pre-authentication (RFC 9588). Off by default: it adds a curve implementation and a
 # second way to log in, and a realm that has not thought about it should not grow one.
-spake = ["dep:curve25519-dalek"]
+spake = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:p521"]
 # GSS pre-authentication (`kdc::gss_preauth`): the mechanism is always compiled, the concrete
 # acceptor over the realm's own HDB is not, because it brings the client crate in.
 gss-preauth = ["dep:rrl-krb5"]

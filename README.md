@@ -144,8 +144,6 @@ this crate.
 
 Planned:
 
-* **Replication** — see below; `hprop`/`hpropd` are written, a second domain controller is a
-  decision rather than a task.
 * **OTP's `must-encrypt-nonce` variant** (RFC 6560 §3.3) — where the one-time value never travels
   and generates the reply key instead. It needs the KDC to hold every token's current value, which
   this crate has no store for; the variant that asks a verifier is written.

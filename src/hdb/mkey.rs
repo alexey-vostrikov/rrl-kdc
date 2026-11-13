@@ -56,6 +56,13 @@ pub struct MasterKey {
 #[derive(Debug, Clone, Default)]
 pub struct MasterKeys {
     keys: Vec<MasterKey>,
+    /// Enctypes present in the stash that this crate does not implement, by number.
+    ///
+    /// Kept rather than dropped: Heimdal writes one master key per enctype it may seal an entry
+    /// under, and a realm with Heimdal's defaults carries `des3-cbc-sha1` next to `aes256`. The keys
+    /// here are the ones this KDC can open; an entry sealed under a skipped one fails at use time
+    /// with its `mkvno`, and this list is what turns that failure into an explanation.
+    unsupported: Vec<i32>,
 }
 
 impl MasterKeys {
@@ -64,10 +71,20 @@ impl MasterKeys {
         MasterKeys::default()
     }
 
+    /// The enctypes the stash carried that this crate does not implement.
+    ///
+    /// Non-empty means the realm has master keys this KDC cannot use. Entries sealed under one of
+    /// them are refused at use time, naming the `mkvno`; this list is what tells an operator that
+    /// the refusal is about the key set and not about a corrupt entry.
+    pub fn unsupported(&self) -> &[i32] {
+        &self.unsupported
+    }
+
     /// A set with one key.
     pub fn single(key: Key, kvno: u32) -> MasterKeys {
         MasterKeys {
             keys: vec![MasterKey { key, kvno }],
+            unsupported: Vec::new(),
         }
     }
 
@@ -77,7 +94,8 @@ impl MasterKeys {
     /// what `kstash` writes and what a sealed key's `mkvno` refers to.
     pub fn from_keytab(path: impl AsRef<std::path::Path>) -> Result<MasterKeys> {
         let path = path.as_ref();
-        let keytab = Keytab::load(path)?;
+        // Lenient about enctypes, strict about everything else: see `parse_skipping_unsupported`.
+        let (keytab, unsupported) = Keytab::load_skipping_unsupported(path)?;
         let mut keys: Vec<MasterKey> = keytab
             .entries()
             .iter()
@@ -112,7 +130,7 @@ impl MasterKeys {
             )));
         }
         keys.sort_by_key(|k| std::cmp::Reverse(k.kvno));
-        Ok(MasterKeys { keys })
+        Ok(MasterKeys { keys, unsupported })
     }
 
     /// Builds a set from pairs, for a caller that has the key material already.
@@ -122,7 +140,10 @@ impl MasterKeys {
             .map(|(key, kvno)| MasterKey { key, kvno })
             .collect();
         keys.sort_by_key(|k| std::cmp::Reverse(k.kvno));
-        MasterKeys { keys }
+        MasterKeys {
+            keys,
+            unsupported: Vec::new(),
+        }
     }
 
     /// Whether the set holds anything.

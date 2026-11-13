@@ -188,6 +188,15 @@ needs revisiting.
   DES keys (§2.2.10.4), and the cost is stated where it belongs: the projection is valid for
   impacket, dissect, mimikatz and AD, and **Samba refuses it** without that property. A realm
   that must feed Samba should not use this projection.
+* **A master key Heimdal wrote with its defaults** — cannot be read, and the reason is a decision.
+  Heimdal 7.7's `kstash --random-key` seals the master key as `des3-cbc-sha1` (enctype 16, 24 octets)
+  whatever `[kadmin] default_keys` and `[libdefaults] default_etypes` say, and this crate implements
+  AES (17/18/19/20) and optionally RC4 (23) — 3DES was dropped deliberately. So a propagation *from*
+  a Heimdal master is refused at the first entry: the tag of a sealed key does not verify, which is
+  the correct diagnosis and not a defect in the receiver. `scripts/hprop-heimdal-master.sh` builds
+  that scenario end to end and stops on exactly this refusal. Taking over an existing Heimdal realm
+  needs either 3DES in `rrl-crypto` or a Heimdal realm made with an AES master key, which 7.7 does
+  not offer.
 * **An OTLP exporter** — not here. `kdc::audit` defines the seam (`AuditDriver`, plus
   `Record::attributes`/`severity_number` mapped to the OpenTelemetry semantic conventions), and
   the exporter that speaks protobuf or HTTP belongs in the service that ships it, where the

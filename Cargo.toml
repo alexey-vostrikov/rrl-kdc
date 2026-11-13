@@ -146,6 +146,13 @@ required-features = ["pkinit"]
 name = "hprop-stand"
 required-features = ["hdb-redb"]
 
+# The SPAKE stand: MIT's `kinit` logs in to it over each group. The mechanism is behind a feature, so
+# an example that serves it must be too — otherwise the default build fails on a module it does not
+# have, which is the mistake `required-features` exists to prevent.
+[[example]]
+name = "spake-stand"
+required-features = ["spake"]
+
 # The `krb5Key` layout partner: it writes a value for Heimdal to decode and reads one Heimdal wrote.
 [[example]]
 name = "key-value"

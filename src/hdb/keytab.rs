@@ -122,6 +122,43 @@ impl Keytab {
 
     /// Parses keytab bytes.
     pub fn parse(data: &[u8]) -> Result<Self> {
+        Self::parse_with(data, &mut Vec::new())
+    }
+
+    /// Parses keytab bytes, skipping entries whose enctype this crate does not implement.
+    ///
+    /// **A separate entry point rather than a change to [`Self::parse`]**, because the two callers
+    /// want opposite things. A keytab of service keys is either usable or not, and a key silently
+    /// missing from it is a service that cannot authenticate — `parse` refuses, which is right.
+    ///
+    /// A **master key stash** is a different object: Heimdal writes one key per enctype it may seal
+    /// entries under, and a realm created with Heimdal's defaults gets `des3-cbc-sha1` in the same
+    /// file as `aes256`. Refusing the file means a slave cannot be given a real master's stash at
+    /// all. What matters for a master key is which key a given entry's `mkvno` names, and that is
+    /// checked at use time — so the keys this crate can use are returned, and the enctypes it cannot
+    /// are reported by number for the caller to log.
+    ///
+    /// The skipped list is returned rather than swallowed: an operator whose realm seals entries
+    /// under a key this KDC cannot read has to learn it from a diagnostic, not from a login that
+    /// fails months later.
+    pub fn parse_skipping_unsupported(data: &[u8]) -> Result<(Self, Vec<i32>)> {
+        let mut skipped = Vec::new();
+        let keytab = Self::parse_with(data, &mut skipped)?;
+        Ok((keytab, skipped))
+    }
+
+    /// The same, from a file.
+    pub fn load_skipping_unsupported(path: impl AsRef<Path>) -> Result<(Self, Vec<i32>)> {
+        let path = path.as_ref();
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| Error::Hdb(format!("cannot open {}: {e}", path.display())))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .map_err(|e| Error::Hdb(format!("cannot read {}: {e}", path.display())))?;
+        Self::parse_skipping_unsupported(&data)
+    }
+
+    fn parse_with(data: &[u8], skipped: &mut Vec<i32>) -> Result<Self> {
         let mut c = Cursor::new(data);
         let version = c.u16()?;
         let size_len = match version {
@@ -145,7 +182,13 @@ impl Keytab {
                 continue;
             }
             let body = c.take(raw_size as usize)?;
-            entries.push(Self::parse_entry(body)?);
+            match Self::parse_entry(body) {
+                Ok(entry) => entries.push(entry),
+                // Only an unimplemented enctype is skippable. A malformed entry is a broken file,
+                // and reading past it would turn a truncated keytab into a short one.
+                Err(Error::UnsupportedEnctype(id)) => skipped.push(id),
+                Err(other) => return Err(other),
+            }
         }
         Ok(Keytab { entries })
     }

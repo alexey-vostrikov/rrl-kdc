@@ -341,7 +341,6 @@ pub fn ticket_flags(
 /// stage announces, and the etype information that goes with it.
 fn method_data(entries: &[EtypeInfo2Entry], extra: &[(i32, Vec<u8>)]) -> Vec<u8> {
     let mut items = vec![
-        (PA_ENC_TIMESTAMP, Vec::new()),
         // Advertised unconditionally, as MIT's KDC does: a client that armors replaces
         // the timestamp with this, a client that does not ignores it. Offering it only
         // to clients that already armored would be circular — the first armored request
@@ -353,10 +352,22 @@ fn method_data(entries: &[EtypeInfo2Entry], extra: &[(i32, Vec<u8>)]) -> Vec<u8>
         (super::req_enc_pa_rep::PA_REQ_ENC_PA_REP, Vec::new()),
         (PA_ETYPE_INFO2, encode_etype_info2(entries)),
     ];
-    // The multi-round mechanisms the realm offers, after the single-round ones: a client
-    // reads this list to decide how to authenticate, and a mechanism missing from it is a
-    // mechanism it will never try.
+    // The mechanisms the realm offers come **before** `PA-ENC-TIMESTAMP`, and the order is
+    // load-bearing rather than cosmetic.
+    //
+    // A client that walks the KDC's `METHOD-DATA` and takes the first type it can answer will take
+    // whichever is listed first — MIT's `kinit` does exactly that, which was measured: with
+    // `PA-ENC-TIMESTAMP` first it produced an encrypted timestamp and never ran its SPAKE module,
+    // and the login succeeded, so nothing looked wrong. The consequence is not cosmetic either: a
+    // realm that offers SPAKE for the offline-attack property it exists to provide would have
+    // silently kept the oracle, and every test that only checks "the login worked" would agree.
+    //
+    // RFC 6113 §5.4.2.1 does not mandate an order, so this is interop rather than conformance —
+    // and the interop is MIT's own layout: FAST first, then the mechanisms, then the password.
+    // A mechanism missing from this list is one a client will never try; a mechanism listed after
+    // the password is one most clients will not try either.
     items.extend_from_slice(extra);
+    items.push((PA_ENC_TIMESTAMP, Vec::new()));
     encode_pa_data(&items)
 }
 

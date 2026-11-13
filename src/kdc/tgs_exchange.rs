@@ -533,10 +533,47 @@ impl Kdc {
                     entry
                 }
                 None => {
-                    return Err(Error::Kdc {
-                        code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
-                        text: format!("{sname} is not a service in this realm"),
-                    });
+                    // `referral_policy`: the built-in referral follows this realm's own hierarchy,
+                    // and a deployment may know of a name no hierarchy explains — a forest trust, a
+                    // KDC this crate was never told about. Heimdal consults a plugin at exactly this
+                    // point (`_kdc_referral_policy` in `kdc/krb5tgs.c`, after the lookup failed),
+                    // with the error code, so the policy can tell "no such service" from "the name
+                    // is not a service at all". The default answers `None` and the refusal stands.
+                    let asked = super::hooks::TicketRequest {
+                        exchange: super::hooks::Exchange::Tgs,
+                        client: proven.tgt.cname.clone(),
+                        service: sname.clone(),
+                        realm: config.realm().to_owned(),
+                    };
+                    match self
+                        .hooks()
+                        .referral_for(&asked, codes::KDC_ERR_S_PRINCIPAL_UNKNOWN)
+                    {
+                        Some(hop) => match self.hdb().fetch(&hop)? {
+                            Some(entry) => {
+                                sname = hop;
+                                entry
+                            }
+                            // A policy that names a realm this KDC holds no `krbtgt` for is a
+                            // broken policy, and saying so is better than a referral nothing can
+                            // follow: the client would walk to a hop that does not exist.
+                            None => {
+                                return Err(Error::Kdc {
+                                    code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                                    text: format!(
+                                        "the referral policy named {hop}, which this KDC does not \
+                                         hold: a policy may only point at a realm it can issue for"
+                                    ),
+                                });
+                            }
+                        },
+                        None => {
+                            return Err(Error::Kdc {
+                                code: codes::KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                                text: format!("{sname} is not a service in this realm"),
+                            });
+                        }
+                    }
                 }
             },
         };
@@ -546,6 +583,16 @@ impl Kdc {
                 text: format!("{sname} may not be issued a ticket"),
             });
         }
+        // `client_access`. Heimdal calls its hook in the AS exchange only; this crate calls it here
+        // too, because the question an operator asks — "alice may not have a ticket for
+        // `cifs/files`" — is a question about a TGS, and a hook that never sees one cannot answer
+        // it. The default is the passthrough, so nothing changes for a realm that installs none.
+        self.hooks().check_access(&super::hooks::TicketRequest {
+            exchange: super::hooks::Exchange::Tgs,
+            client: proven.tgt.cname.clone(),
+            service: server.principal.clone(),
+            realm: config.realm().to_owned(),
+        })?;
         // RFC 6806 §6: a TGS reply must not change the name the client asked for, so
         // `canonicalize` does not. Heimdal makes one exception, for deployments that depend on the
         // old behaviour: a service whose entry carries `force-canonicalize` gets the entry's own

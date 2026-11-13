@@ -44,6 +44,7 @@ pub mod fast;
 #[cfg(feature = "gss-preauth")]
 pub mod gss_hdb;
 pub mod gss_preauth;
+pub mod hooks;
 pub mod hwauth;
 /// The change-password service (RFC 3244): protocol constants, the reply a
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
@@ -211,6 +212,11 @@ pub struct Kdc {
     hdb: Arc<dyn Hdb>,
     cipher: Arc<dyn Cipher>,
     policy: Arc<dyn ChangePolicy>,
+    /// The `kdc-plugin.c` hooks this realm installs: access, referral, reply.
+    ///
+    /// Defaults are the do-nothing ones, so a realm that installs none behaves exactly as it did
+    /// before the seams existed.
+    hooks: hooks::Hooks,
     /// What counts as hardware authentication for an entry with `require-hwauth`.
     ///
     /// [`hwauth::CertificateOnly`] by default, which is Heimdal's own answer when no plugin is
@@ -273,6 +279,7 @@ impl Kdc {
             hdb,
             cipher,
             policy: Arc::new(SelfOnly),
+            hooks: hooks::Hooks::new(),
             hw_auth: Arc::new(hwauth::CertificateOnly),
             audit: None,
             identities: None,
@@ -551,6 +558,17 @@ impl Kdc {
         self.hw_auth.as_ref()
     }
 
+    /// Installs the `kdc-plugin.c` hooks.
+    pub fn with_hooks(mut self, hooks: hooks::Hooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// The hooks in force.
+    pub fn hooks(&self) -> &hooks::Hooks {
+        &self.hooks
+    }
+
     /// Records every decision in `audit`.
     ///
     /// One record per request, written by [`Self::handle_from`] — the only place that answers one.
@@ -698,17 +716,58 @@ impl Kdc {
                 } else {
                     audit::Exchange::As
                 };
+                let subject = audit::reply_subject(&reply, &req.body.realm);
                 self.record(audit::Record {
                     at: now,
                     exchange,
-                    client: audit::reply_subject(&reply, &req.body.realm),
+                    client: subject.clone(),
                     service: req.body.sname.clone(),
                     realm: req.body.realm.clone(),
                     peer,
                     outcome: audit::Outcome::Issued,
                     code: None,
                 });
-                reply
+                // `finalize_reply`: the last thing a reply passes through, in Heimdal's position —
+                // after the reply exists, before it goes out. A hook that refuses becomes a
+                // `KRB-ERROR`, which is what Heimdal does with a non-zero return.
+                let finalized = self.hooks().finalize(
+                    &hooks::TicketRequest {
+                        exchange: match exchange {
+                            audit::Exchange::Tgs => hooks::Exchange::Tgs,
+                            _ => hooks::Exchange::As,
+                        },
+                        client: subject.unwrap_or_else(|| {
+                            req.body
+                                .cname
+                                .clone()
+                                .unwrap_or_else(|| Principal::krbtgt(self.config.realm()))
+                        }),
+                        service: req
+                            .body
+                            .sname
+                            .clone()
+                            .unwrap_or_else(|| Principal::krbtgt(self.config.realm())),
+                        realm: req.body.realm.clone(),
+                    },
+                    reply,
+                );
+                finalized.unwrap_or_else(|err| {
+                    // The audit record already says the ticket was issued, and it was: the hook saw
+                    // a reply and refused it. Recorded as a refusal too, because what the client
+                    // got is the refusal and a trail that said only "issued" would be a lie about
+                    // the wire.
+                    self.record(audit::Record {
+                        at: now,
+                        exchange,
+                        client: req.body.cname.clone(),
+                        service: req.body.sname.clone(),
+                        realm: req.body.realm.clone(),
+                        peer,
+                        outcome: audit::Outcome::Refused,
+                        code: Some(Self::reply_code(&err)),
+                    });
+                    self.error(Some(&req), &err, now)
+                })
             }
             Err(err) => {
                 let reply = self.error(Some(&req), &err, now);

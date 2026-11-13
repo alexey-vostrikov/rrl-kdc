@@ -1004,6 +1004,19 @@ impl Kdc {
                 .ok_or_else(|| preauth_failed(&cname, &entries, "no key for the session enctype"))?
         };
 
+        // 5b. `client_access` — Heimdal's `_kdc_check_access`, called here in `kdc/kerberos5.c`
+        // immediately after pre-authentication and before the reply is built, for the same reason:
+        // a decision about a name nobody has authenticated yet is a decision about a claim.
+        //
+        // The default policy is the passthrough, and the HDB flag checks above already ran, so a
+        // realm that installed nothing is unaffected.
+        self.hooks().check_access(&super::hooks::TicketRequest {
+            exchange: super::hooks::Exchange::As,
+            client: cname.clone(),
+            service: server.principal.clone(),
+            realm: config.realm().to_owned(),
+        })?;
+
         // 6. Flags and times.
         let may_postdate = may_postdate(body, &client, &server)?;
         let start = starttime(body, &client);

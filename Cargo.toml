@@ -97,9 +97,11 @@ spake = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:p521"]
 # GSS pre-authentication (`kdc::gss_preauth`): the mechanism is always compiled, the concrete
 # acceptor over the realm's own HDB is not, because it brings the client crate in.
 gss-preauth = ["dep:rrl-krb5"]
-# OTP pre-authentication (RFC 6560). No dependency: the ASN.1 and the nonce check are this
-# crate's, and the one-time value is judged by a `Verifier` the caller supplies.
-otp = []
+# OTP pre-authentication (RFC 6560). The ASN.1, the nonce check and the base64 the key derivation
+# feeds on are this crate's; `base64` comes with it because RFC 6560 §3.6 derives K2 from the
+# *base64 encoding* of the value, and a hand-written encoder in a key-derivation path is a place
+# where a padding rule silently changes every key.
+otp = ["dep:base64"]
 # The JSON form of the administrator's vocabulary, for a transport that speaks
 # HTTP. `serde` alone is enough for the domain types (`Principal`, `Enctype`);
 # this feature adds the request and reply envelopes and the base64 encoding the

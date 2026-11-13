@@ -50,6 +50,10 @@ pub mod hwauth;
 /// caller frames, and the `kadmin/changepw` entry a realm needs.
 pub mod kpasswd;
 pub mod logon_info;
+// Behind `otp`, as the README says: RFC 6560 §3.6 derives the Client and Reply keys from the
+// *base64* of the value, so this module needs `base64`, and a default build that carried the
+// dependency for a mechanism it does not compile would be a dependency nobody chose.
+#[cfg(feature = "otp")]
 pub mod otp;
 pub mod pac;
 pub mod pkinit;

@@ -73,7 +73,7 @@ drives the acceptance tests; impacket checks the PAC and the AD key projection, 
 | `kdc::req_enc_pa_rep` — RFC 6806 §11 | done: the request checksum in the *encrypted* part of the reply, the `enc-pa-rep` flag, and `PA-FX-FAST` beside it — which is how a client learns from FAST that S4U exists |
 | `kdc::cookie` — RFC 6113 §5.4.2.3 `PA-FX-COOKIE` | done: opaque realm state, sealed under a key of its own; an expired, foreign or altered cookie is ignored rather than refused, because refusing would let a rewritten request break a legitimate login |
 | `kdc::preauth` — the multi-round framework | done: `KDC_ERR_MORE_PREAUTH_DATA_REQUIRED` (91), a mechanism trait that returns the reply key itself, and nothing advertised by a realm that configured nothing |
-| `kdc::spake` — RFC 9588 SPAKE (feature `spake`) | done for `edwards25519`: the mask, the transcript, `K'[n]`, and the second factor that proves the password. Checked against the published vectors and accepted by `krb5` |
+| `kdc::spake` — RFC 9588 SPAKE (feature `spake`) | done: the mask, the transcript, `K'[n]`, and the second factor that proves the password. Checked against the published vectors and accepted by `krb5`; the registry groups are below |
 | `kdc::hooks` — `kdc-plugin.c`'s `check_access`, `referral_policy`, `finalize_reply` | done: `Hooks` carries three traits with Heimdal's own defaults (`Allow`, `NoReferral`, `Keep`), so a realm that installs none behaves byte for byte as before. `client_access` is consulted in the AS exchange as Heimdal does **and** in the TGS, which Heimdal does not — the question an operator asks is about a service ticket, and a hook that never sees one cannot answer it. A refusal is `KDC_ERR_POLICY`, the code Heimdal answers with. A referral policy is consulted where the built-in referral found nothing and is told the error code, so it can tell "no such service" from "not a service at all"; a hop this KDC holds no `krbtgt` for is refused by name rather than sent to a KDC that does not exist. `finalize_reply` sees the encoded reply and may replace or refuse it |
 | `kdc::hwauth` — `require-hwauth` (`_kdc_hwauth_policy`) | done: the flag is now enforced, checked before any credential is validated so it cannot serve as a password oracle. Default policy is Heimdal's: a certificate admits (`PA_HARDWARE_AUTH` is set on the two PKINIT entries and nowhere else), everything else is refused with `KDC_ERR_POLICY`. `HwAuthPolicy` is the seam; `AllowList` is the configuration-shaped one. The flag *alone* does not force pre-authentication — Heimdal's check sits inside the pre-authentication loop — so it is meaningful together with `require-preauth`, and that is pinned by a test rather than left to be discovered |
 | `kdc::audit` — the trail (`kdc/kdc-plugin.c`'s `audit` hook) | done: one `Record` per request, emitted by `Kdc::handle_from` — the only place that answers one — so an undecodable request is recorded too; the subject comes from the **reply** when a ticket is issued (after an alias, a canonicalization or `PA-FOR-USER`) and from the request when it is refused (a `KRB-ERROR` carries no client); the code is the one the client received. `Audit` cannot fail, so a full disk cannot refuse a login. Three layers: `Record` (the decision as data), `Audit` (takes records — batch, sign, ship), `AuditDriver` (takes the **record**, because an OTLP log record carries attributes and a rendered line has already thrown them away); a closure is a driver. For OpenTelemetry the mapping is part of the contract, not the exporter's invention: `Record::attributes` (`kerberos.*`, plus `client.address` where the semantic conventions define one), `Record::severity_number` (9 `INFO`, 13 `WARN` — a refusal is the KDC working, not a fault), body `Record::to_line`. `Collector`, `DriverAudit` over any driver, and `ToWriter` (flushes every line) ship |
@@ -144,14 +144,8 @@ The target is behavioural parity with Heimdal's `kdc/`, so the gaps are worth st
 than leaving to be discovered. Measured against `kdc/*.c` of the Heimdal tree and `src/` of
 this crate.
 
-Planned:
-
-* **OTP's `must-encrypt-nonce` variant** (RFC 6560 §3.3) — where the one-time value never travels
-  and generates the reply key instead. It needs the KDC to hold every token's current value, which
-  this crate has no store for; the variant that asks a verifier is written.
-* **Replication** (`kdc/hprop.c`, `hpropd.c`) — a second domain controller. The mechanism and the role seam are in `hprop::replica`; what is not here is the operations around it — which scheduler pushes and when, and what pages an operator when `last_sync` goes stale
-  in the sense of "next": a decision was taken that one HDB is enough, so this sits at
-  `deferred` rather than `todo`.
+Planned: nothing. Every gap this section used to list is either shipped or closed as a decision
+below — the list is kept, and kept empty, because a parity table that never empties stops being read.
 
 Done since an earlier version of this section listed them as absent, because a parity table
 that does not move reads as a claim about the code:
@@ -162,8 +156,17 @@ that does not move reads as a claim about the code:
   arrived, which is the only thing that makes an exchange multi-round.
 * **`forwarded` and `proxy`** `kdc-options` — honoured in the TGS, including the refusal of a
   proxied TGT.
+* **OTP's `must-encrypt-nonce` variant** (RFC 6560 §3.3) — `kdc::otp` writes the flag when a realm
+  installs an `OtpSource`, derives the Client and Reply keys from the value (§3.6) and refuses a
+  value sent although the challenge withheld it. Live interop is not covered: no client in the
+  stand speaks this variant — MIT has only the ASN.1 for it and Heimdal has no OTP at all.
+* **Replication as a second domain controller** — `hprop::replica` (role, `ReadOnly`, `kvno` guard,
+  `SyncState`) and `hprop::push` (the sending half). `scripts/hprop-push-stand.sh` runs two
+  processes of this crate end to end. What is left out is operations: which scheduler pushes and
+  what pages an operator when `last_sync` goes stale.
 * **Enterprise names** (`NT-ENTERPRISE`, RFC 6806 §6), **anonymous PKINIT** (RFC 8062),
-  **`PA-REQ-ENC-PA-REP`** (RFC 6806 §11), **SPAKE** (RFC 9588, `edwards25519`) and
+  **`PA-REQ-ENC-PA-REP`** (RFC 6806 §11), **SPAKE** (RFC 9588, all four registry groups, with MIT's
+  `kinit` logging in over edwards25519, P-256 and P-384) and
   **OTP** (RFC 6560, FAST OTP).
 
 Outside the intent: `bx509d`, `httpkadmind`, JWT and token validators, and `announce`. These

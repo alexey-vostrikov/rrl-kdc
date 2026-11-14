@@ -115,6 +115,44 @@ fn tgt(krbtgt_key: &Key, endtime: i64) -> (Vec<u8>, Key) {
     (ticket.encode(), session_key)
 }
 
+/// The same, minted at a chosen instant.
+///
+/// `tgt` fixes `authtime` at `NOW - 60`, which is close enough to `now` that a ticket inheriting it
+/// and a ticket stamped with `now` differ by a minute — an assertion over that would pass for the
+/// wrong reason on a slow machine. This one moves it an hour, so the two candidates cannot be
+/// confused.
+fn tgt_at(krbtgt_key: &Key, endtime: i64, authtime: i64) -> (Vec<u8>, Key) {
+    let cipher = OwnCipher;
+    let session_key = cipher.random(Enctype::Aes256Sha1).unwrap();
+    let part = EncTicketPart {
+        flags: tkt_flags::INITIAL | tkt_flags::PRE_AUTHENT | tkt_flags::FORWARDABLE,
+        session_key: session_key.clone(),
+        crealm: REALM.into(),
+        cname: alice(),
+        transited_type: 0,
+        transited: Vec::new(),
+        authtime,
+        starttime: None,
+        endtime,
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let ticket = Ticket {
+        realm: REALM.into(),
+        sname: Principal::krbtgt(REALM),
+        enc: EncryptedData::seal(
+            &cipher,
+            krbtgt_key,
+            usage::KDC_REP_TICKET,
+            Some(1),
+            &part.encode(),
+        )
+        .unwrap(),
+    };
+    (ticket.encode(), session_key)
+}
+
 /// A `TGS-REQ` for `service()` whose body says `till`.
 fn tgs_req(ticket: &[u8], session_key: &Key, till: i64) -> Vec<u8> {
     let cipher = OwnCipher;
@@ -485,5 +523,40 @@ fn an_account_that_allows_no_requested_enctype_is_refused_by_name() {
     assert!(
         text.contains("Aes128Sha1"),
         "and say what it allows: {text}"
+    );
+}
+
+/// A service ticket's `authtime` is the one the TGT carries, not the moment of the request.
+///
+/// RFC 4120 §5.4.2 calls the field "the time of initial authentication", and a ticket that restated
+/// every hop as a fresh login would be wrong twice over: a service reading a session's age from it
+/// would see a client that authenticated a moment ago, and a PAC built from it would state that as
+/// the logon time. Heimdal takes it from the TGT (`kdc/krb5tgs.c`: `et->authtime = tgt->authtime`),
+/// as do this crate's own renewal and validation plans.
+///
+/// The TGT here is minted an hour in the past and the request is answered at `NOW`, so the two
+/// candidate values are an hour apart and the assertion cannot pass by coincidence.
+#[test]
+fn a_service_ticket_inherits_the_authtime_of_its_tgt() {
+    let (kdc, krbtgt_key, _) = kdc(NOW + 2 * max_life());
+    let minted_at = NOW - 3600;
+    let (ticket, session) = tgt_at(&krbtgt_key, NOW + 2 * max_life(), minted_at);
+
+    let reply = kdc.handle(&tgs_req(&ticket, &session, NOW + 3600), NOW);
+    assert!(
+        msg::KrbError::decode(&reply).is_err(),
+        "{:?}",
+        msg::KrbError::decode(&reply)
+    );
+
+    let rep = rep_part(&reply, &session);
+    assert_eq!(
+        rep.authtime, minted_at,
+        "the ticket states when the client authenticated, which is when the TGT was issued"
+    );
+    assert_ne!(
+        rep.authtime, NOW,
+        "and not when this hop happened: {} is the request's time",
+        NOW
     );
 }

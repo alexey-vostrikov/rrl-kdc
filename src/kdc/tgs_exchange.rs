@@ -250,6 +250,7 @@ fn service_plan(
     body: &msg::KdcReqBody,
     server: &HdbEntry,
     tgt_flags: u32,
+    tgt_authtime: i64,
     tgt_endtime: i64,
     now: i64,
 ) -> Result<TicketPlan> {
@@ -309,7 +310,14 @@ fn service_plan(
     }
     Ok(TicketPlan {
         flags,
-        authtime: now,
+        // The TGT's, not `now`: RFC 4120 §5.4.2 calls this "the time of initial authentication",
+        // and a service ticket that said "just now" would restate every hop as a fresh login. A
+        // service comparing a session's age against it — and a PAC carrying it as the logon time —
+        // would then describe a client that authenticated at each hop, which is the opposite of what
+        // a ticket-granting ticket is for. Heimdal does the same (`kdc/krb5tgs.c`: `et->authtime =
+        // tgt->authtime`), and so do the renewal and validation plans here, which took it from the
+        // TGT from the start: this branch was the one place that did not.
+        authtime: tgt_authtime,
         starttime: None,
         endtime,
         renew_till,
@@ -727,6 +735,7 @@ impl Kdc {
                 body,
                 &server,
                 proven.tgt.flags,
+                proven.tgt.authtime,
                 proven.tgt.endtime,
                 now,
             )?

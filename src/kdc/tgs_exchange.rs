@@ -842,7 +842,21 @@ impl Kdc {
                 super::is_root_tgt(&server.principal),
                 super::pac_attributes(padata),
             ) {
-                self.pac_authorization_data(&client, &ticket_key.0, authtime)?
+                // The PAC the TGT carried, which the issuer may keep, replace or merge. Extracted
+                // here rather than passed as raw authorization data: an issuer is given the PAC, not
+                // the envelope around it, and the walk is this crate's one rule for nesting.
+                let old_pac = proven
+                    .tgt
+                    .authorization_data
+                    .as_deref()
+                    .and_then(super::pac::extract_pac);
+                self.pac_authorization_data(
+                    &client,
+                    &server.principal,
+                    &ticket_key.0,
+                    authtime,
+                    old_pac.as_deref(),
+                )?
             } else {
                 None
             },

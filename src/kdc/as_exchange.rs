@@ -1142,7 +1142,14 @@ impl Kdc {
                 is_root_tgt(&server.principal),
                 super::pac_attributes(padata),
             ) {
-                self.pac_authorization_data(&client.principal, &server_key.key, now)?
+                // An `AS` exchange has no incoming ticket, so no PAC to carry forward.
+                self.pac_authorization_data(
+                    &client.principal,
+                    &server.principal,
+                    &server_key.key,
+                    now,
+                    None,
+                )?
             } else {
                 None
             },

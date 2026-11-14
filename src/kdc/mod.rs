@@ -232,7 +232,12 @@ pub struct Kdc {
     /// without being asked would be a KDC that fills a disk nobody knew it had. A realm that needs
     /// an audit trail says so once, here.
     audit: Option<Arc<dyn audit::Audit>>,
-    identities: Option<Arc<dyn logon_info::PacIdentities>>,
+    /// Who builds a PAC, when this realm issues one.
+    ///
+    /// `None` is "this realm issues no PAC", which is the default and the same answer MIT gives a
+    /// configuration with no kdb `issue_pac`. A PAC states SIDs and group membership, and a KDC that
+    /// invented them would produce a ticket services trust and cannot verify the contents of.
+    pac: Option<Arc<dyn pac::PacIssuer>>,
     /// The realm's certificate and trust anchors, when PKINIT is configured.
     ///
     /// `None` means the realm authenticates with passwords only, and a `PA-PK-AS-REQ` is
@@ -267,7 +272,7 @@ impl std::fmt::Debug for Kdc {
         f.debug_struct("Kdc")
             .field("config", &self.config)
             .field("policy", &self.policy)
-            .field("issues_pac", &self.identities.is_some())
+            .field("issues_pac", &self.pac.is_some())
             .field("pkinit", &self.offers_pkinit())
             .field("cookie", &self.cookie_key.is_some())
             .field("preauth", &self.preauth)
@@ -286,7 +291,7 @@ impl Kdc {
             hooks: hooks::Hooks::new(),
             hw_auth: Arc::new(hwauth::CertificateOnly),
             audit: None,
-            identities: None,
+            pac: None,
             #[cfg(feature = "pkinit")]
             pkinit: None,
             #[cfg(feature = "pkinit")]
@@ -442,13 +447,28 @@ impl Kdc {
     /// realm with no Windows clients: a PAC that states an identity invented here
     /// would be worse than no PAC at all.
     pub fn with_pac(mut self, identities: Arc<dyn logon_info::PacIdentities>) -> Self {
-        self.identities = Some(identities);
+        self.pac = Some(Arc::new(pac::IdentityIssuer::new(identities)));
+        self
+    }
+
+    /// Installs the PAC issuer itself, the way MIT's `issue_pac` is installed by a kdb module.
+    ///
+    /// This is the seam a directory uses when the facts behind a PAC are its own and reachable only
+    /// through its own code — SIDs, RIDs and group membership out of a catalogue — and when it has
+    /// to make decisions [`logon_info::PacIdentities`] cannot express: keeping the PAC an incoming
+    /// ticket carried, merging it, or refusing to state one for an account it does not trust.
+    ///
+    /// The issuer builds and signs; the format it must produce is `rrl-krb-common`'s, shared with
+    /// the acceptor, so a second NDR written here would be a second way to make a PAC Windows
+    /// rejects. [`pac::PacRequest`] hands it both keys for the same reason.
+    pub fn with_pac_issuer(mut self, issuer: Arc<dyn pac::PacIssuer>) -> Self {
+        self.pac = Some(issuer);
         self
     }
 
     /// Whether tickets carry a PAC.
     pub fn issues_pac(&self) -> bool {
-        self.identities.is_some()
+        self.pac.is_some()
     }
 
     /// Whether a ticket for `server` carries a PAC, per Heimdal's `_kdc_include_pac_p`.
@@ -487,22 +507,27 @@ impl Kdc {
         pac_attributes & (pac::WAS_REQUESTED | pac::WAS_GIVEN_IMPLICITLY) != 0
     }
 
-    /// The `AuthorizationData` a ticket for `client` carries, or `None` when this
-    /// realm does not issue PACs or the directory does not know the account.
+    /// The `AuthorizationData` a ticket for `client` carries, or `None` when this realm issues no
+    /// PAC, the issuer declines, or the directory does not know the account.
     ///
-    /// The signature type follows `server_key`, because a PAC signature is keyed by
-    /// the ticket's service key — and the `krbtgt` key that countersigns it must be
-    /// of the same enctype, so that one signature type describes both checksums.
+    /// **What is left here is plumbing and policy, not identity.** The KDC chooses the signature
+    /// type from the service key's enctype — one type has to describe both checksums, and the
+    /// `krbtgt` key that countersigns must be of that enctype — fetches that key, and hands the
+    /// issuer a [`pac::PacRequest`]. Building the buffers and signing them is the issuer's, which is
+    /// the split MIT makes between `kdc_authdata.c` and the kdb module's `issue_pac`.
+    ///
+    /// `old_pac` is the PAC the incoming ticket carried, for a `TGS-REQ`: an issuer that had no way
+    /// to see it could not keep a PAC across a service hop, and the decision to keep, replace or
+    /// merge is the directory's rather than this function's.
     pub(crate) fn pac_authorization_data(
         &self,
         client: &Principal,
+        server: &Principal,
         server_key: &crate::crypto::Key,
-        now: i64,
+        authtime: i64,
+        old_pac: Option<&[u8]>,
     ) -> crate::Result<Option<Vec<u8>>> {
-        let Some(identities) = &self.identities else {
-            return Ok(None);
-        };
-        let Some(identity) = identities.identity(client)? else {
+        let Some(issuer) = &self.pac else {
             return Ok(None);
         };
         let signature =
@@ -530,22 +555,15 @@ impl Kdc {
                     signature.enctype()
                 ),
             })?;
-
-        let logon = identity.logon_info(client.to_string(), now);
-        let mut blob = pac::pac(&[
-            pac::Buffer::new(pac::PAC_LOGON_INFO, logon_info::encode(&logon)?),
-            pac::client_info(&logon.effective_name, now)?,
-            pac::Buffer::new(
-                pac::PAC_SERVER_CHECKSUM,
-                vec![0u8; signature.signature_len() + 4],
-            ),
-            pac::Buffer::new(
-                pac::PAC_PRIVSVR_CHECKSUM,
-                vec![0u8; signature.signature_len() + 4],
-            ),
-        ]);
-        pac::seal(&mut blob, server_key, &kdc_key.key, signature)?;
-        Ok(Some(pac::authorization_data(&blob)))
+        issuer.issue(&pac::PacRequest {
+            client,
+            server,
+            authtime,
+            signature,
+            server_key,
+            kdc_key: &kdc_key.key,
+            old_pac,
+        })
     }
 
     /// Decides what `require-hwauth` accepts, when the realm's answer differs from Heimdal's.

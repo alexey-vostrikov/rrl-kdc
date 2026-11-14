@@ -259,11 +259,18 @@ pub fn kerberos_newer_keys(entry: &HdbEntry) -> Vec<u8> {
         (credentials, old, older)
     };
 
+    // **The salt is a WCHAR string, so it is written UTF-16LE.** `DefaultSalt` in
+    // [MS-SAMR] §2.2.10.1 is `RPC_UNICODE_STRING`, and a real directory's blob carries
+    // `F\0I\0X\0.\0T\0E\0S\0T\0…` where a naive reading expects `FIX.TEST…`. Writing the
+    // bytes of a Rust `String` here produces a blob whose salt a Windows or Samba KDC reads as
+    // "FIX.TEST" with every other octet missing — and string-to-key over that salt derives keys
+    // that open nothing, with the account's own keys sitting right beside them.
     let salt = entry
         .keys
         .first()
         .and_then(|k| k.salt.clone())
         .unwrap_or_else(|| entry.principal.default_salt());
+    let salt = wchar_bytes(&salt);
 
     // `KERB_STORED_CREDENTIAL_NEW`'s fixed part: eight 16-bit fields and two
     // 32-bit ones.
@@ -391,6 +398,16 @@ pub struct AdCredential {
 /// the order of its counts, and an entry read back at one version has no use for
 /// the distinction.
 pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
+    Ok(credentials_with_skipped(blob)?.0)
+}
+
+/// The same, with the enctypes this crate does not implement named rather than dropped in silence.
+///
+/// A caller that logs the second half tells an operator why a directory holds keys that vanished from
+/// a ticket: an account whose only keys are `des-cbc-md5` reads as "no usable keys" here, and that is
+/// a fact about the realm, not a corrupt blob. [`crate::hdb::ldap::from_attributes`] does not need it
+/// — a skipped key is one no ticket can use — but a diagnostic does.
+pub fn credentials_with_skipped(blob: &[u8]) -> Result<(Vec<AdCredential>, Vec<i32>), AdBlobError> {
     let value = property_value(blob, PROPERTY_KERBEROS_NEWER_KEYS)?;
     let inner = unhex(value)?;
     if inner.len() < CREDENTIAL_HEADER {
@@ -415,10 +432,13 @@ pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
     if end > inner.len() {
         return Err(AdBlobError::Inconsistent);
     }
+    // Decoded from UTF-16LE, the way the field is written: `DefaultSalt` is a WCHAR string. Handing
+    // the raw octets on would give a caller a salt with a NUL after every character, and every key
+    // derived from it would differ from the keys in the same blob.
     let salt = if salt_len == 0 {
         None
     } else {
-        Some(inner[salt_offset..end].to_vec())
+        Some(wchar_string(&inner[salt_offset..end])?)
     };
     let array_end = CREDENTIAL_HEADER
         .checked_add(
@@ -431,6 +451,7 @@ pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
         return Err(AdBlobError::Inconsistent);
     }
 
+    let mut skipped: Vec<i32> = Vec::new();
     let mut keys = Vec::with_capacity(total);
     for i in 0..total {
         let at = CREDENTIAL_HEADER + i * KEY_DATA_NEW;
@@ -441,7 +462,16 @@ pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
         if key_end > inner.len() {
             return Err(AdBlobError::Inconsistent);
         }
-        let enctype = Enctype::from_id(id).ok_or(AdBlobError::UnknownEnctype(id))?;
+        // **An enctype this crate does not implement is skipped, not fatal.** Every blob a real
+        // directory writes carries the pre-2008 pair — `des-cbc-md5` (3) and `des-cbc-crc` (1) —
+        // beside the AES keys, because `Primary:Kerberos` is built from them; Samba's own
+        // `supplementalCredentials` was measured to hold four credentials for a freshly created
+        // account, two of them DES. Refusing the blob on those would make every account in an
+        // AD-shaped directory unreadable, which is the opposite of what this reader is for.
+        let Some(enctype) = Enctype::from_id(id) else {
+            skipped.push(id);
+            continue;
+        };
         // `Key::new` is the one place that knows each enctype's length, so a
         // structure that claims an impossible length is refused here rather than
         // becoming a key nothing can ever decrypt with.
@@ -453,7 +483,7 @@ pub fn credentials(blob: &[u8]) -> Result<Vec<AdCredential>, AdBlobError> {
             salt: salt.clone(),
         });
     }
-    Ok(keys)
+    Ok((keys, skipped))
 }
 
 /// [`credentials`] as `HdbKey`s at `kvno`, ready to be handed to a KDC.
@@ -497,7 +527,13 @@ fn property_value<'a>(blob: &'a [u8], name: &str) -> Result<&'a [u8], AdBlobErro
     if length != blob.len() - 13 && length != blob.len() - 12 {
         return Err(AdBlobError::NotUserProperties);
     }
-    if u16_at(blob, 8) != 1 || u16_at(blob, 108) != PROPERTY_SIGNATURE {
+    // `Reserved2` is **not** checked. §2.2.10.1 says it "MUST be set to 1", and Samba writes 0: a
+    // freshly provisioned domain's `supplementalCredentials` was measured at `Reserved2 = 0,
+    // Reserved3 = 0` with a valid signature and count, and requiring the specification's value made
+    // every account a Samba directory holds unreadable. `PropertySignature` is what identifies the
+    // structure — it is the only field here that is not either reserved or self-describing — so a
+    // reserved field is left to the writer that filled it in.
+    if u16_at(blob, 108) != PROPERTY_SIGNATURE {
         return Err(AdBlobError::NotUserProperties);
     }
     // No `PropertyCount` field at all when there is nothing to count.
@@ -546,6 +582,37 @@ fn utf16(bytes: &[u8]) -> Result<String, AdBlobError> {
         .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&units).map_err(|_| AdBlobError::Inconsistent)
+}
+
+/// The octets of `text` as a WCHAR string: UTF-16LE, with no terminating NUL.
+///
+/// `DefaultSalt` is the one field in these structures spelled as text, and Windows and Samba both
+/// write it as UTF-16LE. The terminator is left out because the structure carries a length beside the
+/// salt: a writer that appended one would make `DefaultSaltLength` disagree with the salt the keys
+/// were derived from.
+fn wchar_bytes(text: &[u8]) -> Vec<u8> {
+    let units = text.iter().map(|&b| u16::from(b));
+    let mut out = Vec::with_capacity(text.len() * 2);
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// UTF-16LE text back to its octets, trailing NUL padding removed.
+///
+/// The padding is what a directory appends when it writes a fixed-width buffer, and it is not part of
+/// the salt. Removed here rather than by the caller so that a salt read from any real directory is
+/// the string that was passed to string-to-key.
+fn wchar_string(bytes: &[u8]) -> Result<Vec<u8>, AdBlobError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(AdBlobError::Inconsistent);
+    }
+    let mut out = utf16(bytes)?.into_bytes();
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    Ok(out)
 }
 
 /// Hexadecimal text back to octets: the inverse of [`hex_lower`], and as strict.
@@ -1011,16 +1078,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_enctype_is_refused_by_number() {
+    fn an_unknown_enctype_is_skipped_and_named() {
+        // This used to assert the whole blob was refused, and that was wrong: every blob a real
+        // directory writes carries `des-cbc-md5` (3) and `des-cbc-crc` (1) beside the AES keys, so
+        // refusing on an unimplemented enctype made every account in an AD-shaped directory
+        // unreadable. The fixture `tests/fixtures/ad_blob/*.json`, written by Samba, is what showed
+        // it — four credentials for a freshly created account, two of them DES.
         let mut blob = supplemental_credentials(&entry());
         let value_at = kerberos_property(&blob).0;
-        // Enctype is at +12 of the key entry.
+        // Enctype is at +12 of the key entry, and each is 8 hex digits: `17000000` is
+        // `des3-cbc-sha1` (16), deliberately a number this crate does not implement.
         let at = value_at + 2 * (CREDENTIAL_HEADER + 12);
-        // `17000000` is `des3-cbc-sha1` (16) — deliberately a number this crate does not implement.
-        // It used to be 23, and 23 is `rc4-hmac`, which is implemented now: the test would have
-        // started asserting that a supported enctype is refused.
         blob[at..at + 8].copy_from_slice(b"10000000");
-        assert_eq!(credentials(&blob), Err(AdBlobError::UnknownEnctype(16)));
+
+        let (keys, skipped) = credentials_with_skipped(&blob).expect("the other keys are readable");
+        assert_eq!(skipped, vec![16], "the enctype that was skipped, by number");
+        assert_eq!(
+            keys.len(),
+            3,
+            "and the keys this crate can use are still there"
+        );
+        assert!(
+            keys.iter().any(|c| c.enctype == Enctype::Aes256Sha1),
+            "including the ones the rewrite did not touch"
+        );
+        // `credentials` is the same answer without the diagnosis.
+        assert_eq!(credentials(&blob).unwrap().len(), 3);
     }
 
     #[test]

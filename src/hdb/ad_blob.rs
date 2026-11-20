@@ -828,6 +828,33 @@ mod tests {
             "the default salt must be inside the buffer"
         );
         assert_eq!(salt_offset, 24 + 4 * 24, "the salt follows the key array");
+        // **The salt is a WCHAR string, so its length is twice the characters and every second octet
+        // is zero.** Asserting the raw bytes is the only way to pin this: the reader decodes UTF-16LE
+        // and the writer encodes it, so a round trip through both passes just as happily when both use
+        // the raw bytes — which is exactly the defect a real Samba blob exposed, in the reader, where
+        // the sample `F\0I\0X\0…` was what gave it away.
+        let salt_bytes = &blob[salt_offset..salt_offset + salt_len];
+        let expected = entry.principal.default_salt();
+        assert_eq!(
+            salt_len,
+            2 * expected.len(),
+            "DefaultSaltLength counts WCHARs, so twice the characters"
+        );
+        for (i, &octet) in salt_bytes.iter().enumerate() {
+            if i % 2 == 1 {
+                assert_eq!(
+                    octet, 0,
+                    "octet {i} is the high half of a WCHAR and must be zero"
+                );
+            } else {
+                assert_eq!(
+                    octet,
+                    expected[i / 2],
+                    "octet {i} is the character at {}",
+                    i / 2
+                );
+            }
+        }
 
         for i in 0..4 {
             let at = 24 + i * 24;

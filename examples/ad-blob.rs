@@ -28,8 +28,13 @@ use rrl_kdc::hdb::ad_blob::{empty_supplemental_credentials, supplemental_credent
 use rrl_kdc::name::Principal;
 
 fn main() -> std::io::Result<()> {
-    let relative = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(index) = args.iter().position(|a| a == "--principal") {
+        return one_entry(&args, index);
+    }
+    let relative = args
+        .first()
+        .cloned()
         .unwrap_or_else(|| "target/ad-blob".to_owned());
     let out = Path::new(&relative);
     std::fs::create_dir_all(out)?;
@@ -78,6 +83,51 @@ fn main() -> std::io::Result<()> {
     )?;
 
     println!("wrote blobs to {}", out.display());
+    Ok(())
+}
+
+/// One entry, for a principal and a password given on the command line.
+///
+/// The live check needs a blob for an account that exists in a real directory:
+/// `scripts/ad-blob-samba-live.sh` writes this blob into a Samba domain's
+/// `supplementalCredentials`, and then a stock `kinit` logs in with the same
+/// password. That is the direction the fixture set cannot cover — those check
+/// that we read what a directory wrote, this checks that a directory reads what we
+/// write, string-to-key and salt included.
+///
+/// ```sh
+/// cargo run --example ad-blob --features hdb-ldap -- \
+///     --principal fixture@FIX.TEST --password 'a password' --out target/blob
+/// ```
+fn one_entry(args: &[String], _index: usize) -> std::io::Result<()> {
+    let value = |flag: &str| -> std::io::Result<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|at| args.get(at + 1))
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{flag} needs a value"),
+                )
+            })
+    };
+    let principal = Principal::parse(&value("--principal")?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    let password = value("--password")?;
+    let out = Path::new(&value("--out")?).to_path_buf();
+    std::fs::create_dir_all(&out)?;
+
+    let mut entry = HdbEntry::user(principal);
+    // Every enctype this crate implements, at one version, so the blob carries the
+    // shape a directory writes beside the AES keys it needs.
+    for enctype in Enctype::ALL {
+        entry
+            .add_password_key(&OwnCipher, enctype, password.as_bytes(), 1)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+    write_entry(&out, "entry", &entry)?;
+    println!("{}", out.join("entry.blob").display());
     Ok(())
 }
 

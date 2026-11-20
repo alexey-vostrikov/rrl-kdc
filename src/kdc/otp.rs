@@ -409,14 +409,8 @@ fn decode_request(value: &[u8]) -> Result<Request2> {
 /// The nonce is a secret the KDC issued; comparing it byte by byte with early exit leaks how much
 /// of a guess was right, and a nonce is short enough to walk one octet at a time.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // RRL-7.2: one implementation in the crypto layer, so the choice of compare is made once.
+    rrl_crypto::ct_eq(a, b)
 }
 
 impl<V: Verifier> Mechanism for Otp<V> {

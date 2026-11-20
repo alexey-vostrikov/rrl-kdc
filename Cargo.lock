@@ -1116,7 +1116,7 @@ dependencies = [
 [[package]]
 name = "rrl-crypto"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#e9c80260051446efb07bb7ce2e2e1f0c1dfb8f25"
+source = "git+https://github.com/alexey-vostrikov/rrl-crypto?branch=main#89d668e7cb4eebf655925b42cf9af38095bdf181"
 dependencies = [
  "aes",
  "getrandom 0.4.3",
@@ -1166,7 +1166,7 @@ dependencies = [
 [[package]]
 name = "rrl-krb-common"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#ab5aab864c724bd4f420022f0615c616edb4dc67"
+source = "git+https://github.com/alexey-vostrikov/rrl-krb-common?branch=main#f2447f0b368b4599343b5daa9f5248781d64d701"
 dependencies = [
  "hmac",
  "rrl-crypto",

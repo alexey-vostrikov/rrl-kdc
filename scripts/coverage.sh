@@ -23,7 +23,11 @@ CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rrl-kdc"
 MIN="${COVERAGE_MIN:-88}"
 
 CHECK=0
-[ "${1:-}" = "--check" ] && CHECK=1
+CRAP=0
+case "${1:-}" in
+--check) CHECK=1 ;;
+--crap) CRAP=1 ;;
+esac
 
 mkdir -p "$CACHE/rustup" "$CACHE/coverage"
 ensure_cargo_home
@@ -76,3 +80,13 @@ if [ "$CHECK" = "1" ]; then
     awk -v min="$COVERAGE_MIN" -v got="${lines:-0}" "BEGIN { if (got+0 < min+0) { printf \"below the floor: %s%% < %s%%\n\", got, min; exit 1 } }"
 fi
 '
+
+# CRAP over the LCOV the run above just wrote. Not part of the default run: hundreds of functions
+# sit above the threshold, and a wall of findings on every coverage check is a wall nobody reads.
+# The floor above is the regression alarm; this is the report you read when you decide what to fix.
+if [ "$CRAP" = "1" ]; then
+    docker run --rm -u "$(id -u):$(id -g)" \
+        -v "$ROOT:/w" -w /w -v "$CACHE/coverage:/coverage" -v "$CARGO_HOME_SRC:/cargo" \
+        -e CARGO_HOME=/cargo -e CARGO_TERM_COLOR=never "$IMAGE" \
+        sh -c 'PATH=/usr/local/cargo/bin:$PATH; cargo crap --lcov /coverage/lcov.info --threshold 10 || true'
+fi

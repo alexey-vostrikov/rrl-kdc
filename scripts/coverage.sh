@@ -25,13 +25,14 @@ MIN="${COVERAGE_MIN:-88}"
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
 
-mkdir -p "$CACHE/rustup"
+mkdir -p "$CACHE/rustup" "$CACHE/coverage"
 ensure_cargo_home
 ensure_image
 
 
 docker run --rm -u "$(id -u):$(id -g)" \
     -v "$ROOT:/w" -v "$CARGO_HOME_SRC:/cargo" -v "$CACHE/rustup:/rustup" \
+    -v "$CACHE/coverage:/coverage" \
     -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup -e CARGO_TERM_COLOR=never \
     -e COVERAGE_MIN="$MIN" -e CHECK="$CHECK" -e CARGO_TARGET_DIR=/w/target/$TAG \
     -w /w "$IMAGE" sh -c '
@@ -53,7 +54,15 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
 
 # `--all-features` because a line behind a feature flag that no test compiles is
 # uncovered for a reason worth seeing.
-cargo llvm-cov --all-features --workspace --summary-only --ignore-filename-regex "(^|/)tests/|(^|/)examples/" > /tmp/cov.txt 2>&1 || {
+# The LCOV is what CRAP needs: coverage and complexity have to come from the same run, or the
+# report attributes uncovered lines to functions that have moved since the LCOV was written.
+# `report` re-renders from the profraw the run just left behind, so the table below costs nothing
+# extra; writing the LCOV does not cost a second test run either.
+cargo llvm-cov --all-features --workspace --lcov --output-path /coverage/lcov.info > /tmp/cov.txt 2>&1 || {
+    cat /tmp/cov.txt
+    exit 1
+}
+cargo llvm-cov report --summary-only --ignore-filename-regex "(^|/)tests/|(^|/)examples/" > /tmp/cov.txt 2>&1 || {
     cat /tmp/cov.txt
     exit 1
 }
@@ -61,6 +70,7 @@ grep -vE "^\s*$" /tmp/cov.txt
 total=$(grep -E "^TOTAL" /tmp/cov.txt | tail -1 || true)
 lines=$(printf "%s" "$total" | awk "{print \$10}" | tr -d "%")
 echo "lines covered: ${lines:-unknown}%"
+echo "lcov: /coverage/lcov.info"
 
 if [ "$CHECK" = "1" ]; then
     awk -v min="$COVERAGE_MIN" -v got="${lines:-0}" "BEGIN { if (got+0 < min+0) { printf \"below the floor: %s%% < %s%%\n\", got, min; exit 1 } }"

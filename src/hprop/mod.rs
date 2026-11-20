@@ -1198,7 +1198,13 @@ mod tests {
         let stand = serve_loopback(service).expect("a stand");
         // Connected and closed: no version strings at all.
         drop(std::net::TcpStream::connect(stand.addr()).expect("connected"));
-        for _ in 0..100 {
+        // Ten seconds, not two. This asserts that a silent connection is *recorded as a failure*,
+        // which is a statement about the stand's behaviour and has nothing to do with how fast the
+        // machine is. Two seconds was enough on an idle host and lost under parallel load - the
+        // assertion then read "the stand forgot the connection" when the stand had simply not been
+        // scheduled yet. A deadline this generous still fails on a real defect: a stand that never
+        // records anything never fills `results`, whatever the wait.
+        for _ in 0..500 {
             if !stand.results().is_empty() {
                 break;
             }

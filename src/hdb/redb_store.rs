@@ -1051,4 +1051,104 @@ mod tests {
         // the two realms interleave: `a@ONE` < `b@TWO` < `c@ONE`.
         assert_eq!(seen, ["a@ONE", "b@TWO", "c@ONE"]);
     }
+
+    /// The ACL on disk — the one an `acl` operation reaches, and the one that has to survive a
+    /// restart — had no test at all: `acl.rs` exercises `MemoryAcl`, so every rule in production
+    /// travelled through code no test had ever run. These four cover the `AclStore` implementation
+    /// on redb: writing a rule, reading the rules back grouped by actor, removing one, and removing
+    /// all of one actor's rules without touching anybody else's.
+    #[test]
+    fn an_acl_rule_survives_a_reopen_and_is_listed_under_its_actor() {
+        let t = temp_db();
+        let admin = Principal::parse("admin@R").unwrap();
+        let bob = Principal::parse("bob@R").unwrap();
+        let carol = Principal::parse("carol@R").unwrap();
+        t.hdb.grant(&admin, Targets::Any).unwrap();
+        t.hdb.grant(&admin, Targets::Only(bob.clone())).unwrap();
+        t.hdb.grant(&carol, Targets::Any).unwrap();
+        // The same rule twice is one rule, not two: the key is (`actor`, `targets`) and the value is
+        // empty, so an upsert that appended would show up here.
+        t.hdb.grant(&admin, Targets::Any).unwrap();
+
+        let path = t.dir.join("hdb.redb.reopened");
+        std::fs::copy(t.dir.join("hdb.redb"), &path).unwrap();
+        let reopened = RedbHdb::open(&path).unwrap();
+
+        let rules = reopened.rules().unwrap();
+        assert_eq!(rules.len(), 3, "two for admin, one for carol: {rules:?}");
+        // `redb` orders by the key, which starts with the actor, so a listing comes out grouped.
+        assert_eq!(rules[0].actor, admin);
+        assert_eq!(rules[1].actor, admin);
+        assert_eq!(rules[2].actor, carol);
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.actor == admin && r.targets == Targets::Only(bob.clone()))
+        );
+    }
+
+    #[test]
+    fn revoking_one_rule_leaves_the_actor_s_others() {
+        let t = temp_db();
+        let admin = Principal::parse("admin@R").unwrap();
+        let bob = Principal::parse("bob@R").unwrap();
+        t.hdb.grant(&admin, Targets::Any).unwrap();
+        t.hdb.grant(&admin, Targets::Only(bob.clone())).unwrap();
+
+        assert!(
+            t.hdb.revoke(&admin, &Targets::Any).unwrap(),
+            "the rule was there"
+        );
+        assert!(
+            !t.hdb.revoke(&admin, &Targets::Any).unwrap(),
+            "and the second attempt reports that it is gone"
+        );
+        let rules = t.hdb.rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].targets, Targets::Only(bob));
+    }
+
+    /// `revoke_all` is what an operator reaches for when an account is compromised: every rule the
+    /// actor has, in one step, and nobody else's. The count it returns is what the audit line says
+    /// happened, so it has to be the number removed and not the number considered.
+    #[test]
+    fn revoke_all_takes_every_rule_of_one_actor_and_counts_them() {
+        let t = temp_db();
+        let admin = Principal::parse("admin@R").unwrap();
+        let other = Principal::parse("other@R").unwrap();
+        let bob = Principal::parse("bob@R").unwrap();
+        for targets in [
+            Targets::Any,
+            Targets::Only(bob.clone()),
+            Targets::Only(Principal::parse("carol@R").unwrap()),
+        ] {
+            t.hdb.grant(&admin, targets).unwrap();
+        }
+        t.hdb.grant(&other, Targets::Any).unwrap();
+        t.hdb.grant(&other, Targets::Only(bob.clone())).unwrap();
+
+        assert_eq!(t.hdb.revoke_all(&admin).unwrap(), 3);
+        let rules = t.hdb.rules().unwrap();
+        assert_eq!(rules.len(), 2, "other's rules are untouched: {rules:?}");
+        assert!(rules.iter().all(|r| r.actor == other));
+        // Nothing left to remove: a second call is a no-op that says so.
+        assert_eq!(t.hdb.revoke_all(&admin).unwrap(), 0);
+
+        // The key is `actor TAB targets`, and the tab is what makes the match exact: without it,
+        // revoking `admin@R` would also take the rules of `admin@RX`, whose name starts with the
+        // same octets. A realm suffix like that is legal, so this is not a hypothetical.
+        let longer = Principal::parse("admin@RX").unwrap();
+        t.hdb.grant(&admin, Targets::Any).unwrap();
+        t.hdb.grant(&longer, Targets::Any).unwrap();
+        assert_eq!(
+            t.hdb.revoke_all(&admin).unwrap(),
+            1,
+            "only the exact actor's rule"
+        );
+        let left = t.hdb.rules().unwrap();
+        assert!(
+            left.iter().any(|r| r.actor == longer),
+            "`admin@RX` keeps its rule: {left:?}"
+        );
+    }
 }

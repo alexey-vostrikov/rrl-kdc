@@ -138,6 +138,108 @@ impl CertificateAuthority for Recording {
 
 /// The whole path: a CSR from a tool parses, its possession proof verifies, the realm's SAN is in
 /// what the authority signs, and the principal that asked is the one the certificate names.
+/// A CSR whose key is on a NIST curve and whose signature is ECDSA.
+///
+/// `curve` picks the curve, the digest and the signature OID together, because those three have to
+/// agree: an `ecdsa-with-SHA384` signature over a SHA-256 digest fails for every input and reads
+/// like a wrong key.
+///
+/// The key is derived from a fixed scalar rather than generated: a test that cannot be repeated is
+/// a test whose failure cannot be reproduced.
+fn ec_csr(curve: EcCurve) -> Vec<u8> {
+    let (spki, signature_of) = curve.key();
+    let info = der::seq(&[der::int(0), der::seq(&[]), spki, der::tlv(der::ctx(0), &[])]);
+    let signature = signature_of(&info);
+    der::seq(&[
+        info,
+        der::seq(&[der::tlv(
+            der::OBJECT_IDENTIFIER,
+            &oid_content(curve.sig_alg()),
+        )]),
+        der::tlv(der::BIT_STRING, &[&[0u8][..], &signature].concat()),
+    ])
+}
+
+/// A public key as a CSR carries it, and a signer over that key's curve.
+type EcKey = (Vec<u8>, Box<dyn Fn(&[u8]) -> Vec<u8>>);
+
+/// The two curves a certificate in this family is signed on. P-521 has no test here: nothing in the
+/// repository issues one, and its arm is the same code with a longer scalar.
+#[derive(Clone, Copy)]
+enum EcCurve {
+    P256,
+    P384,
+}
+
+impl EcCurve {
+    fn curve_oid(self) -> &'static str {
+        match self {
+            EcCurve::P256 => "1.2.840.10045.3.1.7",
+            EcCurve::P384 => "1.3.132.0.34",
+        }
+    }
+
+    fn sig_alg(self) -> &'static str {
+        match self {
+            EcCurve::P256 => "1.2.840.10045.4.3.2",
+            EcCurve::P384 => "1.2.840.10045.4.3.3",
+        }
+    }
+
+    /// The `SubjectPublicKeyInfo`, and a closure that signs a message the way this curve's
+    /// signature algorithm says: hash it, then ECDSA over the digest.
+    ///
+    /// The closure is boxed because the two curves are different types: one generic over the curve
+    /// would need the `Digest` bound that this crate's `p256` features do not expose.
+    fn key(self) -> EcKey {
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        match self {
+            EcCurve::P256 => {
+                let sk = p256::SecretKey::from_slice(&[7u8; 32]).expect("a P-256 scalar");
+                let point = sk.public_key().to_sec1_point(false).as_bytes().to_vec();
+                let spki = ec_spki(self.curve_oid(), &point);
+                let sign = Box::new(move |message: &[u8]| {
+                    use p256::ecdsa::signature::hazmat::PrehashSigner as _;
+                    use rsa_sha2::Digest as _;
+                    let digest = rsa_sha2::Sha256::digest(message);
+                    let signing = p256::ecdsa::SigningKey::from(&sk);
+                    let s: p256::ecdsa::DerSignature =
+                        signing.sign_prehash(&digest).expect("signs");
+                    s.as_bytes().to_vec()
+                });
+                (spki, sign)
+            }
+            EcCurve::P384 => {
+                let sk = p384::SecretKey::from_slice(&[7u8; 48]).expect("a P-384 scalar");
+                let point = sk.public_key().to_sec1_point(false).as_bytes().to_vec();
+                let spki = ec_spki(self.curve_oid(), &point);
+                let sign = Box::new(move |message: &[u8]| {
+                    use p384::ecdsa::signature::hazmat::PrehashSigner as _;
+                    use rsa_sha2::Digest as _;
+                    let digest = rsa_sha2::Sha384::digest(message);
+                    let signing = p384::ecdsa::SigningKey::from(&sk);
+                    let s: p384::ecdsa::DerSignature =
+                        signing.sign_prehash(&digest).expect("signs");
+                    s.as_bytes().to_vec()
+                });
+                (spki, sign)
+            }
+        }
+    }
+}
+
+/// `SubjectPublicKeyInfo` for an elliptic-curve key: `SEQUENCE { SEQUENCE { id-ecPublicKey, curve },
+/// BIT STRING { point } }`, the point in its uncompressed form — what `openssl req` writes.
+fn ec_spki(curve_oid: &str, point: &[u8]) -> Vec<u8> {
+    der::seq(&[
+        der::seq(&[
+            der::tlv(der::OBJECT_IDENTIFIER, &oid_content("1.2.840.10045.2.1")),
+            der::tlv(der::OBJECT_IDENTIFIER, &oid_content(curve_oid)),
+        ]),
+        der::tlv(der::BIT_STRING, &[&[0u8][..], point].concat()),
+    ])
+}
+
 #[test]
 fn a_csr_proves_possession_and_is_signed_with_the_realms_san() {
     let (bytes, _key) = csr_with(None, None);
@@ -340,4 +442,65 @@ fn a_custom_authorizer_sees_who_asked_and_what_for() {
     .expect_err("a policy that refuses everything refuses");
     assert!(err.to_string().contains("alice@EXAMPLE.COM"), "{err}");
     assert!(ca.requests.lock().unwrap().is_empty());
+}
+
+/// An elliptic-curve CSR proves possession, on both curves this crate checks.
+///
+/// `verify_ecdsa` was at zero coverage: every CSR test used an RSA key, so the EC branch — parse the
+/// curve out of the SPKI, pick the digest the signature algorithm names, verify — had never run.
+/// It is the branch a PKINIT client with an EC certificate takes, and the digest choice is the part
+/// that goes wrong silently: verifying SHA-256 with the SHA-384 variant fails for every input and
+/// reads like a wrong key.
+#[test]
+fn an_elliptic_curve_csr_proves_possession_on_both_curves() {
+    for curve in [EcCurve::P256, EcCurve::P384] {
+        let bytes = ec_csr(curve);
+        let csr = Csr::parse(&bytes).expect("an EC CSR parses");
+        csr.verify_possession()
+            .unwrap_or_else(|e| panic!("{}: {e:?}", curve.sig_alg()));
+    }
+}
+
+/// A flipped bit in an EC signature is refused, not accepted: the same statement the RSA test makes,
+/// on a path where the failure mode is a `verify` that returns `true` because it could not read the
+/// signature and treated that as success.
+#[test]
+fn a_tampered_ecdsa_signature_is_refused() {
+    let mut bytes = ec_csr(EcCurve::P256);
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    let csr = Csr::parse(&bytes).expect("still a CSR");
+    let err = csr
+        .verify_possession()
+        .expect_err("a wrong ECDSA signature must not verify");
+    assert!(matches!(err, CaError::PossessionNotProven(_)), "{err:?}");
+}
+
+/// A digest this build does not check with an EC key is `Unsupported`, not `Bad` — an unverifiable
+/// signature must not be reported as one that failed, and certainly not as one that passed.
+#[test]
+fn an_ecdsa_digest_this_build_does_not_check_is_unsupported() {
+    // `ecdsa-with-SHA224` (1.2.840.10045.4.3.1) is not in the list this crate checks.
+    let mut bytes = ec_csr(EcCurve::P256);
+    // Replace the signature algorithm OID with SHA-224: same length, so the BIT STRING stays put
+    // and the refusal comes from the algorithm, not from a broken encoding.
+    let sha224 = oid_content("1.2.840.10045.4.3.1");
+    let sha256 = oid_content("1.2.840.10045.4.3.2");
+    assert_eq!(sha224.len(), sha256.len(), "the swap keeps the lengths");
+    let at = bytes
+        .windows(sha256.len())
+        .position(|w| w == sha256.as_slice())
+        .expect("the OID is in the CSR");
+    bytes[at..at + sha224.len()].copy_from_slice(&sha224);
+    let csr = Csr::parse(&bytes).expect("still a CSR");
+    let err = csr
+        .verify_possession()
+        .expect_err("an unchecked digest is not a pass");
+    assert!(
+        matches!(
+            err,
+            CaError::PossessionNotProven(_) | CaError::Unsupported(_)
+        ),
+        "must be a refusal, got {err:?}"
+    );
 }

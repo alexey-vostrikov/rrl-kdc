@@ -527,6 +527,12 @@ fn serve_data(
     let sealed_reply = context
         .seal(credential.seq as u64, to_seal.bytes())
         .map_err(|_| 13u32)?;
+    diag(&format!(
+        "data: replay plaintext {} octets (seq + {} result), token {} octets",
+        to_seal.bytes().len(),
+        results.len(),
+        sealed_reply.len()
+    ));
     // The reply's verifier is the acceptor's MIC over the sequence number, and its body is the
     // sealed results.
     let verifier = context

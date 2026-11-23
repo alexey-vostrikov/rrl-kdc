@@ -155,13 +155,21 @@ impl Kadmin {
                 Ok(Vec::new())
             }
             kadm5::GET_PRIVS => {
-                let rights = if self.admin.policy().may(actor, Right::List, None) {
-                    kadm5::PRIV_ALL
-                } else {
-                    0
-                };
+                // Every privilege, to every caller — which is what MIT does, and for the same
+                // reason. Its `kadm5_get_privs` says so in as many words: *"this is impossible to
+                // do with the current interface. For now, return all privs, which will confuse
+                // some clients, but not deny any access to users of smart clients which try to
+                // cache"*. The interface cannot answer it: a grant may be narrowed to particular
+                // targets, and this call names none.
+                //
+                // This used to answer zero to a caller without `List`, and that is the failure the
+                // MIT comment warns about: a client that caches `0` refuses operations it is in
+                // fact allowed to perform, and the operator sees "insufficient privileges" for a
+                // right the ACL had granted. Enforcement is per procedure, in `require`, and it
+                // reads the policy every time — so answering generously here denies nothing.
+                let _ = actor;
                 let mut out = Writer::new();
-                out.u32(rights);
+                out.u32(kadm5::PRIV_ALL);
                 Ok(out.into_bytes())
             }
             kadm5::GET_PRINCIPAL => {
@@ -432,6 +440,14 @@ impl Kadmin {
                 Ok(Vec::new())
             }
             kadm5::CHPASS_PRINCIPAL => {
+                // Changing a password is its own right, and the actor is the ticket's client —
+                // MIT's admin protocol never lets a caller name somebody else as the actor.
+                //
+                // Before the arguments are read, like every other procedure here. A check after
+                // parsing answers an unprivileged caller `UNK_PRINC` or `BAD_MASK` for a name it may
+                // not touch, which says whether that name exists; the refusal it is owed names the
+                // right instead and says nothing about the realm.
+                self.require(actor, Right::SetPassword)?;
                 let mut r = Reader::new(args);
                 let _ = r.u32();
                 let name = r
@@ -443,10 +459,6 @@ impl Kadmin {
                     .nullstring()
                     .map_err(|_| kadm5::BAD_MASK)?
                     .unwrap_or_default();
-                // Changing a password is its own right, and the actor is the
-                // ticket's client — MIT's admin protocol never lets a caller name
-                // somebody else as the actor.
-                self.require(actor, Right::SetPassword)?;
                 self.admin
                     .set_password(&principal, password.as_bytes())
                     .map_err(|e| {
@@ -832,6 +844,212 @@ mod tests {
         assert_eq!(status_of(Error::NotFound("x".into())), kadm5::UNK_PRINC);
         assert_eq!(status_of(Error::Exists("x".into())), kadm5::DUP);
         assert_eq!(status_of(Error::Hdb("x".into())), kadm5::FAILURE);
+    }
+
+    // --- the ACL surface: which procedure needs which right -------------------------------
+
+    use crate::admin::wire::{Grants, Rights};
+    use crate::kdc::KdcConfig;
+    use crate::name::Principal;
+
+    const ACL_REALM: &str = "EXAMPLE.COM";
+
+    fn principal(name: &str) -> Principal {
+        Principal::parse(&format!("{name}@{ACL_REALM}")).unwrap()
+    }
+
+    /// A `kadmind` over an empty realm, with `actor` holding exactly `rights`.
+    fn kadmind(actor: &str, rights: Rights) -> Kadmin {
+        use crate::crypto::OwnCipher;
+        use crate::hdb::{HdbEntry, MemoryHdb};
+
+        let db = MemoryHdb::new();
+        let cipher = OwnCipher;
+        let mut krbtgt = HdbEntry::krbtgt(ACL_REALM);
+        krbtgt
+            .add_password_key(&cipher, crate::crypto::Enctype::Aes256Sha1, b"master", 1)
+            .unwrap();
+        db.insert(krbtgt).unwrap();
+
+        let kdc = Kdc::new(
+            KdcConfig::new(ACL_REALM).unwrap(),
+            std::sync::Arc::new(db),
+            std::sync::Arc::new(OwnCipher),
+        );
+        let grants = Grants::default().grant(&principal(actor), rights);
+        Kadmin::new(kdc, std::sync::Arc::new(grants)).expect("a kadmind over the realm")
+    }
+
+    /// One call, as `kadm5` receives it: the version word, then whatever the procedure reads.
+    fn call(kadmin: &Kadmin, actor: &str, procedure: u32, args: &[u8]) -> u32 {
+        let rpc = crate::kadmin::rpc::Call {
+            xid: 1,
+            prog: kadm5::PROG,
+            vers: kadm5::VERS,
+            proc_: procedure,
+            cred_flavor: 6,
+            gss: None,
+            verf: (0, Vec::new()),
+            args: Vec::new(),
+            header_len: 0,
+        };
+        let mut full = Vec::with_capacity(args.len() + 4);
+        full.extend_from_slice(&kadm5::API_VERSION_2.to_le_bytes());
+        full.extend_from_slice(args);
+        let answer = kadmin.dispatch(&principal(actor), &rpc, &full);
+        // The reply is `[version][status][results…]`, and XDR is **big-endian** throughout: reading
+        // it as little-endian gives a status that is the right number byte-reversed, which looks
+        // like a refusal this server never sent.
+        u32::from_be_bytes(answer[4..8].try_into().expect("four octets"))
+    }
+
+    /// Every procedure that reads or writes needs its own right, and the refusal names that right.
+    ///
+    /// The table is the point: a procedure routed to a handler with a weaker `Right` grants a
+    /// privilege nobody meant to grant, and nothing about the answer would look wrong. MIT has one
+    /// `AUTH_*` code per right and a client prints the one it got, so a mismatch is visible here
+    /// and invisible at the wire.
+    #[test]
+    fn every_procedure_needs_its_own_right() {
+        let actor = "admin";
+        // (procedure, the right it must demand, the code when it is missing)
+        let table: &[(u32, Right, u32)] = &[
+            (kadm5::GET_PRINCIPAL, Right::Read, kadm5::AUTH_GET),
+            (kadm5::GET_PRINCS, Right::List, kadm5::AUTH_LIST),
+            (kadm5::CREATE_PRINCIPAL, Right::Create, kadm5::AUTH_ADD),
+            (kadm5::MODIFY_PRINCIPAL, Right::Modify, kadm5::AUTH_MODIFY),
+            (kadm5::RENAME_PRINCIPAL, Right::Modify, kadm5::AUTH_MODIFY),
+            (kadm5::DELETE_PRINCIPAL, Right::Delete, kadm5::AUTH_DELETE),
+            (
+                kadm5::CHPASS_PRINCIPAL,
+                Right::SetPassword,
+                kadm5::AUTH_CHANGEPW,
+            ),
+            (kadm5::CREATE_POLICY, Right::Create, kadm5::AUTH_ADD),
+            (kadm5::MODIFY_POLICY, Right::Modify, kadm5::AUTH_MODIFY),
+            (kadm5::DELETE_POLICY, Right::Delete, kadm5::AUTH_DELETE),
+            (kadm5::GET_POLICY, Right::Read, kadm5::AUTH_GET),
+            (kadm5::GET_POLS, Right::List, kadm5::AUTH_LIST),
+            (kadm5::GET_STRINGS, Right::Read, kadm5::AUTH_GET),
+            (kadm5::SET_STRING, Right::Modify, kadm5::AUTH_MODIFY),
+            (
+                kadm5::EXTRACT_KEYS,
+                Right::ExtractKeys,
+                kadm5::AUTH_INSUFFICIENT,
+            ),
+        ];
+
+        for (procedure, right, refusal) in table {
+            // Without the right: refused, and with the code that names it.
+            let none = kadmind(actor, Rights::NONE);
+            assert_eq!(
+                call(&none, actor, *procedure, &[]),
+                *refusal,
+                "procedure {procedure} (needs {right:?}) was not refused"
+            );
+
+            // With every right: past the check. What comes back is whatever the handler says about
+            // the empty arguments — a `BAD_MASK` at worst — and never an `AUTH_*`: a refusal here
+            // would mean the grant did not reach the procedure that asked for it.
+            let all = kadmind(actor, Rights::ALL);
+            let status = call(&all, actor, *procedure, &[]);
+            assert!(
+                !(kadm5::AUTH_GET..=kadm5::AUTH_INSUFFICIENT).contains(&status)
+                    || status == kadm5::AUTH_INSUFFICIENT && *right == Right::ExtractKeys,
+                "procedure {procedure} refused a caller holding {right:?}: {status}"
+            );
+        }
+    }
+
+    /// A grant of one right opens exactly one procedure.
+    ///
+    /// The other direction of the same table: a policy that grants `List` and nothing else must not
+    /// let the same caller create, delete or read an entry.
+    #[test]
+    fn one_grant_opens_one_procedure() {
+        let actor = "reader";
+        let list_only = kadmind(actor, Rights::LIST);
+        assert_ne!(
+            call(&list_only, actor, kadm5::GET_PRINCS, &[]),
+            kadm5::AUTH_LIST,
+            "the granted procedure is past its check"
+        );
+        for (procedure, refusal) in [
+            (kadm5::GET_PRINCIPAL, kadm5::AUTH_GET),
+            (kadm5::CREATE_PRINCIPAL, kadm5::AUTH_ADD),
+            (kadm5::DELETE_PRINCIPAL, kadm5::AUTH_DELETE),
+            (kadm5::CHPASS_PRINCIPAL, kadm5::AUTH_CHANGEPW),
+        ] {
+            assert_eq!(
+                call(&list_only, actor, procedure, &[]),
+                refusal,
+                "procedure {procedure} accepted a caller granted only List"
+            );
+        }
+    }
+
+    /// A caller with no grant at all is refused by every procedure, `init` and `get_privs` aside.
+    #[test]
+    fn a_caller_with_no_grant_is_refused_everywhere() {
+        let actor = "nobody";
+        let none = kadmind(actor, Rights::NONE);
+        assert_eq!(
+            call(&none, actor, kadm5::INIT, &[]),
+            kadm5::OK,
+            "init opens the session: the handshake is its own authentication"
+        );
+        for procedure in [
+            kadm5::GET_PRINCIPAL,
+            kadm5::GET_PRINCS,
+            kadm5::CREATE_PRINCIPAL,
+            kadm5::MODIFY_PRINCIPAL,
+            kadm5::RENAME_PRINCIPAL,
+            kadm5::DELETE_PRINCIPAL,
+            kadm5::CHPASS_PRINCIPAL,
+            kadm5::GET_STRINGS,
+            kadm5::SET_STRING,
+            kadm5::EXTRACT_KEYS,
+        ] {
+            let status = call(&none, actor, procedure, &[]);
+            assert!(
+                status != kadm5::OK,
+                "procedure {procedure} answered an unprivileged caller with success"
+            );
+        }
+    }
+
+    /// `get_privs` reports every privilege to everyone, as MIT's does.
+    ///
+    /// MIT's `kadm5_get_privs` returns `~0` with the comment that the interface cannot answer the
+    /// question — a grant may be narrowed to particular targets, and this call names none — and that
+    /// answering generously keeps a caching client from denying operations the ACL granted.
+    #[test]
+    fn get_privs_reports_every_privilege_to_any_caller() {
+        for rights in [Rights::NONE, Rights::LIST, Rights::ALL] {
+            let kadmind = kadmind("someone", rights);
+            let rpc = crate::kadmin::rpc::Call {
+                xid: 1,
+                prog: kadm5::PROG,
+                vers: kadm5::VERS,
+                proc_: kadm5::GET_PRIVS,
+                cred_flavor: 6,
+                gss: None,
+                verf: (0, Vec::new()),
+                args: Vec::new(),
+                header_len: 0,
+            };
+            let mut args = Vec::new();
+            args.extend_from_slice(&kadm5::API_VERSION_2.to_le_bytes());
+            let answer = kadmind.dispatch(&principal("someone"), &rpc, &args);
+            let status = u32::from_be_bytes(answer[4..8].try_into().expect("four octets"));
+            assert_eq!(status, kadm5::OK);
+            let privs = u32::from_be_bytes(answer[8..12].try_into().expect("four octets"));
+            assert_eq!(
+                privs,
+                kadm5::PRIV_ALL,
+                "a caller with {rights:?} was told it has fewer privileges than MIT reports"
+            );
+        }
     }
 
     #[test]

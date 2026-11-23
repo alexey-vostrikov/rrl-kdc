@@ -20,13 +20,16 @@
 # Requires: `kadmin` (Debian: krb5-user), cargo, and a free port pair. Run inside
 # `docker/kadmin-stand.Dockerfile`, or anywhere with the toolchain and the client.
 #
-# STATUS: the first scenario fails, and that is the finding, not a bug in the script. MIT's `kadmin`
-# gets a ticket, completes the GSS handshake (`kadmind: data: context established` / `MIC verified` /
-# `wrap opened` under `RRL_KADMIN_DIAG=1`), sends `kadm5_init` — and then reports
-# `Communication failure with server`, so it does not accept this server's *reply*. Three defects on
-# the way to that point are fixed (see the commit that added this file); the reply's framing is not.
-# The script exits non-zero until it is, deliberately: a stand that swallowed this would say the
-# interop works.
+# Assertions are made on the **text** of the answer, not on the exit status: MIT's `kadmin -q` returns
+# 0 whatever the operation did. Measured, not assumed — a `getprinc` for a principal that does not
+# exist prints "Principal does not exist" and still exits 0, and so does a duplicate `addprinc`. A
+# stand that trusted `$?` would pass while the server refused everything.
+#
+# Four defects were found here and fixed, each invisible to this crate's own client because both
+# ends shared the mistake: the acceptor numbered its reply tokens from zero instead of continuing
+# the sequence its AP-REP announced (MIT answers "Communication failure"); `mod_name` was sent as
+# NULL, which MIT's `kadmin` unparses without a NULL check and kills `getprinc` with a parse error
+# that blames the principal; and two privilege answers, below.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -87,8 +90,12 @@ start_stand() {
 stop_stand() {
     if [ -n "${STAND_PID:-}" ]; then
         kill "$STAND_PID" 2>/dev/null
+        # The stand is *supposed* to die here, so its status is 143 — and `wait` would hand that to
+        # `set -e`-less callers as the script's own result. A clean run has to look clean.
         wait "$STAND_PID" 2>/dev/null
+        STAND_PID=
     fi
+    return 0
 }
 trap stop_stand EXIT
 
@@ -103,14 +110,25 @@ start_stand 0
 
 kadmin_call -q "getprincs" || fail "getprincs was refused by an administrator holding every right"
 
+# A principal of the stand's own, so that a realm the example seeded is not the thing under test.
+NEW=mitprobe
+
 # A create, a read of what was created, and a delete: the three answers a client unmarshals most
-# strictly, because each carries a principal entry rather than a bare status.
-kadmin_call -q "addprinc -pw alice-Password-1 alice" || fail "addprinc"
-kadmin_call -q "getprinc alice" | grep -q "Principal: alice@$REALM" || fail "getprinc did not name the entry"
+# strictly, because each carries a principal entry rather than a bare status. Every expectation is
+# on the text; see the note about exit statuses at the top.
+kadmin_call -q "addprinc -pw $NEW-Password-1 $NEW" 2>&1 | grep -q "already exists" \
+    && fail "addprinc found an entry that should not exist"
+kadmin_call -q "getprinc $NEW" 2>&1 | grep -q "Principal: $NEW@$REALM" \
+    || fail "getprinc did not name the entry it had just created"
 # A password change goes through its own procedure and its own right.
-kadmin_call -q "cpw -pw another-Password-1 alice" || fail "cpw"
-kadmin_call -q "delprinc -force alice" || fail "delprinc"
-kadmin_call -q "getprinc alice" >/dev/null 2>&1 && fail "getprinc found a principal that was deleted"
+kadmin_call -q "cpw -pw another-Password-1 $NEW" 2>&1 | grep -q "Password for .* changed" \
+    || fail "cpw did not report the change"
+kadmin_call -q "delprinc -force $NEW" 2>&1 | grep -q "deleted" \
+    || fail "delprinc did not report the delete"
+# `kadmin` writes its errors to stderr, so a check that reads only stdout sees an empty answer and
+# calls a correct refusal a failure.
+kadmin_call -q "getprinc $NEW" 2>&1 | grep -q "does not exist" \
+    || fail "getprinc still found a principal that was deleted"
 echo "PASS: an administrator with every right could list, add, read, change and delete"
 stop_stand
 
@@ -121,12 +139,9 @@ start_stand 1
 # test the wrong thing. What must fail is every operation after it, with MIT's own message.
 for query in "getprincs" "addprinc -pw x y" "getprinc alice"; do
     out=$(kadmin_call -q "$query" 2>&1)
-    status=$?
-    if [ $status -eq 0 ]; then
-        echo "the stand refused nothing; $query was answered with success:" >&2
-        echo "$out" >&2
-        fail "$query"
-    fi
+    # The exit status is 0 either way, so a refusal is recognised by its message alone — and a call
+    # that *silently* succeeded would show up as that message's absence, not as a status.
+
     echo "$out" | grep -qi "insufficient privileges\|requires .* privilege\|Operation requires" || {
         echo "$query was refused, but not with a privilege message:" >&2
         echo "$out" >&2
@@ -135,3 +150,4 @@ for query in "getprincs" "addprinc -pw x y" "getprinc alice"; do
 done
 echo "PASS: every call was refused with a privilege message"
 stop_stand
+exit 0

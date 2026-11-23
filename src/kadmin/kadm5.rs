@@ -235,7 +235,18 @@ pub fn encode_principal_entry(entry: &HdbEntry) -> Vec<u8> {
         .i32(0) // last_pwd_change: not modelled
         .i32(entry.pw_end.unwrap_or(0) as i32) // pw_expiration
         .i32(entry.max_life.unwrap_or(0) as i32)
-        .absent() // mod_name: NULL
+        // `mod_name` is not optional in practice, whatever the XDR says. MIT's `kadmin` calls
+        // `krb5_unparse_name` on it unconditionally, and a NULL there returns
+        // `KRB5_PARSE_MALFORMED` — the whole `getprinc` dies with "Malformed representation of
+        // principal while unparsing principal", which reads as if *our* name were corrupt.
+        //
+        // This record has no modifier: the Heimdal `hdb.asn1` entry has no field for one, and
+        // `modified_by` is not kept anywhere in this crate. So the name reported is the entry's
+        // own — the one principal the record certainly names. It is an approximation an operator
+        // should not mistake for an audit trail, and recording the real modifier is a field of its
+        // own rather than something to infer here.
+        .present()
+        .nullstring(Some(&entry.principal.to_string()))
         .i32(entry.modified as i32) // mod_date
         .i32(attributes_of(entry) as i32)
         .u32(entry.kvno())
@@ -790,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_is_encoded_positionally_with_the_absent_marker_for_mod_name() {
+    fn an_entry_is_encoded_positionally_and_names_a_modifier() {
         let mut entry = HdbEntry::user(Principal::parse("alice@R").unwrap());
         entry
             .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"pw", 3)
@@ -808,7 +819,17 @@ mod tests {
         assert_eq!(r.i32().unwrap(), 0, "last_pwd_change is not modelled");
         assert_eq!(r.i32().unwrap(), 0, "no pw_expiration");
         assert_eq!(r.i32().unwrap(), 36_000, "max_life");
-        assert!(r.bool().unwrap(), "mod_name is absent");
+        // `mod_name` is written, not skipped: MIT's client unparses it without a NULL check, and a
+        // NULL there kills the whole `getprinc` with a parse error that blames our principal.
+        assert!(
+            !r.bool().unwrap(),
+            "mod_name is present, not the absent marker"
+        );
+        assert_eq!(
+            r.nullstring().unwrap().as_deref(),
+            Some("alice@R"),
+            "the modifier reported is the entry's own name: no field records the real one"
+        );
         assert_eq!(r.i32().unwrap(), 0, "mod_date");
         assert_eq!(
             r.u32().unwrap(),

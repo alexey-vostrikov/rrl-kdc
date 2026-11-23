@@ -705,17 +705,23 @@ impl Kdc {
         // The same folding as the client: a client that spelled the realm from a DNS name asks for
         // `krbtgt/EXAMPLE.COM@example.com`, and that name is not in the database.
         super::fold_realm(&mut sname, config.realm());
+        // An unknown **service** here is `S_PRINCIPAL_UNKNOWN`, not `C_PRINCIPAL_UNKNOWN`: the
+        // client is known, and a reply that says "client not found" sends an operator to look at the
+        // account that is present while the name that is missing is the one in `sname`. Measured
+        // with MIT's `kadmin`, which asks for an initial ticket for `kadmin/<admin-server-host>`: a
+        // realm without that principal answered "Client 'kadmin/admin@REALM' not found", and the
+        // account it named was in the database all along.
         let server = self
             .hdb()
             .fetch(&sname)?
-            .ok_or_else(|| Error::UnknownPrincipal(sname.to_string()))?;
+            .ok_or_else(|| Error::NotFound(sname.to_string()))?;
         // Any service may be asked for here — that is what an "initial ticket" is,
         // and Heimdal allows it (`kdc/kerberos5.c` restricts an AS request only by
         // the entry's own flags). The opposite restriction lives in the TGS: an
         // entry with `initial` may *only* be reached this way, which is how
         // `kpasswd` keeps `kadmin/changepw` out of reach of a stolen TGT.
         if !server.has(entry_flags::SERVER) {
-            return Err(Error::UnknownPrincipal(sname.to_string()));
+            return Err(Error::NotFound(sname.to_string()));
         }
 
         // 4. Enctypes.

@@ -247,6 +247,16 @@ pub fn serve_connection(mut stream: TcpStream, kadmin: &Kadmin, now: i64) {
                 return;
             }
         };
+        if std::env::var_os("RRL_KADMIN_DIAG").is_some() {
+            eprintln!(
+                "kadmind: record in, {} octets: {}",
+                message.len(),
+                message
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+        }
         let Some(credential) = authenticated(&call) else {
             let _ = write_record(&mut stream, &denied(call.xid, 1)); // AUTH_BADCRED
             continue;
@@ -287,6 +297,13 @@ pub fn serve_connection(mut stream: TcpStream, kadmin: &Kadmin, now: i64) {
                 match served {
                     Ok((reply, seq)) => {
                         last_gss_seq = seq;
+                        if std::env::var_os("RRL_KADMIN_DIAG").is_some() {
+                            eprintln!(
+                                "kadmind: record out, {} octets: {}",
+                                reply.len(),
+                                reply.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                            );
+                        }
                         let _ = write_record(&mut stream, &reply);
                     }
                     Err(stat) => {
@@ -431,6 +448,18 @@ fn serve_init(
 ///
 /// `Err(auth_stat)` is a refusal to answer the call as asked. Every step is a function of its
 /// arguments, so each refusal below is one `?` rather than a `write; continue` pair.
+/// A diagnostic line, when the environment asks for one.
+///
+/// `RRL_KADMIN_DIAG=1` makes this server say why it refused a call. A refusal reaches the client as
+/// `GSS_S_FAILURE` or as an RPC error with no detail — by design, since an attacker must not learn
+/// which check failed — and that leaves an operator with nothing to read when the client is the one
+/// that is wrong.
+fn diag(message: &str) {
+    if std::env::var_os("RRL_KADMIN_DIAG").is_some() {
+        eprintln!("kadmind: {message}");
+    }
+}
+
 fn serve_data(
     message: &[u8],
     call: &Call,
@@ -443,31 +472,55 @@ fn serve_data(
     // weaker service is refused rather than served.
     requires_privacy(credential).map_err(|_| 13u32)?;
     let (actor, context) = context.ok_or(14u32)?;
+    diag("data: context established");
 
     // The verifier is a MIC over the header as it arrived.
     let header = &message[..call.header_len];
     let seq = context
         .verify_mic(&call.verf.1, header)
+        .inspect_err(|e| {
+            diag(&format!("data: MIC did not verify: {e:?}"));
+        })
         .map_err(refuse_mic)?;
+    diag(&format!("data: MIC verified, seq {}", seq.seq));
     let seq = check_freshness(last, seq.seq, "MIC")?;
 
     // The arguments are the sealed body: an opaque holding `seq || args`.
     let mut reader = Reader::new(&call.args);
     let sealed = reader.opaque().map_err(|_| 13u32)?;
-    let opened = context
-        .unwrap(sealed)
-        .map_err(|error| refuse_with(13, &format!("unwrap: {error}")))?;
+    let opened = context.unwrap(sealed).map_err(|error| {
+        diag(&format!("data: unwrap failed: {error:?}"));
+        13u32
+    })?;
+    diag(&format!("data: wrap opened, seq {}", opened.seq));
     // The Wrap carries its own sequence, and it has to be newer than the MIC's: a replayed
     // body inside a fresh header would otherwise pass, because the MIC only covers the header.
-    let seq = check_freshness(seq, opened.seq, "Wrap token")?;
+    let seq = check_freshness(seq, opened.seq, "Wrap token").inspect_err(|e| {
+        diag(&format!("data: the wrap token is not fresh ({e})"));
+    })?;
 
     let mut inner = Reader::new(&opened.message);
-    let inner_seq = inner.u32().map_err(|_| 13u32)?;
+    let inner_seq = inner.u32().map_err(|_| {
+        diag(&format!(
+            "data: the opened body is {} octets, too short for a sequence number",
+            opened.message.len()
+        ));
+        13u32
+    })?;
     if inner_seq != credential.seq {
+        diag(&format!(
+            "data: the sealed body carries seq {inner_seq}, the credential says {}",
+            credential.seq
+        ));
         return Err(13);
     }
     let arguments = inner.rest().to_vec();
 
+    diag(&format!(
+        "data: dispatched proc {} with {} octets of arguments",
+        call.proc_,
+        arguments.len()
+    ));
     let results = kadmin.dispatch(actor, call, &arguments);
     let mut to_seal = Writer::new();
     to_seal.u32(credential.seq).raw(&results);

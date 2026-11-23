@@ -57,19 +57,38 @@ pub fn service_principal(realm: &str) -> Result<Principal> {
     Principal::parse(&format!("kadmin/admin@{realm}")).map_err(Error::from)
 }
 
+/// Whether `candidate` names this realm's admin service: `kadmin/<anything>@<realm>`.
+///
+/// The second component is not checked, and deliberately: MIT's `kadmin` asks for
+/// `kadmin/<admin-server-host>` while `kadmin.local` and the documented principal are `kadmin/admin`,
+/// and both travel to the same server with a keytab that holds both. Only the first component and the
+/// realm decide that this is the admin service rather than some other.
+fn is_admin_service(candidate: &Principal, configured: &Principal) -> bool {
+    candidate.realm == configured.realm
+        && candidate.components.len() == configured.components.len()
+        && candidate.components.first() == configured.components.first()
+}
+
 /// The `kadmin/admin` entry a realm needs, keyed with `password`.
 ///
 /// `INITIAL` and `change-pw` are not set: a `kadmin` ticket is a *service* ticket,
 /// obtained with a TGT, which is what MIT does and what makes `kadmin -p` work
 /// from any host the TGT is valid on. The change-password service is a different
 /// principal with different flags for exactly that reason.
+///
+/// `CLIENT` **is** set, and that is not a detail: `kadmin -p` with no ticket cache asks the KDC for
+/// an initial ticket for this principal, and a KDC that finds only `SERVER` on the entry refuses
+/// with `KDC_ERR_POLICY` — *"is not a client principal"*. An administrator who cannot obtain the
+/// ticket that opens the admin port has a realm nobody can administer. Measured against MIT's
+/// `kadmin`: without this flag the first thing it prints is `KDC policy rejects request while
+/// initializing kadmin interface`.
 pub fn admin_entry(
     realm: &str,
     cipher: &dyn crate::crypto::Cipher,
     password: &[u8],
 ) -> Result<HdbEntry> {
     let mut entry = HdbEntry::service(service_principal(realm)?);
-    entry.flags |= crate::hdb::flags::REQUIRE_PREAUTH;
+    entry.flags |= crate::hdb::flags::REQUIRE_PREAUTH | crate::hdb::flags::CLIENT;
     for enctype in crate::crypto::Enctype::ALL {
         entry.add_password_key(cipher, enctype, password, 1)?;
     }
@@ -523,11 +542,30 @@ impl Kadmin {
         let ap_req_bytes = unwrap_initial_context_token(token)?;
         let ap_req = ApReq::decode(ap_req_bytes)?;
         let ticket = crate::msg::Ticket::decode(&ap_req.ticket)?;
+        // The key comes from the entry the **ticket** names, not from a single pinned principal.
+        //
+        // That is what a keytab-based acceptor does, and MIT's `kadmin` is the reason it matters: it
+        // asks the KDC for an initial ticket for `kadmin/<admin-server-host>` — its own trace says
+        // `Setting initial creds service to kadmin/127.0.0.1` — so a server that accepted only
+        // `kadmin/admin` refused every real client with `GSS-API error while initializing kadmin
+        // interface`. A keytab for `kadmin` holds both names for exactly this reason.
+        //
+        // What is still refused: a ticket for a service **outside** the `kadmin` name, which is the
+        // case `BADMATCH` is for.
+        if !is_admin_service(&ticket.sname, &self.service) {
+            return Err(Error::Kdc {
+                code: crate::error::codes::KRB_AP_ERR_BADMATCH,
+                text: format!(
+                    "the ticket is for {}, which is not the admin service of {}",
+                    ticket.sname, self.service.realm
+                ),
+            });
+        }
         let service = self
             .kdc
             .hdb()
-            .fetch(&self.service)?
-            .ok_or_else(|| Error::Hdb(format!("{} is not in the database", self.service)))?;
+            .fetch(&ticket.sname)?
+            .ok_or_else(|| Error::Hdb(format!("{} is not in the database", ticket.sname)))?;
         let key = service
             .key_for(ticket.enc.etype)
             .or_else(|| service.enctypes().first().and_then(|e| service.key_for(*e)))
@@ -537,12 +575,6 @@ impl Kadmin {
                 .cipher()
                 .decrypt(&key.key, usage::KDC_REP_TICKET, &ticket.enc.cipher)?;
         let enc_part: EncTicketPart = EncTicketPart::decode(&plain)?;
-        if ticket.sname != self.service {
-            return Err(Error::Kdc {
-                code: crate::error::codes::KRB_AP_ERR_BADMATCH,
-                text: format!("the ticket is for {}, not {}", ticket.sname, self.service),
-            });
-        }
         if now > enc_part.endtime {
             return Err(Error::Kdc {
                 code: crate::error::codes::KRB_AP_ERR_TKT_EXPIRED,
@@ -670,9 +702,21 @@ impl Drop for RunningKadmin {
 /// The clock is read once, here: everything below takes the instant as a
 /// parameter, so a test can hand the engine a fixed time.
 pub fn serve_kadmin_loopback(kadmin: Kadmin) -> Result<RunningKadmin> {
+    serve_kadmin_on(("127.0.0.1", 0), kadmin)
+}
+
+/// Starts a `kadmind` on `addr`, for a stand that has to name its port.
+///
+/// `admin_server` in a `krb5.conf` is a fixed `host:port`, so a client that reads one — MIT's
+/// `kadmin` does — cannot be pointed at an address the server picked. `serve_kadmin_loopback` is
+/// this with port zero.
+pub fn serve_kadmin_on<A: std::net::ToSocketAddrs>(
+    addr: A,
+    kadmin: Kadmin,
+) -> Result<RunningKadmin> {
     use std::net::TcpListener;
 
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(Error::Io)?;
+    let listener = TcpListener::bind(addr).map_err(Error::Io)?;
     listener.set_nonblocking(true).map_err(Error::Io)?;
     let addr = listener.local_addr().map_err(Error::Io)?.to_string();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1048,6 +1092,40 @@ mod tests {
                 privs,
                 kadm5::PRIV_ALL,
                 "a caller with {rights:?} was told it has fewer privileges than MIT reports"
+            );
+        }
+    }
+
+    /// The acceptor is keyed on the ticket's name, within the `kadmin` service only.
+    ///
+    /// MIT's `kadmin` presents a ticket for `kadmin/<admin-server-host>`; `kadmin.local` and the
+    /// documented name are `kadmin/admin`. Both reach the same server, and a keytab holds both — so
+    /// the second component is not part of the decision, and the first one is.
+    #[test]
+    fn the_admin_service_is_kadmin_in_this_realm() {
+        let configured = service_principal(ACL_REALM).unwrap();
+        for accepted in ["kadmin/admin", "kadmin/127.0.0.1", "kadmin/dc1.example.com"] {
+            assert!(
+                is_admin_service(&principal(accepted), &configured),
+                "{accepted} is the admin service and must be accepted"
+            );
+        }
+        for refused in [
+            // Another service entirely: a stolen service ticket must not open the admin port.
+            "host/dc1.example.com",
+            // Same shape, another realm.
+            "kadmin/admin@OTHER.COM",
+            // A one-component name is not `kadmin/<instance>`.
+            "kadmin",
+        ] {
+            let candidate = if refused.contains('@') {
+                Principal::parse(refused).unwrap()
+            } else {
+                principal(refused)
+            };
+            assert!(
+                !is_admin_service(&candidate, &configured),
+                "{refused} is not the admin service and must be refused"
             );
         }
     }

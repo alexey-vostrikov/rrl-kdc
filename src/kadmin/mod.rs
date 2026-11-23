@@ -621,7 +621,14 @@ impl Kadmin {
 
         Ok((
             authenticator.cname.clone(),
-            AcceptorContext::new(self.kdc.cipher_arc(), context_key),
+            // Seeded with the number this AP-REP announces one line up: the
+            // initiator counts our tokens from it, so the first one we send has
+            // to be `seq_number + 1`, not zero.
+            AcceptorContext::new(
+                self.kdc.cipher_arc(),
+                context_key,
+                authenticator.seq_number.unwrap_or(0),
+            ),
             // The AP-REP goes back inside the same generic wrapper the client
             // used: `[APPLICATION 0] { OID, AP-REP }`. A bare AP-REP is what this
             // server looked for on the way in and what every real client refuses

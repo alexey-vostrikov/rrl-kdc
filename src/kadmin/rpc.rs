@@ -420,7 +420,7 @@ fn serve_init(
     match kadmin.accept(&token, now) {
         Ok((actor, accepted_context, ap_rep)) => {
             let verifier = accepted_context
-                .emit_mic(0, &WINDOW.to_be_bytes())
+                .emit_mic(&WINDOW.to_be_bytes())
                 .map_err(|_| 13u32)?;
             let body = gss_init_body(handle, &ap_rep);
             Ok(InitOutcome::Accepted {
@@ -524,20 +524,23 @@ fn serve_data(
     let results = kadmin.dispatch(actor, call, &arguments);
     let mut to_seal = Writer::new();
     to_seal.u32(credential.seq).raw(&results);
-    let sealed_reply = context
-        .seal(credential.seq as u64, to_seal.bytes())
+    // The verifier is emitted first on purpose: it travels ahead of the body in the reply, and
+    // the peer's replay window wants the sequence numbers in the order the octets arrive.
+    let verifier = context
+        .emit_mic(&credential.seq.to_be_bytes())
         .map_err(|_| 13u32)?;
+    let sealed_reply = context.seal(to_seal.bytes()).map_err(|_| 13u32)?;
     diag(&format!(
-        "data: replay plaintext {} octets (seq + {} result), token {} octets",
+        "data: replay plaintext {} octets (seq + {} result), token {} octets, hex {}",
         to_seal.bytes().len(),
         results.len(),
-        sealed_reply.len()
+        sealed_reply.len(),
+        to_seal
+            .bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     ));
-    // The reply's verifier is the acceptor's MIC over the sequence number, and its body is the
-    // sealed results.
-    let verifier = context
-        .emit_mic(0, &credential.seq.to_be_bytes())
-        .map_err(|_| 13u32)?;
     Ok((
         accepted(
             call.xid,

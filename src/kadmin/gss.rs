@@ -72,16 +72,39 @@ pub struct AcceptorContext {
     /// kept as a field so that a token claiming one is refused with the right
     /// reason rather than an opaque MAC failure.
     acceptor_subkey: bool,
+    /// The last sequence number this side has *emitted*.
+    ///
+    /// Seeded with the number our AP-REP announced: RFC 4121 §3.1 makes the
+    /// acceptor's sending sequence continue the initiator's, and the initiator
+    /// starts counting from what the AP-REP said. Emitting `0` here — which is
+    /// what this code did before it had a counter — is not "the first token",
+    /// it is a token from far below every receiver's replay window, and MIT's
+    /// `kadmin` answers it with `Communication failure` rather than a GSS code
+    /// an operator can read.
+    send_seq: std::sync::atomic::AtomicU64,
 }
 
 impl AcceptorContext {
-    /// A context keyed by `key`.
-    pub fn new(cipher: std::sync::Arc<dyn Cipher>, key: Key) -> Self {
+    /// A context keyed by `key`, whose outgoing tokens continue from
+    /// `announced_seq` — the number the AP-REP carried.
+    pub fn new(cipher: std::sync::Arc<dyn Cipher>, key: Key, announced_seq: u32) -> Self {
         AcceptorContext {
             cipher,
             key,
             acceptor_subkey: false,
+            send_seq: std::sync::atomic::AtomicU64::new(u64::from(announced_seq)),
         }
+    }
+
+    /// The sequence number the next emitted token carries.
+    ///
+    /// Every token spends one number, MIC and Wrap alike: MIT's acceptor takes
+    /// its reply verifier from the same counter it wraps the body with, so a
+    /// peer that numbers only the Wrap tokens makes the verifier look replayed.
+    fn next_token_seq(&self) -> u64 {
+        self.send_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     /// The key per-message tokens are computed with — for tests and logs, never
@@ -248,8 +271,8 @@ impl AcceptorContext {
     }
 
     /// Seals `message` in a Wrap token for the initiator.
-    pub fn seal(&self, seq: u64, message: &[u8]) -> Result<Vec<u8>> {
-        let header = wrap_header(self.flags() | FLAG_SEALED, 0, 0, seq);
+    pub fn seal(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let header = wrap_header(self.flags() | FLAG_SEALED, 0, 0, self.next_token_seq());
         let mut to_encrypt = Vec::with_capacity(message.len() + HEADER_LEN);
         to_encrypt.extend_from_slice(message);
         to_encrypt.extend_from_slice(&header);
@@ -263,8 +286,8 @@ impl AcceptorContext {
     }
 
     /// A MIC token over `message`, for the reply verifier.
-    pub fn emit_mic(&self, seq: u64, message: &[u8]) -> Result<Vec<u8>> {
-        let header = mic_header(self.flags(), seq);
+    pub fn emit_mic(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let header = mic_header(self.flags(), self.next_token_seq());
         let mut signed = Vec::with_capacity(message.len() + HEADER_LEN);
         signed.extend_from_slice(message);
         signed.extend_from_slice(&header);
@@ -325,7 +348,7 @@ mod tests {
     fn context(enctype: Enctype) -> (AcceptorContext, Key) {
         let key = OwnCipher.random(enctype).unwrap();
         (
-            AcceptorContext::new(Arc::new(OwnCipher) as Arc<dyn Cipher>, key.clone()),
+            AcceptorContext::new(Arc::new(OwnCipher) as Arc<dyn Cipher>, key.clone(), 0),
             key,
         )
     }
@@ -386,12 +409,34 @@ mod tests {
     }
 
     #[test]
+    fn the_acceptors_tokens_continue_from_the_number_its_ap_rep_announced() {
+        // RFC 4121 §3.1: the acceptor's sending sequence continues the one the AP-REP names, and
+        // MIT's client opens its replay window there. A context that numbers its first token `0`
+        // looks like a replay of something older than the window, and `kadmin` reports it as
+        // "Communication failure" — no GSS code, no hint that a counter is what is missing.
+        let key = OwnCipher.random(Enctype::Aes256Sha1).unwrap();
+        let context =
+            AcceptorContext::new(Arc::new(OwnCipher) as Arc<dyn Cipher>, key, 0x0102_0304);
+        let seq = |token: &[u8]| u64::from_be_bytes(token[8..16].try_into().expect("16"));
+
+        let mic = context.emit_mic(b"first").unwrap();
+        let wrap = context.seal(b"second").unwrap();
+
+        assert_eq!(
+            seq(&mic),
+            0x0102_0305,
+            "the MIC takes the first number after the AP-REP's"
+        );
+        assert_eq!(seq(&wrap), 0x0102_0306, "and the Wrap takes the next");
+    }
+
+    #[test]
     fn a_reflected_mic_is_refused() {
         // The acceptor's own token replayed at it: the checksum is valid — under
         // the acceptor's usage — and only the direction bit says it is not the
         // peer's. This is what stops a reflection attack.
         let (context, _key) = context(Enctype::Aes256Sha1);
-        let own = context.emit_mic(1, b"message").unwrap();
+        let own = context.emit_mic(b"message").unwrap();
         let error = context
             .verify_mic(&own, b"message")
             .unwrap_err()
@@ -424,7 +469,7 @@ mod tests {
     fn a_mic_token_that_claims_to_be_sealed_is_refused() {
         // RFC 4121 §4.2.2: "SHALL NOT be set in MIC tokens".
         let (context, _key) = context(Enctype::Aes256Sha1);
-        let mut token = context.emit_mic(1, b"x").unwrap();
+        let mut token = context.emit_mic(b"x").unwrap();
         token[2] |= FLAG_SEALED;
         token[2] &= !FLAG_SENT_BY_ACCEPTOR;
         assert!(context.verify_mic(&token, b"x").is_err());
@@ -495,7 +540,7 @@ mod tests {
             let (context, _) = context(enctype);
             assert_eq!(context.checksum_len(), want, "{}", enctype.name());
             assert_eq!(
-                context.emit_mic(1, b"x").unwrap().len(),
+                context.emit_mic(b"x").unwrap().len(),
                 HEADER_LEN + want,
                 "{}",
                 enctype.name()

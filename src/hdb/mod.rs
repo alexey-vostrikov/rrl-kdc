@@ -211,6 +211,17 @@ pub struct HdbEntry {
     pub etypes: Option<Vec<Enctype>>,
     /// `modified`.
     pub modified: i64,
+    /// The principal that last changed this entry, when the writer recorded one.
+    ///
+    /// Heimdal's `hdb.asn1` has no field for this, so it lives in this crate's own HDB extension
+    /// (18) next to the private extensions for strings and the NT hash. It is the same fact MIT's
+    /// `kadm5_principal_ent_rec.mod_name` carries, and `getprinc` prints it.
+    ///
+    /// `None` is **"not recorded"**, not "changed by nobody": an entry written by another tool, or
+    /// by an operation that had no actor to name. The two are kept apart because a reader that
+    /// could not tell them apart would have to invent a name for the first case, and the invented
+    /// name would be indistinguishable from a real one.
+    pub modified_by: Option<Principal>,
     /// `HDB-Ext-Constrained-delegation-acl`: the services this principal may delegate to.
     ///
     /// Heimdal keeps this in the entry's extensions (`allowed-to-delegate-to [2]`) rather than
@@ -269,10 +280,30 @@ impl HdbEntry {
             max_renew: None,
             etypes: None,
             modified: 0,
+            modified_by: None,
             constrained_delegation: None,
             aliases: None,
             policy: None,
             strings: Vec::new(),
+        }
+    }
+
+    /// Records who changed this entry, and when.
+    ///
+    /// Called by the writer, never inferred. The modifier is a fact about the *operation*: the same
+    /// `modify` is performed by an administrator through `kadmin`, by an account owner through
+    /// `kpasswd`, and by a replica applying what its master sent — and a store that stamped itself
+    /// would name the code path instead of the hand. So the caller passes what it knows, and an
+    /// argument that is absent leaves the field alone rather than clearing it.
+    ///
+    /// `at == 0` likewise leaves the timestamp alone: a caller with no clock (a stand, a test)
+    /// says so by passing zero, and the record keeps whatever time it had.
+    pub fn stamp(&mut self, by: Option<&Principal>, at: i64) {
+        if let Some(by) = by {
+            self.modified_by = Some(by.clone());
+        }
+        if at != 0 {
+            self.modified = at;
         }
     }
 
@@ -341,6 +372,7 @@ impl HdbEntry {
             max_renew: None,
             etypes: None,
             modified: 0,
+            modified_by: None,
             constrained_delegation: None,
             aliases: None,
             policy: None,
@@ -364,6 +396,7 @@ impl HdbEntry {
             max_renew: None,
             etypes: None,
             modified: 0,
+            modified_by: None,
             constrained_delegation: None,
             aliases: None,
             policy: None,

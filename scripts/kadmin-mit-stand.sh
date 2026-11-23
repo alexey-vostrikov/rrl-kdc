@@ -120,6 +120,13 @@ kadmin_call -q "addprinc -pw $NEW-Password-1 $NEW" 2>&1 | grep -q "already exist
     && fail "addprinc found an entry that should not exist"
 kadmin_call -q "getprinc $NEW" 2>&1 | grep -q "Principal: $NEW@$REALM" \
     || fail "getprinc did not name the entry it had just created"
+# Who changed it, and when: `mod_name`/`mod_date` of the entry record. MIT prints them as
+# "Last modified: <date> (<principal>)". This is the field that used to be the entry's own name
+# because nothing recorded a modifier — so a stand that only checked the name of the entry would
+# pass with the wrong person in it.
+kadmin_call -q "getprinc $NEW" 2>&1 \
+    | grep -qE "Last modified: .*\\($ADMIN@$REALM\\)" \
+    || fail "getprinc did not name the administrator who created the entry"
 # A password change goes through its own procedure and its own right.
 kadmin_call -q "cpw -pw another-Password-1 $NEW" 2>&1 | grep -q "Password for .* changed" \
     || fail "cpw did not report the change"

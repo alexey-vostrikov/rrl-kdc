@@ -172,6 +172,38 @@ pub struct Admin {
     policy: Arc<dyn wire::Policy>,
 }
 
+/// Who is making a change, and when — the two facts a record keeps about its last writer.
+///
+/// Supplied by the caller, because the same operation is performed by different hands: an
+/// administrator through `kadmin`, an account's owner through `kpasswd`, a replica applying what its
+/// master sent. A store that stamped itself would name the code path instead of the hand, and a
+/// record whose modifier is always `replication` is worse than one with no modifier at all.
+///
+/// The timestamp is separate from the author and may be absent (`at == 0`): a stand or a test has an
+/// author to name and no clock, and inventing `now` there would put a false date in the record.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stamp<'a> {
+    by: Option<&'a Principal>,
+    at: i64,
+}
+
+impl<'a> Stamp<'a> {
+    /// A change with no recorded author and no timestamp.
+    pub fn none() -> Self {
+        Stamp::default()
+    }
+
+    /// A change by `by` at `at` seconds since the epoch; `at == 0` leaves the date alone.
+    pub fn by(by: &'a Principal, at: i64) -> Self {
+        Stamp { by: Some(by), at }
+    }
+
+    /// Writes what it knows onto `entry`, leaving what it does not know as it was.
+    fn apply(&self, entry: &mut HdbEntry) {
+        entry.stamp(self.by, self.at);
+    }
+}
+
 impl Admin {
     /// An administrator over `hdb`, issuing `allowed` enctypes.
     pub fn new(
@@ -227,8 +259,15 @@ impl Admin {
             .ok_or_else(|| Error::NotFound(principal.to_string()))
     }
 
-    /// Creates a principal, or fails if it exists.
+    /// Creates a principal, or fails if it exists, recording no author.
+    ///
+    /// [`Admin::create_by`] is the same with the hand named.
     pub fn create(&self, new: NewPrincipal) -> Result<HdbEntry> {
+        self.create_by(new, &Stamp::none())
+    }
+
+    /// Creates a principal, or fails if it exists.
+    pub fn create_by(&self, new: NewPrincipal, stamp: &Stamp<'_>) -> Result<HdbEntry> {
         let mut principal = new.principal;
         if principal.realm.is_empty() {
             principal.realm = self.realm.clone();
@@ -265,6 +304,9 @@ impl Admin {
             max_renew: None,
             etypes: None,
             modified: 0,
+            // Set by `stamp`, from whatever the caller knows about who is acting; a create that
+            // stamps itself would name this function rather than the administrator.
+            modified_by: None,
             // Delegation limits are an HDB extension a directory cannot hold; a principal
             // created through the admin interface delegates nowhere but itself.
             constrained_delegation: None,
@@ -290,6 +332,7 @@ impl Admin {
                 entry.add_password_key(self.cipher.as_ref(), *enctype, &new.password, 1)?;
             }
         }
+        stamp.apply(&mut entry);
         self.hdb.store(entry.clone())?;
         Ok(entry)
     }
@@ -322,6 +365,13 @@ impl Admin {
     ///
     /// `krbtgt` and `immutable` entries are refused as well, the same two that [`Admin::delete`]
     /// refuses; renaming either leaves a realm that cannot issue a ticket.
+    ///
+    /// A rename records **no** modifier. The backends move the record — decode, change the name,
+    /// write — and this method hands them no author to stamp with, because stamping here would mean
+    /// a second write after the move, and a rename that half happened is the failure the atomicity
+    /// above exists to prevent. So the modifier a `getprinc` shows after a rename is the one from
+    /// the last change to the entry's *content*, which is a fact about the record and not a lie
+    /// about the move.
     pub fn rename(&self, from: &Principal, to: &Principal) -> Result<()> {
         if from == to {
             return Err(Error::Config(format!("{from} is already its own name")));
@@ -353,6 +403,17 @@ impl Admin {
     /// empty", which is not the same as absent — the distinction is how an operator says "this
     /// attribute exists but is blank" to whatever reads it.
     pub fn set_string(&self, principal: &Principal, key: &str, value: &str) -> Result<HdbEntry> {
+        self.set_string_by(principal, key, value, &Stamp::none())
+    }
+
+    /// Sets one string attribute, recording who did it.
+    pub fn set_string_by(
+        &self,
+        principal: &Principal,
+        key: &str,
+        value: &str,
+        stamp: &Stamp<'_>,
+    ) -> Result<HdbEntry> {
         if key.is_empty() {
             return Err(Error::Config(
                 "an empty string-attribute key: a pair with no name is one nothing can ask for"
@@ -364,6 +425,7 @@ impl Admin {
             Some(pair) => pair.1 = value.to_owned(),
             None => entry.strings.push((key.to_owned(), value.to_owned())),
         }
+        stamp.apply(&mut entry);
         self.hdb.store(entry.clone())?;
         Ok(entry)
     }
@@ -374,18 +436,39 @@ impl Admin {
     /// principal is not: the caller asked for an end state, and the end state is what it gets.
     /// [`Admin::strings`] is how it can tell.
     pub fn delete_string(&self, principal: &Principal, key: &str) -> Result<bool> {
+        self.delete_string_by(principal, key, &Stamp::none())
+    }
+
+    /// Removes one string attribute, recording who did it.
+    pub fn delete_string_by(
+        &self,
+        principal: &Principal,
+        key: &str,
+        stamp: &Stamp<'_>,
+    ) -> Result<bool> {
         let mut entry = self.get(principal)?;
         let before = entry.strings.len();
         entry.strings.retain(|(k, _)| k != key);
         if entry.strings.len() == before {
             return Ok(false);
         }
+        stamp.apply(&mut entry);
         self.hdb.store(entry)?;
         Ok(true)
     }
 
-    /// Applies `change` to an existing entry.
+    /// Applies `change` to an existing entry, recording no author.
     pub fn modify(&self, principal: &Principal, change: Modify) -> Result<HdbEntry> {
+        self.modify_by(principal, change, &Stamp::none())
+    }
+
+    /// Applies `change` to an existing entry.
+    pub fn modify_by(
+        &self,
+        principal: &Principal,
+        change: Modify,
+        stamp: &Stamp<'_>,
+    ) -> Result<HdbEntry> {
         if change.is_empty() {
             return Err(Error::Config(
                 "an empty modification: nothing to do, and a no-op that reports success is a \
@@ -458,6 +541,7 @@ impl Admin {
             }
             entry.kvno = kvno;
         }
+        stamp.apply(&mut entry);
         self.hdb.store(entry.clone())?;
         Ok(entry)
     }
@@ -532,6 +616,16 @@ impl Admin {
     /// Returns the kvno the new keys are at, which is what a service needs to
     /// know when it re-reads its keytab.
     pub fn set_password(&self, principal: &Principal, password: &[u8]) -> Result<u32> {
+        self.set_password_by(principal, password, &Stamp::none())
+    }
+
+    /// Rotation and passwords in one place: [`Admin::set_password`], recording who did it.
+    pub fn set_password_by(
+        &self,
+        principal: &Principal,
+        password: &[u8],
+        stamp: &Stamp<'_>,
+    ) -> Result<u32> {
         if password.is_empty() {
             return Err(Error::Config(
                 "an empty password: a key derived from nothing is a key everybody has".into(),
@@ -552,7 +646,8 @@ impl Admin {
                 }
             }
         }
-        let updated = entry.rekey(self.cipher.as_ref(), password)?;
+        let mut updated = entry.rekey(self.cipher.as_ref(), password)?;
+        stamp.apply(&mut updated);
         let kvno = updated.kvno();
         self.hdb.store(updated)?;
         Ok(kvno)
@@ -565,12 +660,18 @@ impl Admin {
     /// invalidate the tickets a user just obtained, and an operator who wants that
     /// says so.
     pub fn prune_old_keys(&self, principal: &Principal) -> Result<usize> {
+        self.prune_old_keys_by(principal, &Stamp::none())
+    }
+
+    /// [`Admin::prune_old_keys`], recording who did it.
+    pub fn prune_old_keys_by(&self, principal: &Principal, stamp: &Stamp<'_>) -> Result<usize> {
         let mut entry = self.get(principal)?;
         let current = entry.kvno();
         let before = entry.keys.len();
         entry.keys.retain(|k| k.kvno == current);
         let removed = before - entry.keys.len();
         if removed > 0 {
+            stamp.apply(&mut entry);
             self.hdb.store(entry)?;
         }
         Ok(removed)

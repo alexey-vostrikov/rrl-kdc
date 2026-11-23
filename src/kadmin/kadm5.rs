@@ -240,13 +240,20 @@ pub fn encode_principal_entry(entry: &HdbEntry) -> Vec<u8> {
         // `KRB5_PARSE_MALFORMED` — the whole `getprinc` dies with "Malformed representation of
         // principal while unparsing principal", which reads as if *our* name were corrupt.
         //
-        // This record has no modifier: the Heimdal `hdb.asn1` entry has no field for one, and
-        // `modified_by` is not kept anywhere in this crate. So the name reported is the entry's
-        // own — the one principal the record certainly names. It is an approximation an operator
-        // should not mistake for an audit trail, and recording the real modifier is a field of its
-        // own rather than something to infer here.
+        // The name written is the modifier the entry recorded, which comes from
+        // `HdbEntry::modified_by` (this crate's HDB extension 18, since Heimdal's schema has no
+        // field for it). When nothing was recorded — an entry written by another tool, or by an
+        // operation that had no actor — the entry's own name is reported instead. That is a
+        // fallback and not a claim: the field cannot be NULL, and an empty or invented name would
+        // be worse than the one principal the record certainly names.
         .present()
-        .nullstring(Some(&entry.principal.to_string()))
+        .nullstring(Some(
+            &entry
+                .modified_by
+                .as_ref()
+                .unwrap_or(&entry.principal)
+                .to_string(),
+        ))
         .i32(entry.modified as i32) // mod_date
         .i32(attributes_of(entry) as i32)
         .u32(entry.kvno())
@@ -340,6 +347,15 @@ pub struct EntryRec {
     pub policy: Option<String>,
     /// `max_renewable_life`.
     pub max_renew: i64,
+    /// `mod_name`: who last changed the entry, when the record says.
+    ///
+    /// Kept because it is the one field of an entry record that is a statement about *people*
+    /// rather than about the account, and a caller that dropped it would have no way to see what
+    /// this server reported — which is how a wrong modifier went unnoticed through the whole
+    /// `getprinc` path once already.
+    pub mod_name: Option<String>,
+    /// `mod_date`: when it changed, 0 meaning "not recorded".
+    pub mod_date: i64,
 }
 
 /// Reads `_xdr_kadm5_principal_ent_rec` from `r`.
@@ -352,10 +368,14 @@ pub fn decode_entry_rec(r: &mut Reader<'_>) -> std::result::Result<EntryRec, u32
     let max_life = r.i32().map_err(|_| BAD_MASK)?;
     // `mod_name` is a plain XDR bool followed by the name when present: TRUE means absent, which
     // is MIT's `xdr_nulltype` and the inverse of what the name suggests.
-    if !r.bool().map_err(|_| BAD_MASK)? {
-        let _ = r.nullstring().map_err(|_| BAD_MASK)?;
-    }
-    let _mod_date = r.i32().map_err(|_| BAD_MASK)?;
+    let mod_name = if r.bool().map_err(|_| BAD_MASK)? {
+        // TRUE is the *absent* marker, MIT's `xdr_nulltype`: the name follows only when the bool is
+        // FALSE, and reading it the other way round parses the modifier out of the next field.
+        None
+    } else {
+        r.nullstring().map_err(|_| BAD_MASK)?
+    };
+    let mod_date = r.i32().map_err(|_| BAD_MASK)?;
     let attributes = r.u32().map_err(|_| BAD_MASK)?;
     let kvno = r.u32().map_err(|_| BAD_MASK)?;
     let _mkvno = r.u32().map_err(|_| BAD_MASK)?;
@@ -403,6 +423,8 @@ pub fn decode_entry_rec(r: &mut Reader<'_>) -> std::result::Result<EntryRec, u32
         kvno,
         policy,
         max_renew: i64::from(max_renew),
+        mod_name,
+        mod_date: i64::from(mod_date),
     })
 }
 
@@ -828,7 +850,7 @@ mod tests {
         assert_eq!(
             r.nullstring().unwrap().as_deref(),
             Some("alice@R"),
-            "the modifier reported is the entry's own name: no field records the real one"
+            "nothing was recorded, so the fallback is the entry's own name — the field cannot be NULL"
         );
         assert_eq!(r.i32().unwrap(), 0, "mod_date");
         assert_eq!(
@@ -837,6 +859,36 @@ mod tests {
             "REQUIRES_PRE_AUTH, DISALLOW_SVR because a user entry is not a server, and \
              DISALLOW_POSTDATED because `HdbEntry::user` does not allow postdating"
         );
+    }
+
+    /// A recorded modifier is what `getprinc` shows: the fallback is for entries without one.
+    ///
+    /// The distinction matters because the fallback names a principal that always exists (the
+    /// entry's own), so a reply built from it looks correct — it is only wrong about the person.
+    #[test]
+    fn a_recorded_modifier_is_reported_instead_of_the_entrys_own_name() {
+        let mut entry = HdbEntry::user(Principal::parse("alice@R").unwrap());
+        entry.modified_by = Some(Principal::parse("clerk@R").unwrap());
+        entry.modified = 1_700_000_000;
+        let bytes = encode_principal_entry(&entry);
+
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.nullstring().unwrap().as_deref(), Some("alice@R"));
+        for field in [
+            "princ_expire_time",
+            "last_pwd_change",
+            "pw_expiration",
+            "max_life",
+        ] {
+            let _ = r.i32().unwrap_or_else(|_| panic!("{field} is a timestamp"));
+        }
+        assert!(!r.bool().unwrap(), "mod_name is present");
+        assert_eq!(
+            r.nullstring().unwrap().as_deref(),
+            Some("clerk@R"),
+            "the hand that changed it, not the account that changed"
+        );
+        assert_eq!(r.i32().unwrap(), 1_700_000_000, "and when");
     }
 
     #[test]

@@ -293,6 +293,7 @@ pub fn serve_connection(mut stream: TcpStream, kadmin: &Kadmin, now: i64) {
                     context.as_ref(),
                     last_gss_seq,
                     kadmin,
+                    now,
                 );
                 match served {
                     Ok((reply, seq)) => {
@@ -467,6 +468,7 @@ fn serve_data(
     context: Option<&(crate::name::Principal, AcceptorContext)>,
     last: u64,
     kadmin: &Kadmin,
+    now: i64,
 ) -> std::result::Result<(Vec<u8>, u64), u32> {
     // Integrity without confidentiality would put a password on the wire in the clear, so the
     // weaker service is refused rather than served.
@@ -521,7 +523,7 @@ fn serve_data(
         call.proc_,
         arguments.len()
     ));
-    let results = kadmin.dispatch(actor, call, &arguments);
+    let results = kadmin.dispatch(actor, call, &arguments, now);
     let mut to_seal = Writer::new();
     to_seal.u32(credential.seq).raw(&results);
     // The verifier is emitted first on purpose: it travels ahead of the body in the reply, and

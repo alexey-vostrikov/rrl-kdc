@@ -135,9 +135,9 @@ impl Kadmin {
     /// Returns the XDR results, or a `kadm5` status the caller turns into a
     /// successful RPC reply carrying an error code — MIT's protocol reports errors
     /// in the results, not in the RPC layer, so a client can print the reason.
-    fn dispatch(&self, actor: &Principal, call: &Call, args: &[u8]) -> Vec<u8> {
+    fn dispatch(&self, actor: &Principal, call: &Call, args: &[u8], now: i64) -> Vec<u8> {
         let version = Reader::new(args).u32().unwrap_or(kadm5::API_VERSION_2);
-        let status = self.dispatch_inner(actor, call, args, version);
+        let status = self.dispatch_inner(actor, call, args, version, now);
         let mut out = Writer::new();
         out.u32(version);
         match status {
@@ -159,7 +159,12 @@ impl Kadmin {
         call: &Call,
         args: &[u8],
         version: u32,
+        now: i64,
     ) -> std::result::Result<Vec<u8>, u32> {
+        // Who is changing what: every procedure that writes an entry records the actor that the
+        // GSS context authenticated and the instant this connection started. Passed in rather than
+        // read here, because the clock is the server's decision, not this function's.
+        let stamp = crate::admin::Stamp::by(actor, now);
         if call.prog != kadm5::PROG || call.vers != kadm5::VERS {
             return Err(kadm5::UNK_PROC);
         }
@@ -238,16 +243,18 @@ impl Kadmin {
                     // said is that a modify was refused before anything was applied.
                     log_refusal(&format!("modify: the request was refused ({status})"));
                 })?;
-                self.admin.modify(&principal, change).map_err(|e| {
-                    log_refusal(&format!("modify {principal}: {e}"));
-                    // A value the field mask named and this server rejected — a kvno below the
-                    // keys, an expiry it cannot store — is a bad mask, not a server failure: the
-                    // operator named a field and gave it something it cannot hold.
-                    match e {
-                        crate::Error::Config(_) => kadm5::BAD_MASK,
-                        other => status_of(other),
-                    }
-                })?;
+                self.admin
+                    .modify_by(&principal, change, &stamp)
+                    .map_err(|e| {
+                        log_refusal(&format!("modify {principal}: {e}"));
+                        // A value the field mask named and this server rejected — a kvno below the
+                        // keys, an expiry it cannot store — is a bad mask, not a server failure: the
+                        // operator named a field and gave it something it cannot hold.
+                        match e {
+                            crate::Error::Config(_) => kadm5::BAD_MASK,
+                            other => status_of(other),
+                        }
+                    })?;
                 Ok(Vec::new())
             }
             kadm5::RENAME_PRINCIPAL => {
@@ -401,7 +408,7 @@ impl Kadmin {
                 match value {
                     Some(value) => {
                         self.admin
-                            .set_string(&principal, &key, &value)
+                            .set_string_by(&principal, &key, &value, &stamp)
                             .map_err(|e| {
                                 log_refusal(&format!("set_string {principal} {key}: {e}"));
                                 match e {
@@ -411,10 +418,12 @@ impl Kadmin {
                             })?;
                     }
                     None => {
-                        self.admin.delete_string(&principal, &key).map_err(|e| {
-                            log_refusal(&format!("del_string {principal} {key}: {e}"));
-                            status_of(e)
-                        })?;
+                        self.admin
+                            .delete_string_by(&principal, &key, &stamp)
+                            .map_err(|e| {
+                                log_refusal(&format!("del_string {principal} {key}: {e}"));
+                                status_of(e)
+                            })?;
                     }
                 }
                 Ok(Vec::new())
@@ -438,7 +447,7 @@ impl Kadmin {
                 } else {
                     new.password = Vec::new();
                 }
-                self.admin.create(new).map_err(|e| {
+                self.admin.create_by(new, &stamp).map_err(|e| {
                     log_refusal(&format!("create: {e}"));
                     status_of(e)
                 })?;
@@ -479,7 +488,7 @@ impl Kadmin {
                     .map_err(|_| kadm5::BAD_MASK)?
                     .unwrap_or_default();
                 self.admin
-                    .set_password(&principal, password.as_bytes())
+                    .set_password_by(&principal, password.as_bytes(), &stamp)
                     .map_err(|e| {
                         log_refusal(&format!("chpass: {e}"));
                         status_of(e)
@@ -507,7 +516,7 @@ impl Kadmin {
                 }
                 let updated = self
                     .admin
-                    .set_password(&principal, &random)
+                    .set_password_by(&principal, &random, &stamp)
                     .map_err(status_of)?;
                 let entry = self.admin.get(&principal).map_err(status_of)?;
                 let mut out = Writer::new();
@@ -931,6 +940,28 @@ mod tests {
         Kadmin::new(kdc, std::sync::Arc::new(grants)).expect("a kadmind over the realm")
     }
 
+    /// One call, as `kadm5` receives it, returning the whole reply rather than its status.
+    fn answer(kadmin: &Kadmin, actor: &str, procedure: u32, args: &[u8]) -> Vec<u8> {
+        let rpc = crate::kadmin::rpc::Call {
+            xid: 1,
+            prog: kadm5::PROG,
+            vers: kadm5::VERS,
+            proc_: procedure,
+            cred_flavor: 6,
+            gss: None,
+            verf: (0, Vec::new()),
+            args: Vec::new(),
+            header_len: 0,
+        };
+        let mut full = Vec::with_capacity(args.len() + 4);
+        full.extend_from_slice(&kadm5::API_VERSION_2.to_le_bytes());
+        full.extend_from_slice(args);
+        kadmin.dispatch(&principal(actor), &rpc, &full, STAMP_AT)
+    }
+
+    /// The instant every call in this module's tests is stamped with.
+    const STAMP_AT: i64 = 1_700_000_000;
+
     /// One call, as `kadm5` receives it: the version word, then whatever the procedure reads.
     fn call(kadmin: &Kadmin, actor: &str, procedure: u32, args: &[u8]) -> u32 {
         let rpc = crate::kadmin::rpc::Call {
@@ -947,7 +978,7 @@ mod tests {
         let mut full = Vec::with_capacity(args.len() + 4);
         full.extend_from_slice(&kadm5::API_VERSION_2.to_le_bytes());
         full.extend_from_slice(args);
-        let answer = kadmin.dispatch(&principal(actor), &rpc, &full);
+        let answer = kadmin.dispatch(&principal(actor), &rpc, &full, 1_700_000_000);
         // The reply is `[version][status][results…]`, and XDR is **big-endian** throughout: reading
         // it as little-endian gives a status that is the right number byte-reversed, which looks
         // like a refusal this server never sent.
@@ -1016,6 +1047,69 @@ mod tests {
     ///
     /// The other direction of the same table: a policy that grants `List` and nothing else must not
     /// let the same caller create, delete or read an entry.
+    /// A change through `kadmind` records **who** made it, and `getprinc` reports that name.
+    ///
+    /// Two facts are checked and they are separate: the entry carries the modifier (a fact about the
+    /// record, so a later `getprinc` or a replica sees it), and the `getprinc` reply carries it in
+    /// `mod_name` (a fact about the answer, so an operator sees it). A store that recorded the
+    /// subject instead of the actor would pass the first and fail nothing — the subject is what a
+    /// server that inferred the modifier would report.
+    #[test]
+    fn a_change_records_its_author_and_getprinc_names_them() {
+        use crate::crypto::{Enctype, OwnCipher};
+        use crate::hdb::{Hdb, HdbEntry, MemoryHdb};
+        use std::sync::Arc;
+
+        let db = Arc::new(MemoryHdb::new());
+        let mut krbtgt = HdbEntry::krbtgt(ACL_REALM);
+        krbtgt
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"master", 1)
+            .unwrap();
+        db.insert(krbtgt).unwrap();
+        let mut alice = HdbEntry::user(principal("alice"));
+        alice
+            .add_password_key(&OwnCipher, Enctype::Aes256Sha1, b"old", 1)
+            .unwrap();
+        db.insert(alice).unwrap();
+
+        let kdc = Kdc::new(
+            KdcConfig::new(ACL_REALM).unwrap(),
+            Arc::clone(&db) as Arc<dyn Hdb>,
+            Arc::new(OwnCipher),
+        );
+        let grants = Grants::default().grant(&principal("clerk"), Rights::ALL);
+        let kadmin = Kadmin::new(kdc, Arc::new(grants)).expect("a kadmind");
+
+        // `clerk` changes *alice's* password: the hand that acted is not the account that changed.
+        let mut args = crate::kadmin::xdr::Writer::new();
+        args.nullstring(Some(&principal("alice").to_string()))
+            .nullstring(Some("a new password"));
+        let reply = answer(&kadmin, "clerk", kadm5::CHPASS_PRINCIPAL, args.bytes());
+        let status = u32::from_be_bytes(reply[4..8].try_into().expect("four octets"));
+        assert_eq!(status, kadm5::OK, "the password change is allowed");
+
+        // The record: the modifier and the instant, both from the actor's call.
+        let stored = db.fetch(&principal("alice")).unwrap().expect("alice");
+        assert_eq!(
+            stored.modified_by.as_ref().map(ToString::to_string),
+            Some(principal("clerk").to_string())
+        );
+        assert_eq!(stored.modified, STAMP_AT, "and when they did it");
+
+        // The answer: `getprinc` reports the same name in `mod_name`.
+        let mut get = crate::kadmin::xdr::Writer::new();
+        get.nullstring(Some(&principal("alice").to_string()));
+        let reply = answer(&kadmin, "clerk", kadm5::GET_PRINCIPAL, get.bytes());
+        let mut r = crate::kadmin::xdr::Reader::new(&reply[8..]);
+        let rec = kadm5::decode_entry_rec(&mut r).expect("an entry record");
+        assert_eq!(
+            rec.mod_name.as_deref(),
+            Some(principal("clerk").to_string().as_str()),
+            "getprinc names the administrator, not the account"
+        );
+        assert_eq!(rec.mod_date, STAMP_AT, "and the date it changed");
+    }
+
     #[test]
     fn one_grant_opens_one_procedure() {
         let actor = "reader";
@@ -1091,7 +1185,7 @@ mod tests {
             };
             let mut args = Vec::new();
             args.extend_from_slice(&kadm5::API_VERSION_2.to_le_bytes());
-            let answer = kadmind.dispatch(&principal("someone"), &rpc, &args);
+            let answer = kadmind.dispatch(&principal("someone"), &rpc, &args, 1_700_000_000);
             let status = u32::from_be_bytes(answer[4..8].try_into().expect("four octets"));
             assert_eq!(status, kadm5::OK);
             let privs = u32::from_be_bytes(answer[8..12].try_into().expect("four octets"));

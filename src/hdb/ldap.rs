@@ -532,6 +532,10 @@ pub fn from_attributes_with(
         // this crate's, and a value read from a file that has none is zero rather
         // than "now", which would be a lie about when it changed.
         modified: 0,
+        // A directory keeps its own (`modifiersName`), and this backend does not read it: reporting
+        // a modifier from a column that is never consulted would be a name for something this store
+        // cannot see. The record backend keeps the field, which is where the extension lives.
+        modified_by: None,
     })
 }
 

@@ -286,6 +286,34 @@ pub fn encode_with(
             der::field(1, der::seq(&[der::field(17, der::seq(&fields))])),
         ]));
     }
+    if let Some(by) = &entry.modified_by {
+        // This crate's `HDB-Ext-Modified-By`, extension 18 — the next free number after the NT hash
+        // and after Heimdal's own list, which ends in `...`. Heimdal skips an extension it does not
+        // know, so a record written here still loads there; what it loses is the modifier, which
+        // Heimdal's schema never had.
+        extensions.push(der::seq(&[
+            der::field(0, der::int(0)),
+            der::field(
+                1,
+                der::seq(&[der::field(
+                    18,
+                    der::seq(&[
+                        der::field(0, der::int(by.name_type as i64)),
+                        der::field(
+                            1,
+                            der::seq(
+                                &by.components
+                                    .iter()
+                                    .map(|c| der::general_string(c))
+                                    .collect::<Vec<_>>(),
+                            ),
+                        ),
+                        der::field(2, der::general_string(&by.realm)),
+                    ]),
+                )]),
+            ),
+        ]));
+    }
     if !extensions.is_empty() {
         parts.push(der::field(13, der::seq(&extensions)));
     }
@@ -455,6 +483,7 @@ pub fn decode_with(
         policy,
         strings,
         nt_hash,
+        modified_by,
     } = read_extensions(&f, ctx, &principal.realm, master)?;
 
     Ok(HdbEntry {
@@ -481,6 +510,7 @@ pub fn decode_with(
         },
         etypes: etypes_field()?,
         modified: time_field(8)?.unwrap_or(0),
+        modified_by,
     })
 }
 
@@ -501,6 +531,7 @@ struct Extensions {
     policy: Option<String>,
     strings: Vec<(String, String)>,
     nt_hash: Option<[u8; 16]>,
+    modified_by: Option<Principal>,
 }
 
 fn read_extensions(
@@ -514,6 +545,7 @@ fn read_extensions(
     let mut policy = None;
     let mut strings = Vec::new();
     let mut nt_hash = None;
+    let mut modified_by = None;
     if f.opt_bytes(13).is_none() {
         return Ok(Extensions {
             delegation: None,
@@ -521,6 +553,7 @@ fn read_extensions(
             policy: None,
             strings,
             nt_hash: None,
+            modified_by: None,
         });
     }
     let mut r = Reader::new(f.bytes(13, ctx)?);
@@ -635,6 +668,16 @@ fn read_extensions(
                 ))
             })?);
         }
+
+        if choice.opt_bytes(18).is_some() {
+            // This crate's `HDB-Ext-Modified-By`, extension 18: the principal laid out exactly as
+            // the record's own `[0]` is — name type, components, realm — so that `principal_from`
+            // reads both and there is one decoder for the shape. The realm travels with it because
+            // an administrator may be in another realm, and re-homing their name into this entry's
+            // would record a different principal from the one that acted.
+            let mut mr = Reader::new(choice.bytes(18, ctx)?);
+            modified_by = Some(principal_from(ctx, mr.expect_in(ctx, der::SEQUENCE)?)?);
+        }
     }
     Ok(Extensions {
         delegation,
@@ -642,6 +685,7 @@ fn read_extensions(
         policy,
         strings,
         nt_hash,
+        modified_by,
     })
 }
 
@@ -666,6 +710,34 @@ mod tests {
         e.max_renew = Some(604_800);
         e.modified = 1_700_000_000;
         e
+    }
+
+    /// The modifier survives the record, with its realm.
+    ///
+    /// Heimdal's `hdb.asn1` has no field for "who changed this", so the fact lives in this crate's
+    /// extension 18 — which means the risk is the one every private extension carries: a record
+    /// written with it must still be readable without it, and a modifier in another realm must come
+    /// back as that realm rather than as this entry's.
+    #[test]
+    fn the_modifier_round_trips_and_keeps_its_realm() {
+        let mut e = entry();
+        assert_eq!(e.modified_by, None, "nothing recorded at construction");
+        assert_eq!(
+            decode(&encode(&e)).unwrap().modified_by,
+            None,
+            "and a record without it reads back without it, not with an invented name"
+        );
+
+        // An administrator in another realm: their realm travels with the name, because a reader
+        // that re-homed them into this entry's realm would report a different principal.
+        e.modified_by = Some(Principal::parse("admin@OTHER.EXAMPLE").unwrap());
+        e.modified = 1_700_000_123;
+        let back = decode(&encode(&e)).unwrap();
+        assert_eq!(
+            back.modified_by.as_ref().map(ToString::to_string),
+            Some("admin@OTHER.EXAMPLE".to_owned())
+        );
+        assert_eq!(back.modified, 1_700_000_123, "and the date with it");
     }
 
     /// The NT hash survives the record, plaintext and sealed, and the two are told apart by the

@@ -151,6 +151,7 @@ fn main() {
         max_renew: None,
         etypes: None,
         modified: 0,
+        modified_by: None,
         constrained_delegation: None,
         aliases: None,
         policy: None,

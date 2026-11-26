@@ -17,7 +17,7 @@
    or compound attributes» — то есть ключи в читаемом атрибуте это решение
    Heimdal, а не недоразумение.
 2. **Потребитель уже публикует словарь AD:** `src/ad_schema.rs` в
-   `~/DevOps/3part/rust-rest-ldap` — `userPrincipalName`, `sAMAccountName`,
+   `~/DevOps/rrl-directory` — `userPrincipalName`, `sAMAccountName`,
    `userAccountControl`, `objectGUID`, `objectSid`, `servicePrincipalName`,
    `primaryGroupID`, `groupType`, `accountExpires`, `pwdLastSet`, классы
    `user`/`group`/`computer`, с настоящими OID Microsoft

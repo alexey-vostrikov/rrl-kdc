@@ -327,7 +327,7 @@ scripts/coverage.sh --check         # COVERAGE_MIN=88 by default
 ```
 
 Edition 2024, MSRV 1.99.1 — the same toolchain the in-process consumer
-(`rust-rest-ldap`) pins in `rust-toolchain.toml`, so one workspace does not need
+(`rrl-directory`) pins in `rust-toolchain.toml`, so one workspace does not need
 two.
 
 ## Layout

@@ -4,7 +4,7 @@
 //! which is exactly the shape a KDC needs: reads happen constantly and are never
 //! blocked by the rare write, and there is no server to run or port to open.
 //!
-//! The version is the one the in-process consumer (`rust-rest-ldap`) already
+//! The version is the one the in-process consumer (`rrl-directory`) already
 //! builds against, so a KDC embedded in it shares a store rather than adding a
 //! second copy of redb to the graph.
 //!

@@ -19,10 +19,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 KDC_ROOT=$(cd "$HERE/../.." && pwd)
 # Where the consumer keeps its release build. Overridable because the checkout is a
 # local detail, and a missing binary should say so rather than run an old one.
-RRD_ROOT="${RRD_ROOT:-$KDC_ROOT/../3part/rust-rest-ldap}"
+RRD_ROOT="${RRD_ROOT:-$KDC_ROOT/../rrl-directory}"
 RRD_TARGET="${RRD_TARGET:-$HOME/.cache/rrl/target/release}"
 KDC_BIN="${KDC_BIN:-$KDC_ROOT/target/debug/examples/kdc-stand}"
-RRD_BIN="${RRD_BIN:-$RRD_TARGET/rust-rest-ldap}"
+# The binary is named after the package, which is `rrl-directory`; the directory it is checked out
+# in used to carry the old name, and this line still did. A stand that looks for a file that has not
+# existed since the rename reports "missing ..." and says nothing about the real cause.
+RRD_BIN="${RRD_BIN:-$RRD_TARGET/rrl-directory}"
 
 for bin in "$KDC_BIN" "$RRD_BIN"; do
     if [ ! -x "$bin" ]; then

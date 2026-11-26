@@ -158,6 +158,15 @@ required-features = ["spake"]
 name = "key-value"
 required-features = ["hdb-ldap"]
 
+# The kadmind stand speaks MIT's kadm5 protocol, which is `kadmin` and not the `Admin` trait: the
+# front end over RPC is what the example is for, so the example cannot build without it. Declared
+# here because cargo's auto-discovery would otherwise compile it under every feature set, and the
+# first failure a reader saw would be `could not find kadmin in rrl_kdc` on a change that had
+# nothing to do with kadmind.
+[[example]]
+name = "kadmin-stand"
+required-features = ["kadmin"]
+
 [[example]]
 name = "pkinit-reply"
 required-features = ["pkinit"]
